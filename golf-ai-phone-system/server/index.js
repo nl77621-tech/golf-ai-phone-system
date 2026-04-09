@@ -61,7 +61,14 @@ app.use('/api', apiRoutes);
 
 // Serve Command Center static files (built React app)
 const publicPath = path.join(__dirname, 'public');
-app.use(express.static(publicPath));
+app.use(express.static(publicPath, {
+  setHeaders: (res, filePath) => {
+    // Serve .jsx files as JavaScript so browsers load them as ES modules
+    if (filePath.endsWith('.jsx')) {
+      res.setHeader('Content-Type', 'application/javascript');
+    }
+  }
+}));
 
 // SPA fallback — serve index.html for any unmatched route
 app.get('*', (req, res) => {

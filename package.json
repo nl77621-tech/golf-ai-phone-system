@@ -1,0 +1,18 @@
+{
+  "name": "golf-ai-phone-system",
+  "version": "1.0.0",
+  "description": "AI Phone Answering System for Valleymede Columbus Golf Course",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "cd server && npm start",
+    "build": "cd server && npm run build:ui",
+    "dev": "cd server && npm run dev"
+  },
+  "workspaces": [
+    "server",
+    "command-center"
+  ],
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}

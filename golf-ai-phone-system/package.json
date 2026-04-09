@@ -1,0 +1,28 @@
+{
+  "name": "valleymede-golf-ai-phone",
+  "version": "1.0.0",
+  "description": "AI Phone Answering System for Valleymede Columbus Golf Course",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "db:init": "node server/db/init.js",
+    "db:seed": "node server/db/seed.js",
+    "build:ui": "cd command-center && npx vite build --outDir ../server/public"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "ws": "^8.16.0",
+    "pg": "^8.12.0",
+    "twilio": "^5.0.0",
+    "nodemailer": "^6.9.8",
+    "jsonwebtoken": "^9.0.2",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.1",
+    "uuid": "^9.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

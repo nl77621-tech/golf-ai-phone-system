@@ -156,21 +156,26 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid) {
       }
 
       switch (event.type) {
+        // xAI uses 'response.output_audio.delta' (OpenAI uses 'response.audio.delta')
         case 'response.audio.delta':
+        case 'response.output_audio.delta':
           // Send audio back to Twilio
           if (!streamSid) console.warn(`[${callSid}] Audio delta received but streamSid is null!`);
           if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
-            twilioWs.send(JSON.stringify({
-              event: 'media',
-              streamSid: streamSid,
-              media: {
-                payload: event.delta
-              }
-            }));
+            const audioPayload = event.delta || event.audio;
+            if (audioPayload) {
+              twilioWs.send(JSON.stringify({
+                event: 'media',
+                streamSid: streamSid,
+                media: { payload: audioPayload }
+              }));
+            }
           }
           break;
 
+        // xAI uses 'response.output_audio_transcript.delta' (OpenAI uses 'response.audio_transcript.delta')
         case 'response.audio_transcript.delta':
+        case 'response.output_audio_transcript.delta':
           // AI is speaking — log transcript
           if (event.delta) {
             callState.transcriptParts.push({ role: 'assistant', text: event.delta });

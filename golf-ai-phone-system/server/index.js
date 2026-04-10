@@ -101,10 +101,11 @@ wss.on('connection', (ws, req) => {
         const callerPhone = params.callerPhone || 'unknown';
         const callSid = params.callSid || msg.start.callSid || 'unknown';
 
-        console.log(`Media stream started: caller=${callerPhone}, sid=${callSid}`);
+        const streamSid = msg.start.streamSid;
+        console.log(`Media stream started: caller=${callerPhone}, sid=${callSid}, stream=${streamSid}`);
 
-        // Hand off to the Grok voice bridge
-        handleMediaStream(ws, callerPhone, callSid);
+        // Hand off to the Grok voice bridge — pass streamSid so audio can flow back
+        handleMediaStream(ws, callerPhone, callSid, streamSid);
       }
     } catch (err) {
       // Not JSON or not a start event — ignore, the handler will process it

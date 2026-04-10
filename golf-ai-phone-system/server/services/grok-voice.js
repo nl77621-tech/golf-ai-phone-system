@@ -22,7 +22,7 @@ const GROK_MODEL = 'grok-3-fast';
 /**
  * Handle an incoming Twilio media stream WebSocket connection
  */
-async function handleMediaStream(twilioWs, callerPhone, callSid) {
+async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid) {
   console.log(`[${callSid}] New call from ${callerPhone}`);
 
   // Create call log entry
@@ -90,7 +90,8 @@ async function handleMediaStream(twilioWs, callerPhone, callSid) {
     }
   });
 
-  let streamSid = null; // Twilio's stream SID for sending audio back
+  // streamSid is passed in from index.js — it's known from the 'start' event
+  // We also update it if Twilio sends another 'start' event
   let conversationActive = true;
 
   // Track state for call summary
@@ -223,8 +224,8 @@ async function handleMediaStream(twilioWs, callerPhone, callSid) {
 
       switch (msg.event) {
         case 'start':
-          streamSid = msg.start.streamSid;
-          console.log(`[${callSid}] Twilio stream started: ${streamSid}`);
+          streamSid = msg.start.streamSid; // update if re-sent
+          console.log(`[${callSid}] Twilio stream start event: ${streamSid}`);
           break;
 
         case 'media':

@@ -150,9 +150,15 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid) {
     try {
       const event = JSON.parse(data.toString());
 
+      // Log all Grok events for debugging (except audio deltas which are too noisy)
+      if (event.type !== 'response.audio.delta') {
+        console.log(`[${callSid}] Grok event: ${event.type}`, JSON.stringify(event).slice(0, 200));
+      }
+
       switch (event.type) {
         case 'response.audio.delta':
           // Send audio back to Twilio
+          if (!streamSid) console.warn(`[${callSid}] Audio delta received but streamSid is null!`);
           if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
             twilioWs.send(JSON.stringify({
               event: 'media',

@@ -150,8 +150,14 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid) {
     try {
       const event = JSON.parse(data.toString());
 
-      // Log all Grok events for debugging (except audio deltas which are too noisy)
-      if (event.type !== 'response.audio.delta') {
+      // Log all Grok events for debugging (log first audio delta to see structure)
+      if (event.type === 'response.audio.delta' || event.type === 'response.output_audio.delta') {
+        // Log just the first audio delta to see its structure
+        if (!callState._audioLogged) {
+          callState._audioLogged = true;
+          console.log(`[${callSid}] First audio delta keys: ${Object.keys(event).join(', ')}, delta length: ${(event.delta || event.audio || '').length}`);
+        }
+      } else {
         console.log(`[${callSid}] Grok event: ${event.type}`, JSON.stringify(event).slice(0, 200));
       }
 

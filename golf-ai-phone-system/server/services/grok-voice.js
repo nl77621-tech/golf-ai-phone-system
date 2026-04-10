@@ -38,8 +38,17 @@ async function handleMediaStream(twilioWs, callerPhone, callSid) {
     console.error('Failed to create call log:', err.message);
   }
 
-  // Look up caller
-  const { customer, isNew } = await registerCall(callerPhone);
+  // Look up caller (graceful fallback if DB unavailable)
+  let customer = null;
+  let isNew = true;
+  try {
+    const result = await registerCall(callerPhone);
+    customer = result.customer;
+    isNew = result.isNew;
+  } catch (err) {
+    console.error('Failed to register call (DB unavailable, continuing):', err.message);
+  }
+
   const callerContext = {
     phone: callerPhone,
     known: !isNew && customer?.name,
@@ -54,11 +63,21 @@ async function handleMediaStream(twilioWs, callerPhone, callSid) {
     query('UPDATE call_logs SET customer_id = $1 WHERE id = $2', [customer.id, callLogId]).catch(() => {});
   }
 
-  // Get a random greeting
-  const greeting = await getRandomGreeting(callerContext.known, callerContext.name);
+  // Get a random greeting (with fallback if DB unavailable)
+  let greeting = 'Thanks for calling Valleymede Columbus Golf Course! How can I help you today?';
+  try {
+    greeting = await getRandomGreeting(callerContext.known, callerContext.name);
+  } catch (err) {
+    console.error('Failed to get greeting (using default):', err.message);
+  }
 
-  // Build the system prompt with all course knowledge
-  const systemPrompt = await buildSystemPrompt(callerContext);
+  // Build the system prompt (with fallback if DB unavailable)
+  let systemPrompt = 'You are a friendly and helpful AI assistant for Valleymede Columbus Golf Course. Help callers with tee time bookings, course information, pricing, and general inquiries. Be warm, professional, and concise.';
+  try {
+    systemPrompt = await buildSystemPrompt(callerContext);
+  } catch (err) {
+    console.error('Failed to build system prompt (using default):', err.message);
+  }
 
   // Define tools for Grok
   const tools = buildToolDefinitions();
@@ -89,10 +108,8 @@ async function handleMediaStream(twilioWs, callerPhone, callSid) {
     grokWs.send(JSON.stringify({
       type: 'session.update',
       session: {
-        model: GROK_MODEL,
-        modalities: ['text', 'audio'],
         instructions: systemPrompt,
-        voice: 'sage', // Natural female voice; options: alloy, echo, fable, onyx, nova, shimmer, sage
+        voice: 'eve', // xAI supported voice
         input_audio_format: 'g711_ulaw',
         output_audio_format: 'g711_ulaw',
         input_audio_transcription: {

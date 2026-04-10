@@ -20,6 +20,67 @@ const GROK_REALTIME_URL = 'wss://api.x.ai/v1/realtime';
 const GROK_MODEL = 'grok-3-fast';
 
 /**
+ * Convert linear 16-bit PCM sample to G.711 μ-law byte
+ */
+function linearToMulaw(sample) {
+  const BIAS = 0x84;
+  const CLIP = 32635;
+  let sign = (sample >> 8) & 0x80;
+  if (sign !== 0) sample = -sample;
+  if (sample > CLIP) sample = CLIP;
+  sample = sample + BIAS;
+  let exponent = 7;
+  const expMask = 0x4000;
+  for (let i = 0; i < 8; i++) {
+    if (sample & expMask) break;
+    exponent--;
+    sample <<= 1;
+  }
+  const mantissa = (sample >> 10) & 0x0F;
+  let mulaw = ~(sign | (exponent << 4) | mantissa) & 0xFF;
+  return mulaw;
+}
+
+/**
+ * Convert G.711 μ-law byte back to linear 16-bit PCM sample
+ */
+function mulawToLinear(mulaw) {
+  mulaw = ~mulaw & 0xFF;
+  const sign = mulaw & 0x80;
+  const exponent = (mulaw >> 4) & 0x07;
+  const mantissa = mulaw & 0x0F;
+  let sample = ((mantissa << 3) + 0x84) << exponent;
+  sample -= 0x84;
+  return sign !== 0 ? -sample : sample;
+}
+
+/**
+ * Convert 8-bit signed PCM buffer to G.711 μ-law buffer
+ */
+function pcm8ToMulaw(inputBuf) {
+  const output = Buffer.alloc(inputBuf.length);
+  for (let i = 0; i < inputBuf.length; i++) {
+    // Convert signed 8-bit (-128..127) to signed 16-bit (-32768..32512)
+    let sample = inputBuf.readInt8(i) * 256;
+    output[i] = linearToMulaw(sample);
+  }
+  return output;
+}
+
+/**
+ * Convert G.711 μ-law buffer to 8-bit signed PCM buffer
+ */
+function mulawToPcm8(inputBuf) {
+  const output = Buffer.alloc(inputBuf.length);
+  for (let i = 0; i < inputBuf.length; i++) {
+    let sample = mulawToLinear(inputBuf[i]);
+    // Scale 16-bit back to 8-bit
+    output.writeInt8(Math.max(-128, Math.min(127, sample >> 8)), i);
+  }
+  return output;
+}
+
+/**
  * Handle an incoming Twilio media stream WebSocket connection
  */
 async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid) {
@@ -172,14 +233,11 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid) {
           if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
             const audioPayload = event.delta || event.audio;
             if (audioPayload) {
-              // xAI sends g711_ulaw WITHOUT standard bit inversion
-              // Twilio expects standard g711_ulaw WITH bit inversion
-              // Fix: decode, XOR each byte with 0xFF, re-encode
+              // xAI sends 8-bit signed PCM despite claiming g711_ulaw
+              // Convert to actual G.711 μ-law for Twilio
               const rawBuf = Buffer.from(audioPayload, 'base64');
-              for (let i = 0; i < rawBuf.length; i++) {
-                rawBuf[i] = rawBuf[i] ^ 0xFF;
-              }
-              const fixedPayload = rawBuf.toString('base64');
+              const mulawBuf = pcm8ToMulaw(rawBuf);
+              const fixedPayload = mulawBuf.toString('base64');
 
               // Send in chunks for smooth playback
               const CHUNK_SIZE = 640; // ~480 raw bytes = 60ms of g711 8kHz
@@ -262,15 +320,13 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid) {
           break;
 
         case 'media':
-          // Forward caller audio to Grok (invert bits for xAI's convention)
+          // Forward caller audio to Grok (convert mulaw to 8-bit PCM)
           if (grokWs.readyState === WebSocket.OPEN) {
             const inBuf = Buffer.from(msg.media.payload, 'base64');
-            for (let i = 0; i < inBuf.length; i++) {
-              inBuf[i] = inBuf[i] ^ 0xFF;
-            }
+            const pcmBuf = mulawToPcm8(inBuf);
             grokWs.send(JSON.stringify({
               type: 'input_audio_buffer.append',
-              audio: inBuf.toString('base64')
+              audio: pcmBuf.toString('base64')
             }));
           }
           break;

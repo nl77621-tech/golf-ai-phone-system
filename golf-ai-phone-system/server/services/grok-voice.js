@@ -167,30 +167,30 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid) {
       switch (event.type) {
         // xAI sends audio via 'response.output_audio.delta'
         case 'response.output_audio.delta':
-          // Send audio back to Twilio in small chunks
+          // Send audio back to Twilio
           if (!streamSid) console.warn(`[${callSid}] Audio delta received but streamSid is null!`);
           if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
             const audioPayload = event.delta || event.audio;
             if (audioPayload) {
-              // Chunk audio into ~20ms segments (160 raw bytes = 216 base64 chars)
-              // Round to nearest multiple of 4 for valid base64
+              // xAI sends g711_ulaw WITHOUT standard bit inversion
+              // Twilio expects standard g711_ulaw WITH bit inversion
+              // Fix: decode, XOR each byte with 0xFF, re-encode
+              const rawBuf = Buffer.from(audioPayload, 'base64');
+              for (let i = 0; i < rawBuf.length; i++) {
+                rawBuf[i] = rawBuf[i] ^ 0xFF;
+              }
+              const fixedPayload = rawBuf.toString('base64');
+
+              // Send in chunks for smooth playback
               const CHUNK_SIZE = 640; // ~480 raw bytes = 60ms of g711 8kHz
-              if (audioPayload.length <= CHUNK_SIZE) {
-                twilioWs.send(JSON.stringify({
-                  event: 'media',
-                  streamSid: streamSid,
-                  media: { payload: audioPayload }
-                }));
-              } else {
-                for (let i = 0; i < audioPayload.length; i += CHUNK_SIZE) {
-                  const chunk = audioPayload.slice(i, i + CHUNK_SIZE);
-                  if (twilioWs.readyState === WebSocket.OPEN) {
-                    twilioWs.send(JSON.stringify({
-                      event: 'media',
-                      streamSid: streamSid,
-                      media: { payload: chunk }
-                    }));
-                  }
+              for (let i = 0; i < fixedPayload.length; i += CHUNK_SIZE) {
+                const chunk = fixedPayload.slice(i, i + CHUNK_SIZE);
+                if (twilioWs.readyState === WebSocket.OPEN) {
+                  twilioWs.send(JSON.stringify({
+                    event: 'media',
+                    streamSid: streamSid,
+                    media: { payload: chunk }
+                  }));
                 }
               }
             }
@@ -262,11 +262,15 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid) {
           break;
 
         case 'media':
-          // Forward caller audio to Grok
+          // Forward caller audio to Grok (invert bits for xAI's convention)
           if (grokWs.readyState === WebSocket.OPEN) {
+            const inBuf = Buffer.from(msg.media.payload, 'base64');
+            for (let i = 0; i < inBuf.length; i++) {
+              inBuf[i] = inBuf[i] ^ 0xFF;
+            }
             grokWs.send(JSON.stringify({
               type: 'input_audio_buffer.append',
-              audio: msg.media.payload
+              audio: inBuf.toString('base64')
             }));
           }
           break;

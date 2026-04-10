@@ -14,6 +14,7 @@ const http = require('http');
 const WebSocket = require('ws');
 const path = require('path');
 const cors = require('cors');
+const fs = require('fs');
 
 // Routes
 const twilioRoutes = require('./routes/twilio');
@@ -22,6 +23,7 @@ const apiRoutes = require('./routes/api');
 
 // Services
 const { handleMediaStream } = require('./services/grok-voice');
+const { pool } = require('./config/database');
 
 const app = express();
 const server = http.createServer(app);
@@ -118,23 +120,75 @@ wss.on('connection', (ws, req) => {
 });
 
 // ============================================
+// Auto-Initialize Database (if DATABASE_URL is set)
+// ============================================
+async function initializeDatabaseIfNeeded() {
+  if (!process.env.DATABASE_URL) {
+    console.log('⚠️  DATABASE_URL not set — skipping database initialization');
+    return;
+  }
+
+  try {
+    console.log('🔧 Checking database schema...');
+    const client = await pool.connect();
+
+    // Check if tables exist
+    const result = await client.query(`
+      SELECT EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = 'call_logs'
+      ) as exists
+    `);
+
+    if (!result.rows[0].exists) {
+      console.log('📋 Creating database schema...');
+      const schema = fs.readFileSync(path.join(__dirname, 'db', 'schema.sql'), 'utf8');
+      await client.query(schema);
+      console.log('✅ Schema created');
+
+      console.log('🌱 Seeding initial data...');
+      const seed = fs.readFileSync(path.join(__dirname, 'db', 'seed.sql'), 'utf8');
+      await client.query(seed);
+      console.log('✅ Seed data inserted');
+    } else {
+      console.log('✅ Database tables already exist');
+    }
+
+    client.release();
+  } catch (err) {
+    console.error('⚠️  Database initialization warning:', err.message);
+    // Don't crash the server if DB init fails — it might be a temporary connection issue
+  }
+}
+
+// ============================================
 // Start Server
 // ============================================
 const PORT = process.env.PORT || 3000;
 
-server.listen(PORT, () => {
-  console.log('');
-  console.log('🏌️ ============================================');
-  console.log('🏌️  Valleymede Columbus Golf Course');
-  console.log('🏌️  AI Phone Answering System');
-  console.log('🏌️ ============================================');
-  console.log(`🌐 Server running on port ${PORT}`);
-  console.log(`📞 Twilio webhook: /twilio/voice`);
-  console.log(`🔌 WebSocket: /twilio/media-stream`);
-  console.log(`🎛️  Command Center: http://localhost:${PORT}`);
-  console.log(`📡 API: /api/*`);
-  console.log('============================================');
-  console.log('');
+async function startServer() {
+  // Initialize database before starting server
+  await initializeDatabaseIfNeeded();
+
+  server.listen(PORT, () => {
+    console.log('');
+    console.log('🏌️ ============================================');
+    console.log('🏌️  Valleymede Columbus Golf Course');
+    console.log('🏌️  AI Phone Answering System');
+    console.log('🏌️ ============================================');
+    console.log(`🌐 Server running on port ${PORT}`);
+    console.log(`📞 Twilio webhook: /twilio/voice`);
+    console.log(`🔌 WebSocket: /twilio/media-stream`);
+    console.log(`🎛️  Command Center: http://localhost:${PORT}`);
+    console.log(`📡 API: /api/*`);
+    console.log('============================================');
+    console.log('');
+  });
+}
+
+startServer().catch(err => {
+  console.error('Failed to start server:', err);
+  process.exit(1);
 });
 
 // Graceful shutdown

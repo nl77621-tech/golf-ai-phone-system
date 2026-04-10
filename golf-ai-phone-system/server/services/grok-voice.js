@@ -150,7 +150,8 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid) {
       if (event.type === 'response.output_audio.delta') {
         if (!callState._audioLogged) {
           callState._audioLogged = true;
-          console.log(`[${callSid}] Audio flowing - delta length: ${(event.delta || '').length}`);
+          const d = event.delta || '';
+          console.log(`[${callSid}] Audio flowing - length: ${d.length}, first50: ${d.slice(0, 50)}, last10: ${d.slice(-10)}`);
         }
       } else if (event.type === 'response.audio.delta') {
         // Log if OpenAI-style event is ALSO being sent (would cause double audio = static)
@@ -166,16 +167,32 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid) {
       switch (event.type) {
         // xAI sends audio via 'response.output_audio.delta'
         case 'response.output_audio.delta':
-          // Send audio back to Twilio
+          // Send audio back to Twilio in small chunks
           if (!streamSid) console.warn(`[${callSid}] Audio delta received but streamSid is null!`);
           if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
             const audioPayload = event.delta || event.audio;
             if (audioPayload) {
-              twilioWs.send(JSON.stringify({
-                event: 'media',
-                streamSid: streamSid,
-                media: { payload: audioPayload }
-              }));
+              // Chunk audio into ~20ms segments (160 raw bytes = 216 base64 chars)
+              // Round to nearest multiple of 4 for valid base64
+              const CHUNK_SIZE = 640; // ~480 raw bytes = 60ms of g711 8kHz
+              if (audioPayload.length <= CHUNK_SIZE) {
+                twilioWs.send(JSON.stringify({
+                  event: 'media',
+                  streamSid: streamSid,
+                  media: { payload: audioPayload }
+                }));
+              } else {
+                for (let i = 0; i < audioPayload.length; i += CHUNK_SIZE) {
+                  const chunk = audioPayload.slice(i, i + CHUNK_SIZE);
+                  if (twilioWs.readyState === WebSocket.OPEN) {
+                    twilioWs.send(JSON.stringify({
+                      event: 'media',
+                      streamSid: streamSid,
+                      media: { payload: chunk }
+                    }));
+                  }
+                }
+              }
             }
           }
           break;

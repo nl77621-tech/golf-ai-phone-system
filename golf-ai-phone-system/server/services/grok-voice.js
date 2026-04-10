@@ -280,15 +280,15 @@ ${callerLine}
     console.log(`[${callSid}] Connected to Grok`);
 
     // Send session configuration
-    // Use g711_ulaw to match Twilio natively — zero conversion, best quality
+    // pcm16 — xAI doesn't honour g711_ulaw, always sends PCM. We convert.
     grokWs.send(JSON.stringify({
       type: 'session.update',
       session: {
         modalities: ['text', 'audio'],
         instructions: systemPrompt,
         voice: 'eve',
-        input_audio_format: 'g711_ulaw',
-        output_audio_format: 'g711_ulaw',
+        input_audio_format: 'pcm16',
+        output_audio_format: 'pcm16',
         turn_detection: {
           type: 'server_vad',
           threshold: 0.5,
@@ -347,12 +347,13 @@ ${callerLine}
           if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
             const audioPayload = event.delta || event.audio;
             if (audioPayload) {
-              // g711_ulaw passthrough — xAI and Twilio both use g711_ulaw, no conversion needed
-              // Chunk the raw buffer (480 bytes = 60ms at 8kHz) then base64 encode each chunk
+              // xAI sends PCM16 at 24kHz — downsample to 8kHz and encode as g711_ulaw for Twilio
               const rawBuf = Buffer.from(audioPayload, 'base64');
+              const mulawBuf = pcm16ToMulaw8k(rawBuf);
+              // Chunk raw buffer before encoding (480 bytes = 60ms at 8kHz g711)
               const CHUNK_BYTES = 480;
-              for (let i = 0; i < rawBuf.length; i += CHUNK_BYTES) {
-                const chunk = rawBuf.slice(i, i + CHUNK_BYTES);
+              for (let i = 0; i < mulawBuf.length; i += CHUNK_BYTES) {
+                const chunk = mulawBuf.slice(i, i + CHUNK_BYTES);
                 if (twilioWs.readyState === WebSocket.OPEN) {
                   twilioWs.send(JSON.stringify({
                     event: 'media',
@@ -430,11 +431,13 @@ ${callerLine}
           break;
 
         case 'media':
-          // Forward caller audio to Grok — g711_ulaw passthrough, no conversion
+          // Forward caller audio to Grok — upsample g711_ulaw 8kHz → PCM16 24kHz
           if (grokWs.readyState === WebSocket.OPEN) {
+            const inBuf = Buffer.from(msg.media.payload, 'base64');
+            const pcmBuf = mulaw8kToPcm16(inBuf);
             grokWs.send(JSON.stringify({
               type: 'input_audio_buffer.append',
-              audio: msg.media.payload
+              audio: pcmBuf.toString('base64')
             }));
           }
           break;

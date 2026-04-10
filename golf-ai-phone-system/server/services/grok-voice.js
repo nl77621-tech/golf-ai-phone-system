@@ -187,6 +187,7 @@ Today is ${dateStr}, current time: ${timeStr} Eastern. The year is 2026.
 - Phone: (905) 655-6300 | Toll-free: 1-866-717-0990
 - Email: info@valleymedecolumbusgolf.com
 - Website: valleymedecolumbusgolf.com
+- Online booking: https://www.tee-on.com/PubGolf/servlet/com.teeon.teesheet.servlets.golfersection.ComboLanding?CourseCode=COLU&FromCourseWebsite=true (click "Public Enter Here")
 - 18-hole British Links-style course on 150 acres, approximately 6,200 yards
 - Beautiful open meadows, mature trees, and long natural grass mounds. Ideal for all skill levels.
 - Directions: About 15 minutes north of Highway 401, near Highway 407, on Simcoe Street North in Oshawa

@@ -114,9 +114,6 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid) {
         voice: 'eve', // xAI supported voice - options: eve, ara, rex, sal, leo
         input_audio_format: 'g711_ulaw',
         output_audio_format: 'g711_ulaw',
-        input_audio_transcription: {
-          model: 'whisper-1'
-        },
         turn_detection: {
           type: 'server_vad',
           threshold: 0.5,
@@ -124,8 +121,7 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid) {
           silence_duration_ms: 500
         },
         tools: tools,
-        tool_choice: 'auto',
-        temperature: 0.8
+        tool_choice: 'auto'
       }
     }));
 
@@ -157,6 +153,10 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid) {
           callState._audioLogged = true;
           console.log(`[${callSid}] First audio delta keys: ${Object.keys(event).join(', ')}, delta length: ${(event.delta || event.audio || '').length}`);
         }
+      } else if (event.type === 'session.updated') {
+        // Log full session to see confirmed audio format
+        const s = event.session || {};
+        console.log(`[${callSid}] Session confirmed - input_fmt: ${s.input_audio_format}, output_fmt: ${s.output_audio_format}, voice: ${s.voice}`);
       } else {
         console.log(`[${callSid}] Grok event: ${event.type}`, JSON.stringify(event).slice(0, 200));
       }

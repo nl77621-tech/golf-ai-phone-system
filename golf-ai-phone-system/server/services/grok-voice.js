@@ -146,13 +146,15 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid) {
     try {
       const event = JSON.parse(data.toString());
 
-      // Log all Grok events for debugging (log first audio delta to see structure)
-      if (event.type === 'response.audio.delta' || event.type === 'response.output_audio.delta') {
-        // Log just the first audio delta to see its structure
+      // Log all Grok events for debugging
+      if (event.type === 'response.output_audio.delta') {
         if (!callState._audioLogged) {
           callState._audioLogged = true;
-          console.log(`[${callSid}] First audio delta keys: ${Object.keys(event).join(', ')}, delta length: ${(event.delta || event.audio || '').length}`);
+          console.log(`[${callSid}] Audio flowing - delta length: ${(event.delta || '').length}`);
         }
+      } else if (event.type === 'response.audio.delta') {
+        // Log if OpenAI-style event is ALSO being sent (would cause double audio = static)
+        console.log(`[${callSid}] WARNING: Got response.audio.delta too - possible double send!`);
       } else if (event.type === 'session.updated') {
         // Log full session to see confirmed audio format
         const s = event.session || {};
@@ -162,8 +164,7 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid) {
       }
 
       switch (event.type) {
-        // xAI uses 'response.output_audio.delta' (OpenAI uses 'response.audio.delta')
-        case 'response.audio.delta':
+        // xAI sends audio via 'response.output_audio.delta'
         case 'response.output_audio.delta':
           // Send audio back to Twilio
           if (!streamSid) console.warn(`[${callSid}] Audio delta received but streamSid is null!`);
@@ -179,8 +180,6 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid) {
           }
           break;
 
-        // xAI uses 'response.output_audio_transcript.delta' (OpenAI uses 'response.audio_transcript.delta')
-        case 'response.audio_transcript.delta':
         case 'response.output_audio_transcript.delta':
           // AI is speaking — log transcript
           if (event.delta) {

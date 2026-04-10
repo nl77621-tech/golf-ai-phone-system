@@ -112,8 +112,10 @@ Railway **automatically creates** a `DATABASE_URL` environment variable — you'
 ```
 TWILIO_ACCOUNT_SID = (your value from Twilio)
 TWILIO_AUTH_TOKEN = (your value from Twilio)
-TWILIO_PHONE_NUMBER = +1XXXXXXXXXX (your Twilio number)
+TWILIO_PHONE_NUMBER = +12893679150
 ```
+
+✅ **Canadian number purchased**: +1 (289) 367-9150 — 289 is the Oshawa/Durham Region area code, no long-distance charges when forwarding from your Bell Canada line.
 
 **xAI Grok Variables:**
 ```
@@ -212,12 +214,25 @@ Your app is running now, but the database tables haven't been created yet. Do th
 
 ## PART 3: Connect to Twilio (10 minutes)
 
-### Step 3.1: Get Your Twilio Credentials
+### Step 3.1: Get a Canadian Twilio Phone Number
+
+⚠️ **IMPORTANT**: Do NOT use a US Twilio number for this system!
+
+**Why?** If you forward your Bell Canada number (905-655-6300) to a US Twilio number, Bell will charge you **long distance rates** for every forwarded call — potentially $0.10-0.50+ per call. With 50-100 calls/day, this adds up quickly.
+
+**Solution**: Get a **Canadian Twilio phone number** instead:
 
 1. Go to https://console.twilio.com
-2. You'll see **Account SID** and **Auth Token** at the top
-3. Also go to **Phone Numbers** and note your phone number
-4. Add these to your Railway environment variables (already done in Step 2.4, but verify)
+2. Click **Phone Numbers** in the left menu
+3. Click **Buy a Number**
+4. **Country**: Select **Canada**
+5. **Area Code**: Choose **905** (Ontario local to Columbus area) OR **416/647** (GTA) OR **1-800** (toll-free)
+6. Click **Search** — pick a number you like
+7. Click **Buy** (trial account gets free Canadian numbers)
+8. Once purchased, you'll see your number in **Phone Numbers** → **Active Numbers**
+9. Note the number in format: `+1XXXXXXXXXX`
+10. Also note your **Account SID** and **Auth Token** at the top of the console
+11. Add all three to your Railway environment variables (already done in Step 2.4, but verify)
 
 ### Step 3.2: Set Up the Webhook
 
@@ -282,25 +297,36 @@ Once you're confident, go back to **Test Mode** and **disable it** to go fully l
 
 This is important — so people can reach you on your existing number:
 
+### ⚠️ CRITICAL: Use a Canadian Twilio Number
+
+✅ **Your Canadian Twilio number is ready**: +1 (289) 367-9150 — no long-distance charges when forwarding from Bell Canada.
+
 ### Option A: Simple Call Forwarding (Recommended)
 
-1. **Call Bell Canada**: 310-BELL (310-2355)
-2. Tell them: *"I want to add call forwarding to line (905) 655-6300. Forward all calls to [your Twilio number]."*
+1. **Call Bell Canada**: 310-BELL (310-2355) or visit bell.ca
+2. Tell them: *"I want to add call forwarding to line (905) 655-6300. Forward all calls to +12893679150."*
 3. They'll set it up (usually instant)
-4. Cost: ~$10/month
-5. To test: Dial `*72` then your Twilio number, then `#`
+4. Cost: ~$10/month (or included in your plan)
+5. To test: Dial `*72` then `2893679150` then `#`
 6. To disable: Dial `*73`
 
-### Option B: Conditional Forwarding
+### Option B: Conditional Forwarding (Better for Mixed Use)
+
+If your business sometimes needs to answer calls manually:
 
 1. Same call to Bell
 2. Ask for: **"Call Forward Busy/No Answer"**
 3. This way if staff picks up, AI doesn't answer
 4. If nobody answers after 30 seconds, forwards to AI
+5. Cost: Same as Option A (~$10/month)
 
-Once forwarding is active, **test it**:
+### Testing Bell Forwarding
+
+Once forwarding is active, **test it thoroughly**:
 - Call your actual (905) 655-6300 number from another phone
-- You should get the AI
+- You should hear the AI answer
+- Check Command Center → **Call Logs** to verify the call was recorded
+- Try making a booking request to test the full flow
 
 ---
 

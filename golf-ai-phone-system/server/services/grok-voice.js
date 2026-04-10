@@ -20,24 +20,30 @@ const GROK_REALTIME_URL = 'wss://api.x.ai/v1/realtime';
 const GROK_MODEL = 'grok-3-fast';
 
 /**
- * Convert linear 16-bit PCM sample to G.711 μ-law byte (ITU-T standard)
+ * Convert linear 16-bit PCM sample to G.711 μ-law byte (ITU-T G.711 standard)
+ * Handles full 16-bit range (-32768 to +32767)
  */
 function linearToMulaw(sample) {
-  const MULAW_MAX = 0x1FFF;
-  const MULAW_BIAS = 33;
-  const sign = (sample < 0) ? 0x80 : 0;
-  if (sample < 0) sample = -sample;
-  if (sample > MULAW_MAX) sample = MULAW_MAX;
-  sample = sample + MULAW_BIAS;
-  let exponent = 0;
-  let expVal = sample >> 6;
-  while (expVal > 1) {
-    exponent++;
-    expVal >>= 1;
+  const MULAW_BIAS = 0x84; // 132
+  const MULAW_CLIP = 32635;
+
+  let sign = 0;
+  if (sample < 0) {
+    sign = 0x80;
+    sample = -sample;
+  }
+  if (sample > MULAW_CLIP) sample = MULAW_CLIP;
+  sample += MULAW_BIAS;
+
+  // Find exponent (highest set bit position above bit 6)
+  let exponent = 7;
+  let expMask = 0x4000;
+  for (; exponent > 0; exponent--) {
+    if (sample & expMask) break;
+    expMask >>= 1;
   }
   const mantissa = (sample >> (exponent + 3)) & 0x0F;
-  const byte = ~(sign | (exponent << 4) | mantissa) & 0xFF;
-  return byte;
+  return (~(sign | (exponent << 4) | mantissa)) & 0xFF;
 }
 
 /**
@@ -48,41 +54,48 @@ function mulawToLinear(byte) {
   const sign = byte & 0x80;
   const exponent = (byte >> 4) & 0x07;
   const mantissa = byte & 0x0F;
-  let sample = (mantissa << 3) + 0x84;
-  sample <<= exponent;
+  let sample = ((mantissa << 3) + 0x84) << exponent;
   sample -= 0x84;
   return sign ? -sample : sample;
 }
 
 /**
  * Convert PCM16 24kHz buffer → G.711 μ-law 8kHz buffer
- * Downsamples by taking every 3rd sample
+ * Uses 3-sample averaging (box filter) to reduce aliasing before downsampling
  */
 function pcm16ToMulaw8k(inputBuf) {
   const numSamples = Math.floor(inputBuf.length / 2);
-  const outputSamples = Math.floor(numSamples / 3); // downsample 24kHz → 8kHz
+  const outputSamples = Math.floor(numSamples / 3);
   const output = Buffer.alloc(outputSamples);
   for (let i = 0; i < outputSamples; i++) {
-    const srcIdx = i * 3 * 2; // every 3rd sample, 2 bytes each
-    if (srcIdx + 1 < inputBuf.length) {
-      const sample = inputBuf.readInt16LE(srcIdx);
-      output[i] = linearToMulaw(sample);
+    // Average 3 consecutive samples (simple low-pass) before encoding
+    let sum = 0;
+    let count = 0;
+    for (let j = 0; j < 3; j++) {
+      const srcIdx = (i * 3 + j) * 2;
+      if (srcIdx + 1 < inputBuf.length) {
+        sum += inputBuf.readInt16LE(srcIdx);
+        count++;
+      }
     }
+    output[i] = linearToMulaw(count > 0 ? Math.round(sum / count) : 0);
   }
   return output;
 }
 
 /**
  * Convert G.711 μ-law 8kHz buffer → PCM16 24kHz buffer
- * Upsamples by repeating each sample 3x
+ * Uses linear interpolation for smooth upsampling (3x)
  */
 function mulaw8kToPcm16(inputBuf) {
-  const output = Buffer.alloc(inputBuf.length * 3 * 2); // 3x samples, 2 bytes each
+  const output = Buffer.alloc(inputBuf.length * 3 * 2);
   for (let i = 0; i < inputBuf.length; i++) {
-    const sample = mulawToLinear(inputBuf[i]);
-    // Write each sample 3 times for 8kHz → 24kHz upsampling
+    const s0 = mulawToLinear(inputBuf[i]);
+    const s1 = (i + 1 < inputBuf.length) ? mulawToLinear(inputBuf[i + 1]) : s0;
+    // Linearly interpolate 3 sub-samples between s0 and s1
     for (let j = 0; j < 3; j++) {
-      output.writeInt16LE(sample, (i * 3 + j) * 2);
+      const interp = Math.round(s0 + (j / 3) * (s1 - s0));
+      output.writeInt16LE(interp, (i * 3 + j) * 2);
     }
   }
   return output;
@@ -140,12 +153,104 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid) {
     console.error('Failed to get greeting (using default):', err.message);
   }
 
-  // Build the system prompt (with fallback if DB unavailable)
-  let systemPrompt = 'You are a friendly and helpful AI assistant for Valleymede Columbus Golf Course. Help callers with tee time bookings, course information, pricing, and general inquiries. Be warm, professional, and concise.';
+  // Build the system prompt (with full fallback if DB unavailable)
+  let systemPrompt = null;
   try {
     systemPrompt = await buildSystemPrompt(callerContext);
   } catch (err) {
-    console.error('Failed to build system prompt (using default):', err.message);
+    console.error('Failed to build system prompt (using hardcoded fallback):', err.message);
+  }
+  if (!systemPrompt) {
+    const now = new Date();
+    const dateStr = now.toLocaleDateString('en-US', { timeZone: 'America/Toronto', weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+    const timeStr = now.toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', hour12: true });
+    const callerLine = callerContext.known && callerContext.name
+      ? `This is a RETURNING caller named ${callerContext.name}. You do NOT need to collect their info again.`
+      : `This is a NEW caller. If they want to book, collect: full name, phone number, and email.`;
+
+    systemPrompt = `IMPORTANT: Today's date is ${dateStr}. The current time is ${timeStr} Eastern Time. Use THIS date and year (2026) for everything — do NOT reference any other dates or years from your training data.
+
+You are a friendly, natural-sounding staff member answering the phone at Valleymede Columbus Golf Course. You are NOT a robot — you're a real person who works at the course and loves golf.
+
+## YOUR PERSONALITY
+Friendly, warm, and conversational. Sound like a real person, not a robot.
+- Keep responses concise — this is a phone call
+- NEVER say "I'm an AI" — you are a staff member at the golf course
+- If you don't know something specific, say "Let me check on that" or offer to take a message
+
+## CURRENT DATE & TIME
+Today is ${dateStr}, current time: ${timeStr} Eastern. The year is 2026.
+
+## COURSE INFORMATION
+- Name: Valleymede Columbus Golf Course
+- Address: 3622 Simcoe Street North, Oshawa, ON L1H 0R5
+- Phone: (905) 655-6300 | Toll-free: 1-866-717-0990
+- Email: info@valleymedecolumbusgolf.com
+- Website: valleymedecolumbusgolf.com
+- 18-hole British Links-style course on 150 acres, approximately 6,200 yards
+- Beautiful open meadows, mature trees, and long natural grass mounds. Ideal for all skill levels.
+- Directions: About 15 minutes north of Highway 401, near Highway 407, on Simcoe Street North in Oshawa
+- Signature holes: Hole 3 has a stunning island green; Hole 17 is an elevated 200-yard par 3 tee surrounded by water and bunkers
+
+## BUSINESS HOURS
+- Monday–Thursday: 7:00 AM – 7:00 PM
+- Friday: 6:30 AM – 7:30 PM
+- Saturday–Sunday: 6:00 AM – 7:30 PM
+
+## GREEN FEES (all prices + HST)
+Weekday (Mon–Thu):
+- Daytime (Open – 12:59 PM): $47.79 for 18 holes
+- Pre-Twilight (1:00–2:59 PM): $44.25 for 18 holes
+- Twilight (3:00 PM – Close): $39.82 for 18 holes, $30.97 for 9 holes
+
+Weekend/Holidays (Fri–Sun):
+- Daytime (Open – 2:59 PM): $57.52 for 18 holes
+- Twilight (3:00 PM – Close): $48.67 for 18 or 9 holes
+
+Cart Fees (per person):
+- 18 holes: $21.24 | Twilight: $12.39 | Pull cart: $5.31 | Single rider surcharge: $10.00
+
+## POLICIES
+- Minimum age: 10 years old
+- Max booking: 8 players (2 foursomes)
+- Max players per group: 4
+- Walk-ins: Limited availability, pre-booking strongly recommended
+- Cart drivers must have valid G2 license or higher, and sign a waiver
+- No outside alcoholic beverages — all alcohol purchased through clubhouse or beverage cart
+- Pull carts and club rentals: Limited, first-come first-served
+
+## MEMBERSHIPS
+- 2026 memberships are SOLD OUT
+- Waitlist available — email info@valleymedecolumbusgolf.com to join
+- Full Membership: $2,900 with HST | Senior Full Membership: $2,700 with HST
+- Benefits: Golf access 7 days/week. Power carts NOT included.
+
+## AMENITIES
+- Professional clubhouse, pro-shop, patio area
+- Chipping and putting greens
+- Fleet of new golf carts (2026)
+- Beverage cart service
+
+## TOURNAMENTS & GROUP OUTINGS
+- Capacity: 24 to 144 golfers
+- Services include: power carts, chipping/putting greens, registration table, licensed beverage cart, contest markers, patio seating
+- To inquire: provide contact name, phone, number of participants, preferred date, start time
+- Packages quoted individually
+
+## CALLER CONTEXT
+${callerLine}
+
+## BOOKING RULES
+- Always confirm: date, time, number of players, carts needed
+- For new callers: collect name, phone, email before booking
+- After collecting details, confirm everything back to the caller
+- Let them know the booking request has been received and staff will confirm shortly
+
+## IMPORTANT
+- Be CONCISE on the phone. Don't read long lists unless asked.
+- When quoting prices, mention HST is extra.
+- NEVER make up information. If unsure, offer to take a message.
+`;
   }
 
   // Define tools for Grok
@@ -175,15 +280,15 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid) {
     console.log(`[${callSid}] Connected to Grok`);
 
     // Send session configuration
-    // Use xAI's native PCM format — we'll convert to/from g711 mulaw for Twilio
+    // Use g711_ulaw to match Twilio natively — zero conversion, best quality
     grokWs.send(JSON.stringify({
       type: 'session.update',
       session: {
         modalities: ['text', 'audio'],
         instructions: systemPrompt,
         voice: 'eve',
-        input_audio_format: 'pcm16',
-        output_audio_format: 'pcm16',
+        input_audio_format: 'g711_ulaw',
+        output_audio_format: 'g711_ulaw',
         turn_detection: {
           type: 'server_vad',
           threshold: 0.5,
@@ -242,20 +347,17 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid) {
           if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
             const audioPayload = event.delta || event.audio;
             if (audioPayload) {
-              // xAI sends PCM16 24kHz — convert to G.711 μ-law 8kHz for Twilio
+              // g711_ulaw passthrough — xAI and Twilio both use g711_ulaw, no conversion needed
+              // Chunk the raw buffer (480 bytes = 60ms at 8kHz) then base64 encode each chunk
               const rawBuf = Buffer.from(audioPayload, 'base64');
-              const mulawBuf = pcm16ToMulaw8k(rawBuf);
-              const fixedPayload = mulawBuf.toString('base64');
-
-              // Send in chunks for smooth playback
-              const CHUNK_SIZE = 640; // ~480 raw bytes = 60ms of g711 8kHz
-              for (let i = 0; i < fixedPayload.length; i += CHUNK_SIZE) {
-                const chunk = fixedPayload.slice(i, i + CHUNK_SIZE);
+              const CHUNK_BYTES = 480;
+              for (let i = 0; i < rawBuf.length; i += CHUNK_BYTES) {
+                const chunk = rawBuf.slice(i, i + CHUNK_BYTES);
                 if (twilioWs.readyState === WebSocket.OPEN) {
                   twilioWs.send(JSON.stringify({
                     event: 'media',
                     streamSid: streamSid,
-                    media: { payload: chunk }
+                    media: { payload: chunk.toString('base64') }
                   }));
                 }
               }
@@ -328,13 +430,11 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid) {
           break;
 
         case 'media':
-          // Forward caller audio to Grok (convert G.711 μ-law 8kHz → PCM16 24kHz)
+          // Forward caller audio to Grok — g711_ulaw passthrough, no conversion
           if (grokWs.readyState === WebSocket.OPEN) {
-            const inBuf = Buffer.from(msg.media.payload, 'base64');
-            const pcmBuf = mulaw8kToPcm16(inBuf);
             grokWs.send(JSON.stringify({
               type: 'input_audio_buffer.append',
-              audio: pcmBuf.toString('base64')
+              audio: msg.media.payload
             }));
           }
           break;

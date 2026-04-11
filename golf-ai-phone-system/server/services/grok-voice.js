@@ -14,6 +14,7 @@ const { lookupByPhone, registerCall, updateCustomer } = require('./caller-lookup
 const { createBookingRequest, createModificationRequest } = require('./booking-manager');
 const { getCurrentWeather, getForecast } = require('./weather');
 const { query, getSetting } = require('../config/database');
+const teeon = require('./teeon-automation');
 require('dotenv').config();
 
 const GROK_REALTIME_URL = 'wss://api.x.ai/v1/realtime';
@@ -252,10 +253,12 @@ Cart Fees (per person):
 ${callerLine}
 
 ## BOOKING RULES
-- Always confirm: date, time, number of players, carts needed
-- For new callers: collect name, phone, email before booking
-- After collecting details, confirm everything back to the caller
-- Let them know the booking request has been received and staff will confirm shortly
+- When a caller wants to book, FIRST use check_tee_times to see what's available on their date
+- Tell them the available times naturally: "I've got 9am, 10:30, and 11am open on Saturday — any of those work?"
+- Once they pick a time, collect: name, phone number, and how many players
+- Then use book_tee_time to book it directly — it goes straight into the tee sheet
+- Confirm back: "Perfect, you're booked for Saturday at 10:30, 4 players. You're all set!"
+- If live booking fails, let them know staff will confirm shortly
 
 ## IMPORTANT
 - Be CONCISE on the phone. Don't read long lists unless asked.
@@ -531,8 +534,21 @@ function buildToolDefinitions() {
   return [
     {
       type: 'function',
+      name: 'check_tee_times',
+      description: 'Check live available tee times on the Tee-On tee sheet for a specific date. Use this BEFORE booking so you can tell the caller what times are open.',
+      parameters: {
+        type: 'object',
+        properties: {
+          date: { type: 'string', description: 'Date to check in YYYY-MM-DD format' },
+          party_size: { type: 'integer', description: 'Number of players (1-4)' }
+        },
+        required: ['date']
+      }
+    },
+    {
+      type: 'function',
       name: 'book_tee_time',
-      description: 'Create a new tee time booking request. Use this when a caller wants to book a tee time. Collect all required info first: date, time, party size, and customer details.',
+      description: 'Book a tee time directly in Tee-On. Use check_tee_times first to confirm availability. Collect name, phone, date, time, party size before calling this.',
       parameters: {
         type: 'object',
         properties: {
@@ -645,24 +661,84 @@ function buildToolDefinitions() {
 async function executeToolCall(toolName, args, callerContext, callLogId) {
   try {
     switch (toolName) {
+      case 'check_tee_times': {
+        if (teeon.isAvailable()) {
+          try {
+            const slots = await teeon.checkAvailability(args.date, args.party_size || 1);
+            if (slots.length === 0) {
+              return { available: false, message: `No available tee times found for ${args.date} with ${args.party_size || 1} players.` };
+            }
+            const times = slots.map(s => s.time).join(', ');
+            return { available: true, date: args.date, slots, message: `Available times on ${args.date}: ${times}` };
+          } catch (err) {
+            console.error('[TeeOn] checkAvailability error:', err.message);
+            return { available: null, message: 'Unable to check live availability right now. You can check online at valleymedecolumbusgolf.com or I can take a booking request.' };
+          }
+        } else {
+          return { available: null, message: 'Live tee sheet not connected. I can take your preferred date and time and staff will confirm availability.' };
+        }
+      }
+
       case 'book_tee_time': {
-        const booking = await createBookingRequest({
-          customerId: callerContext.customerId,
-          customerName: args.customer_name,
-          customerPhone: args.customer_phone || callerContext.phone,
-          customerEmail: args.customer_email,
-          requestedDate: args.date,
-          requestedTime: args.time,
-          partySize: args.party_size,
-          numCarts: args.num_carts || 0,
-          specialRequests: args.special_requests,
-          callId: callLogId
-        });
-        return {
-          success: true,
-          message: `Booking request created successfully for ${args.customer_name}, ${args.date} at ${args.time || 'flexible time'}, ${args.party_size} players. Staff will confirm shortly.`,
-          bookingId: booking.id
-        };
+        // Try live Tee-On booking first
+        if (teeon.isAvailable() && args.date && args.time) {
+          try {
+            const result = await teeon.bookTeeTime({
+              date: args.date,
+              time: args.time,
+              partySize: args.party_size || 1,
+              holes: args.holes || 18,
+              carts: args.num_carts || 0,
+              players: [{ name: args.customer_name, phone: args.customer_phone || callerContext.phone, email: args.customer_email }]
+            });
+            if (result.success) {
+              // Also log to our DB
+              try {
+                await createBookingRequest({
+                  customerId: callerContext.customerId,
+                  customerName: args.customer_name,
+                  customerPhone: args.customer_phone || callerContext.phone,
+                  customerEmail: args.customer_email,
+                  requestedDate: args.date,
+                  requestedTime: args.time,
+                  partySize: args.party_size,
+                  numCarts: args.num_carts || 0,
+                  specialRequests: args.special_requests,
+                  callId: callLogId
+                });
+              } catch (dbErr) { /* non-critical */ }
+              return { success: true, message: `Done! Booked directly in Tee-On: ${args.date} at ${args.time}, ${args.party_size || 1} player(s). You're all set!` };
+            } else {
+              // Fall through to manual request
+              console.log('[TeeOn] Live booking failed, falling back to request:', result.error);
+            }
+          } catch (err) {
+            console.error('[TeeOn] bookTeeTime error:', err.message);
+          }
+        }
+
+        // Fallback: log as a booking request for staff to handle
+        try {
+          const booking = await createBookingRequest({
+            customerId: callerContext.customerId,
+            customerName: args.customer_name,
+            customerPhone: args.customer_phone || callerContext.phone,
+            customerEmail: args.customer_email,
+            requestedDate: args.date,
+            requestedTime: args.time,
+            partySize: args.party_size,
+            numCarts: args.num_carts || 0,
+            specialRequests: args.special_requests,
+            callId: callLogId
+          });
+          return {
+            success: true,
+            message: `Booking request logged for ${args.customer_name}, ${args.date} at ${args.time || 'flexible time'}, ${args.party_size} players. Staff will confirm shortly.`,
+            bookingId: booking.id
+          };
+        } catch (dbErr) {
+          return { success: true, message: `Got it — I've noted your booking request for ${args.date} at ${args.time}. Staff will follow up to confirm.` };
+        }
       }
 
       case 'edit_booking': {

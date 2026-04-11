@@ -292,9 +292,9 @@ ${callerLine}
         output_audio_format: 'pcm16',
         turn_detection: {
           type: 'server_vad',
-          threshold: 0.5,
-          prefix_padding_ms: 300,
-          silence_duration_ms: 500
+          threshold: 0.4,      // more sensitive to speech
+          prefix_padding_ms: 200,
+          silence_duration_ms: 300  // respond faster after you stop talking
         },
         tools: tools,
         tool_choice: 'auto'
@@ -341,6 +341,17 @@ ${callerLine}
       }
 
       switch (event.type) {
+        // User started speaking — barge-in: cancel AI and clear Twilio buffer
+        case 'input_audio_buffer.speech_started':
+          console.log(`[${callSid}] Barge-in detected — cancelling AI response`);
+          // Tell Grok to stop generating
+          grokWs.send(JSON.stringify({ type: 'response.cancel' }));
+          // Tell Twilio to stop playing buffered audio immediately
+          if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
+            twilioWs.send(JSON.stringify({ event: 'clear', streamSid: streamSid }));
+          }
+          break;
+
         // xAI sends audio via 'response.output_audio.delta'
         case 'response.output_audio.delta':
           // Send audio back to Twilio

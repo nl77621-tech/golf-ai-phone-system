@@ -254,11 +254,11 @@ ${callerLine}
 
 ## BOOKING RULES
 - When a caller wants to book, FIRST use check_tee_times to see what's available on their date
-- Tell them the available times naturally: "I've got 9am, 10:30, and 11am open on Saturday — any of those work?"
+- Tell them the available times naturally: "I've got 9 AM, 10:30, and 11 AM open on Saturday — any of those work?"
 - Once they pick a time, collect: name, phone number, and how many players
-- Then use book_tee_time to book it directly — it goes straight into the tee sheet
-- Confirm back: "Perfect, you're booked for Saturday at 10:30, 4 players. You're all set!"
-- If live booking fails, let them know staff will confirm shortly
+- Then use book_tee_time to submit the request — our staff will confirm it in the tee sheet within minutes
+- Confirm back: "Perfect! I've got you down for Saturday at 10:30, 4 players. Our team will confirm shortly — you may get a quick follow-up call."
+- Always reassure them it's locked in and staff will follow up if needed
 
 ## IMPORTANT
 - Be CONCISE on the phone. Don't read long lists unless asked.
@@ -680,44 +680,12 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
       }
 
       case 'book_tee_time': {
-        // Try live Tee-On booking first
-        if (teeon.isAvailable() && args.date && args.time) {
-          try {
-            const result = await teeon.bookTeeTime({
-              date: args.date,
-              time: args.time,
-              partySize: args.party_size || 1,
-              holes: args.holes || 18,
-              carts: args.num_carts || 0,
-              players: [{ name: args.customer_name, phone: args.customer_phone || callerContext.phone, email: args.customer_email }]
-            });
-            if (result.success) {
-              // Also log to our DB
-              try {
-                await createBookingRequest({
-                  customerId: callerContext.customerId,
-                  customerName: args.customer_name,
-                  customerPhone: args.customer_phone || callerContext.phone,
-                  customerEmail: args.customer_email,
-                  requestedDate: args.date,
-                  requestedTime: args.time,
-                  partySize: args.party_size,
-                  numCarts: args.num_carts || 0,
-                  specialRequests: args.special_requests,
-                  callId: callLogId
-                });
-              } catch (dbErr) { /* non-critical */ }
-              return { success: true, message: `Done! Booked directly in Tee-On: ${args.date} at ${args.time}, ${args.party_size || 1} player(s). You're all set!` };
-            } else {
-              // Fall through to manual request
-              console.log('[TeeOn] Live booking failed, falling back to request:', result.error);
-            }
-          } catch (err) {
-            console.error('[TeeOn] bookTeeTime error:', err.message);
-          }
-        }
-
-        // Fallback: log as a booking request for staff to handle
+        // Log as a booking request for staff to confirm in Tee-On.
+        // Note: Direct Puppeteer booking is not available because the Tee-On
+        // account (ColumbusG) is an Administrator — Tee-On blocks admins from
+        // completing bookings via the golfer web interface. Bookings are queued
+        // for staff to confirm. To enable live bookings, create a non-admin
+        // golfer account in Tee-On and update TEEON_USERNAME/TEEON_PASSWORD.
         try {
           const booking = await createBookingRequest({
             customerId: callerContext.customerId,

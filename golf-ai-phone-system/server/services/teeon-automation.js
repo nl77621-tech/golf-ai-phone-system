@@ -2,11 +2,15 @@
  * Tee-On Golf Systems Automation
  * Uses Puppeteer (headless Chrome) to log into Tee-On and:
  *  - Check available tee times for a given date
- *  - Book a tee time with caller details
- *  - Modify or cancel existing bookings
  *
  * Credentials stored as env vars: TEEON_USERNAME, TEEON_PASSWORD
  * Course: Valleymede Columbus Golf Club (CourseCode=COLU, CourseGroupID=11242)
+ *
+ * NOTE: The TEEON_USERNAME account is an Administrator. Tee-On blocks admins
+ * from completing bookings through the golfer web interface. Availability
+ * checking works fine. Bookings are handled as "booking requests" stored in
+ * the database and confirmed by staff. To enable live bookings in the future,
+ * create a non-admin golfer account and update the credentials.
  */
 
 let puppeteer;
@@ -18,8 +22,6 @@ try {
 
 const TEEON_LOGIN_URL = 'https://www.tee-on.com/PubGolf/servlet/com.teeon.teesheet.servlets.golfersection.SignInGolferSection?LoginType=-1&GrabFocus=true&FromTeeOn=true';
 const TEEON_SHEET_URL = 'https://www.tee-on.com/PubGolf/servlet/com.teeon.teesheet.servlets.golfersection.WebBookingAllTimesLanding?CourseGroupID=11242&CourseCode=COLU&LoginType=-1';
-const COURSE_CODE = 'COLU';
-const COURSE_GROUP_ID = '11242';
 
 let browser = null;
 let lastLoginTime = null;
@@ -42,17 +44,43 @@ async function getSession() {
     }
 
     console.log('[TeeOn] Launching browser and logging in...');
-    browser = await puppeteer.launch({
+
+    // Use system Chromium if available (Railway/Linux), otherwise fall back to bundled
+    let executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || null;
+    if (!executablePath) {
+      const fs = require('fs');
+      const { execSync } = require('child_process');
+      if (fs.existsSync('/usr/bin/chromium')) {
+        executablePath = '/usr/bin/chromium';
+      } else if (fs.existsSync('/usr/bin/chromium-browser')) {
+        executablePath = '/usr/bin/chromium-browser';
+      } else {
+        try {
+          const p = execSync('which chromium 2>/dev/null || which chromium-browser 2>/dev/null', { encoding: 'utf8' }).trim();
+          if (p) executablePath = p;
+        } catch (e) {}
+      }
+    }
+
+    const launchOpts = {
       headless: true,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-gpu',
-        '--single-process'
+        '--single-process',
+        '--no-zygote',
+        '--disable-extensions',
+        '--disable-background-networking'
       ]
-    });
+    };
+    if (executablePath) {
+      launchOpts.executablePath = executablePath;
+      console.log(`[TeeOn] Using Chrome at: ${executablePath}`);
+    }
 
+    browser = await puppeteer.launch(launchOpts);
     await login(browser);
     lastLoginTime = Date.now();
     console.log('[TeeOn] Logged in successfully');
@@ -73,8 +101,7 @@ async function login(br) {
   // Wait for ALTCHA to auto-solve (it's a proof-of-work, not visual CAPTCHA)
   console.log('[TeeOn] Waiting for ALTCHA to solve...');
   await page.waitForSelector('altcha-widget', { timeout: 15000 });
-  // Give ALTCHA time to compute and verify
-  await new Promise(r => setTimeout(r, 6000));
+  await new Promise(r => setTimeout(r, 6000)); // Give ALTCHA time to compute
 
   // Fill credentials
   await page.waitForSelector('input[name="UserName"], input[id="UserName"]', { timeout: 10000 });
@@ -97,230 +124,85 @@ async function login(br) {
 }
 
 /**
- * Check available tee times for a given date and party size
+ * Check available tee times for a given date
+ *
+ * Page structure (confirmed via DOM inspection Apr 2026):
+ * - Times appear as "7:30AM", "9:22AM" etc. (uppercase AM/PM) in innerText
+ * - Each tile also shows course ("Front" or "Back") and price
+ * - Tile times can be filtered for 18 Holes / 9 Holes
+ *
  * @param {string} date - YYYY-MM-DD format
- * @param {number} partySize - 1-4
- * @returns {Array} list of available time slots
+ * @param {number} partySize - 1-4 (used to navigate to correct date)
+ * @returns {Array} list of available time slot objects
  */
 async function checkAvailability(date, partySize = 1) {
   const br = await getSession();
   const page = await br.newPage();
 
   try {
-    // Format date for Tee-On (MM/DD/YYYY)
+    // Format date for Tee-On URL (MM/DD/YYYY)
     const [year, month, day] = date.split('-');
     const teeonDate = `${month}/${day}/${year}`;
 
-    // Navigate to tee sheet for the given date
     const url = `${TEEON_SHEET_URL}&SelectedDate=${encodeURIComponent(teeonDate)}&NumberOfPlayers=${partySize}`;
     console.log(`[TeeOn] Checking availability for ${date}, party of ${partySize}`);
+
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
 
-    // Wait for tee time rows to load
-    await page.waitForSelector('table, .tee-time, [class*="teeTime"], [class*="time-slot"]', { timeout: 10000 })
-      .catch(() => console.log('[TeeOn] No tee time selector found, trying to parse page anyway'));
+    // Wait for tee times to render (the date nav always appears)
+    await page.waitForSelector('[class*="toggle-players-wrapper"]', { timeout: 10000 })
+      .catch(() => console.log('[TeeOn] No player wrapper found — may be no times available'));
 
-    // Scrape available time slots
-    const slots = await page.evaluate((players) => {
-      const available = [];
+    // Give JS time to render tiles
+    await new Promise(r => setTimeout(r, 1500));
 
-      // Try various selectors Tee-On might use for time slots
-      const rows = document.querySelectorAll('tr, .teeTimeRow, [class*="available"]');
+    // Extract times from page text
+    // Tiles show times as "7:30AM" or "2:15PM" (uppercase) in innerText
+    // The popup titles show "18 Holes - 7:30am" (lowercase) — we exclude those
+    const result = await page.evaluate(() => {
+      const text = document.body.innerText;
 
-      rows.forEach(row => {
-        const text = row.innerText || row.textContent || '';
-
-        // Look for time patterns (7:00 AM, 10:30, etc.)
-        const timeMatch = text.match(/\b(\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)?)\b/);
-        if (!timeMatch) return;
-
-        // Skip rows that look booked (contain player names or "Full")
-        const isBooked = text.includes('Full') ||
-                         (row.querySelector('input[value*="Name"]') === null &&
-                          row.querySelectorAll('td').length > 2 &&
-                          text.trim().length > 20 &&
-                          !text.includes('Book'));
-
-        // Check for a booking link or button
-        const hasBookLink = row.querySelector('a, button, input[type="button"]') !== null;
-
-        if (timeMatch && !isBooked && hasBookLink) {
-          available.push({
-            time: timeMatch[1],
-            text: text.trim().slice(0, 100)
-          });
-        }
-      });
-
-      return available;
-    }, partySize);
-
-    // If scraping didn't find structured data, fall back to page text
-    if (slots.length === 0) {
-      const pageText = await page.evaluate(() => document.body.innerText);
-      const timeMatches = [...pageText.matchAll(/\b(\d{1,2}:\d{2}\s*(?:AM|PM|am|pm))\b/g)];
-      const times = [...new Set(timeMatches.map(m => m[1]))];
-      console.log(`[TeeOn] Fallback: found ${times.length} time patterns on page`);
-      return times.map(t => ({ time: t, available: true }));
-    }
-
-    console.log(`[TeeOn] Found ${slots.length} available slots`);
-    return slots;
-
-  } finally {
-    await page.close();
-  }
-}
-
-/**
- * Book a tee time in Tee-On
- * @param {object} details - booking details
- * @returns {object} result with success/failure
- */
-async function bookTeeTime({ date, time, partySize = 1, holes = 18, carts = 0, players = [] }) {
-  const br = await getSession();
-  const page = await br.newPage();
-
-  try {
-    const [year, month, day] = date.split('-');
-    const teeonDate = `${month}/${day}/${year}`;
-
-    console.log(`[TeeOn] Booking tee time: ${date} ${time}, party of ${partySize}`);
-
-    // Navigate to tee sheet for the date
-    const url = `${TEEON_SHEET_URL}&SelectedDate=${encodeURIComponent(teeonDate)}&NumberOfPlayers=${partySize}`;
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
-
-    // Find and click the time slot link
-    const clicked = await page.evaluate((targetTime) => {
-      // Normalize target time for comparison (e.g. "10:30 AM" or "10:30")
-      const normalize = t => t.replace(/\s+/g, '').toLowerCase();
-      const target = normalize(targetTime);
-
-      const links = document.querySelectorAll('a, input[type="button"], button');
-      for (const el of links) {
-        const text = normalize(el.innerText || el.value || '');
-        if (text.includes(target)) {
-          el.click();
-          return true;
-        }
+      // Check for "No times available" message
+      if (text.includes('No times available')) {
+        return { noTimes: true, slots: [] };
       }
 
-      // Try finding in table rows
-      const rows = document.querySelectorAll('tr');
-      for (const row of rows) {
-        const text = normalize(row.innerText || '');
-        if (text.includes(target)) {
-          const link = row.querySelector('a, input[type="button"]');
-          if (link) { link.click(); return true; }
-        }
+      const slots = [];
+      // Match tile times: digit:digit followed immediately by AM or PM (uppercase only)
+      // Example matches: "7:30AM", "10:02AM", "12:10PM"
+      const timeRegex = /\b(\d{1,2}:\d{2})(AM|PM)\b/g;
+      let match;
+      const seen = new Set();
+
+      while ((match = timeRegex.exec(text)) !== null) {
+        const timeStr = match[1] + ':' + match[2]; // e.g. "7:30:AM" — fix below
+        const full = match[1] + match[2]; // e.g. "7:30AM"
+
+        if (seen.has(full)) continue;
+        seen.add(full);
+
+        // Get context around this time (next 60 chars) to extract course + holes
+        const context = text.substring(match.index, match.index + 80);
+        const course = context.includes('Front') ? 'Front 9' : context.includes('Back') ? 'Back 9' : 'Course';
+        const holes = context.includes('18 Holes') || context.includes('18 H') ? 18 : 9;
+
+        // Format nicely: "7:30 AM"
+        const displayTime = match[1] + ' ' + match[2];
+
+        slots.push({ time: displayTime, raw: full, course, holes });
       }
 
-      return false;
-    }, time);
-
-    if (!clicked) {
-      return { success: false, error: `Could not find time slot ${time} on ${date}. It may already be booked or unavailable.` };
-    }
-
-    // Wait for booking form to load
-    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 });
-    await new Promise(r => setTimeout(r, 1000));
-
-    // Set number of players
-    await page.evaluate((count) => {
-      const btns = document.querySelectorAll('input[type="button"], button');
-      for (const btn of btns) {
-        const val = (btn.value || btn.innerText || '').trim();
-        if (val === String(count)) { btn.click(); return; }
-      }
-    }, partySize);
-    await new Promise(r => setTimeout(r, 500));
-
-    // Set holes (18 or 9)
-    await page.evaluate((holeCount) => {
-      const btns = document.querySelectorAll('input[type="button"], button');
-      for (const btn of btns) {
-        const val = (btn.value || btn.innerText || '').trim();
-        if (val === String(holeCount)) { btn.click(); return; }
-      }
-    }, holes);
-    await new Promise(r => setTimeout(r, 500));
-
-    // Set carts
-    await page.evaluate((cartCount) => {
-      const btns = document.querySelectorAll('input[type="button"], button');
-      for (const btn of btns) {
-        const val = (btn.value || btn.innerText || '').trim();
-        if (val === String(cartCount)) { btn.click(); return; }
-      }
-    }, carts);
-    await new Promise(r => setTimeout(r, 500));
-
-    // Fill in player 1 details (primary booker)
-    const primaryPlayer = players[0] || {};
-    if (primaryPlayer.name) {
-      await page.evaluate((name) => {
-        const inputs = document.querySelectorAll('input[placeholder="Name"], input[name*="Name"]');
-        if (inputs[0]) { inputs[0].value = ''; inputs[0].value = name; }
-      }, primaryPlayer.name);
-    }
-
-    if (primaryPlayer.phone) {
-      await page.evaluate((phone) => {
-        const inputs = document.querySelectorAll('input[placeholder="Phone"], input[name*="Phone"]');
-        if (inputs[0]) { inputs[0].value = phone; }
-      }, primaryPlayer.phone);
-    }
-
-    if (primaryPlayer.email) {
-      await page.evaluate((email) => {
-        const inputs = document.querySelectorAll('input[placeholder="Email"], input[name*="Email"]');
-        if (inputs[0]) { inputs[0].value = email; }
-      }, primaryPlayer.email);
-    }
-
-    await new Promise(r => setTimeout(r, 500));
-
-    // Take a screenshot before saving (for debugging)
-    // await page.screenshot({ path: '/tmp/teeon-booking.png' });
-
-    // Click Save
-    const saved = await page.evaluate(() => {
-      const btns = document.querySelectorAll('input[type="button"], input[type="submit"], button');
-      for (const btn of btns) {
-        const val = (btn.value || btn.innerText || '').trim().toLowerCase();
-        if (val === 'save') { btn.click(); return true; }
-      }
-      return false;
+      return { noTimes: false, slots };
     });
 
-    if (!saved) {
-      return { success: false, error: 'Could not find Save button on booking form' };
+    if (result.noTimes) {
+      console.log(`[TeeOn] No times available for ${date}`);
+      return [];
     }
 
-    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 })
-      .catch(() => {}); // sometimes no navigation after save
+    console.log(`[TeeOn] Found ${result.slots.length} available slots for ${date}`);
+    return result.slots;
 
-    // Check for success or error message
-    const resultText = await page.evaluate(() => document.body.innerText.slice(0, 500));
-    const isError = resultText.toLowerCase().includes('error') ||
-                    resultText.toLowerCase().includes('already booked') ||
-                    resultText.toLowerCase().includes('unavailable');
-
-    if (isError) {
-      return { success: false, error: resultText.slice(0, 200) };
-    }
-
-    console.log(`[TeeOn] Booking saved successfully`);
-    return {
-      success: true,
-      message: `Tee time booked in Tee-On: ${date} at ${time}, ${partySize} player(s), ${holes} holes`
-    };
-
-  } catch (err) {
-    console.error('[TeeOn] Booking error:', err.message);
-    return { success: false, error: err.message };
   } finally {
     await page.close();
   }
@@ -331,7 +213,7 @@ async function bookTeeTime({ date, time, partySize = 1, holes = 18, carts = 0, p
  */
 async function closeBrowser() {
   if (browser) {
-    await browser.close();
+    try { await browser.close(); } catch (e) {}
     browser = null;
   }
 }
@@ -343,4 +225,4 @@ function isAvailable() {
   return !!puppeteer && !!process.env.TEEON_USERNAME && !!process.env.TEEON_PASSWORD;
 }
 
-module.exports = { checkAvailability, bookTeeTime, closeBrowser, isAvailable };
+module.exports = { checkAvailability, closeBrowser, isAvailable };

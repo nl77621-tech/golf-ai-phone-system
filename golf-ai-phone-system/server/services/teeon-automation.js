@@ -165,55 +165,93 @@ let httpSessionTime = 0;
 const HTTP_SESSION_TTL = 20 * 60 * 1000; // 20 minutes
 
 /**
+ * Detect page type from HTML body
+ */
+function detectPageType(html) {
+  const lower = html.toLowerCase();
+  if (lower.includes('signin') || lower.includes('sign in') || lower.includes('login') || lower.includes('username') || lower.includes('password')) return 'LOGIN';
+  if (lower.includes('no times available')) return 'NO_TIMES';
+  if (lower.includes('am') || lower.includes('pm')) return 'SHEET';
+  return 'UNKNOWN';
+}
+
+/**
  * Check available tee times via plain HTTP (no Puppeteer/Chromium required)
  * Fetches the public Tee-On tee sheet page for a given date.
  */
 async function checkAvailabilityHTTP(date, partySize = 1) {
   const [year, month, day] = date.split('-');
   const teeonDate = `${month}/${day}/${year}`; // MM/DD/YYYY
+  // Also try YYYY-MM-DD format some Tee-On servlets accept
+  const teeonDateISO = date;
 
   console.log(`[TeeOn-HTTP] Checking availability for ${date} (party of ${partySize})`);
 
   try {
-    // Step 1: Get a session by visiting the public ComboLanding page
+    // Step 1: Always get a fresh session by loading the public tee sheet page
+    // ComboLanding redirects to WebBookingAllTimesLanding — follow full redirect chain
+    // so we land on the actual tee sheet page (today's by default) with a live session
     const sessionExpired = !httpSession || (Date.now() - httpSessionTime > HTTP_SESSION_TTL);
     if (sessionExpired) {
-      console.log('[TeeOn-HTTP] Getting fresh session...');
+      console.log('[TeeOn-HTTP] Getting fresh session via ComboLanding...');
       const landing = await httpsGet(
         `https://www.tee-on.com/PubGolf/servlet/com.teeon.teesheet.servlets.golfersection.ComboLanding?CourseCode=${COURSE_CODE}&FromCourseWebsite=true`
       );
       httpSession = landing.cookies;
       httpSessionTime = Date.now();
-      console.log('[TeeOn-HTTP] Session established');
+      const pageType = detectPageType(landing.body);
+      console.log(`[TeeOn-HTTP] Session established | FinalURL: ${landing.finalUrl} | PageType: ${pageType}`);
+      console.log(`[TeeOn-HTTP] Body preview: ${landing.body.substring(0, 300).replace(/\s+/g, ' ')}`);
     }
 
-    // Step 2: POST to the tee sheet servlet with the date
-    // The servlet accepts SelectedDate as a form parameter
     const cookieHeader = httpSession ? { Cookie: httpSession } : {};
 
-    const result = await httpsPost(
-      `${PUBLIC_SHEET_BASE}?CourseCode=${COURSE_CODE}`,
-      {
-        CourseCode: COURSE_CODE,
-        CourseGroupID: COURSE_GROUP_ID,
-        SelectedDate: teeonDate,
-        NumberOfPlayers: String(partySize),
-        Referrer: '',
-        LoginType: ''
-      },
+    // Step 2: GET the tee sheet directly with SelectedDate in query string
+    // Tee-On public pages accept SelectedDate as a URL parameter
+    console.log(`[TeeOn-HTTP] Fetching tee sheet for ${teeonDate}...`);
+    const getResult = await httpsGet(
+      `${PUBLIC_SHEET_BASE}?CourseCode=${COURSE_CODE}&CourseGroupID=${COURSE_GROUP_ID}&SelectedDate=${encodeURIComponent(teeonDate)}&NumberOfPlayers=${partySize}&LoginType=`,
       cookieHeader
     );
 
-    let slots = parseTimesFromHTML(result.body);
+    const pageType1 = detectPageType(getResult.body);
+    console.log(`[TeeOn-HTTP] GET result | Status: ${getResult.status} | PageType: ${pageType1}`);
+    console.log(`[TeeOn-HTTP] Body preview: ${getResult.body.substring(0, 400).replace(/\s+/g, ' ')}`);
 
-    // If POST didn't work, try GET with SelectedDate param
-    if (slots.length === 0 && !result.body.includes('No times available')) {
-      console.log('[TeeOn-HTTP] POST returned no times, trying GET...');
-      const getResult = await httpsGet(
-        `${PUBLIC_SHEET_BASE}?CourseCode=${COURSE_CODE}&CourseGroupID=${COURSE_GROUP_ID}&SelectedDate=${encodeURIComponent(teeonDate)}&NumberOfPlayers=${partySize}`,
-        cookieHeader
+    let slots = parseTimesFromHTML(getResult.body);
+
+    // Step 3: If GET didn't work, try POST (some Tee-On versions prefer POST)
+    if (slots.length === 0 && pageType1 !== 'NO_TIMES') {
+      console.log('[TeeOn-HTTP] GET returned no times, trying POST...');
+      const postResult = await httpsPost(
+        `${PUBLIC_SHEET_BASE}?CourseCode=${COURSE_CODE}`,
+        {
+          CourseCode: COURSE_CODE,
+          CourseGroupID: COURSE_GROUP_ID,
+          SelectedDate: teeonDate,
+          NumberOfPlayers: String(partySize),
+          Referrer: '',
+          LoginType: ''
+        },
+        { ...cookieHeader, 'Referer': `https://www.tee-on.com/PubGolf/servlet/com.teeon.teesheet.servlets.golfersection.WebBookingAllTimesLanding?CourseCode=${COURSE_CODE}` }
       );
-      slots = parseTimesFromHTML(getResult.body);
+
+      const pageType2 = detectPageType(postResult.body);
+      console.log(`[TeeOn-HTTP] POST result | Status: ${postResult.status} | PageType: ${pageType2}`);
+      console.log(`[TeeOn-HTTP] POST body preview: ${postResult.body.substring(0, 400).replace(/\s+/g, ' ')}`);
+      slots = parseTimesFromHTML(postResult.body);
+    }
+
+    // Step 4: If still nothing, force a fresh session and retry once (session may have expired)
+    if (slots.length === 0) {
+      const freshPageType = detectPageType(getResult.body);
+      if (freshPageType === 'LOGIN') {
+        console.log('[TeeOn-HTTP] Got login page — resetting session and retrying...');
+        httpSession = null;
+        httpSessionTime = 0;
+        // Recursive call with fresh session (only once)
+        return checkAvailabilityHTTP(date, partySize);
+      }
     }
 
     console.log(`[TeeOn-HTTP] Found ${slots.length} slots for ${date}`);

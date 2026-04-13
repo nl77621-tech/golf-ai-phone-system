@@ -209,6 +209,33 @@ function DashboardPage() {
 // ============================================
 // BOOKINGS PAGE
 // ============================================
+
+// Helper to format booking date/time nicely
+function formatBookingDateTime(dateStr, timeStr) {
+  try {
+    // dateStr format: YYYY-MM-DD, timeStr format: HH:MM
+    const [year, month, day] = dateStr.split('-');
+    const date = new Date(year, parseInt(month) - 1, day);
+    const dayName = date.toLocaleDateString('en-US', { weekday: 'long' });
+    const monthName = date.toLocaleDateString('en-US', { month: 'long' });
+    const dayNum = parseInt(day);
+
+    if (!timeStr || timeStr === 'Flexible') {
+      return `${dayName}, ${monthName} ${dayNum}`;
+    }
+
+    const [hours, mins] = timeStr.split(':');
+    const hour = parseInt(hours);
+    const ampm = hour >= 12 ? 'PM' : 'AM';
+    const displayHour = hour % 12 || 12;
+    const timeFormatted = `${displayHour}:${mins} ${ampm}`;
+
+    return `${dayName}, ${monthName} ${dayNum} at ${timeFormatted}`;
+  } catch (e) {
+    return `${dateStr} ${timeStr}`;
+  }
+}
+
 function BookingsPage() {
   const [bookings, setBookings] = useState([]);
   const [modifications, setModifications] = useState([]);
@@ -302,8 +329,11 @@ function BookingsPage() {
                       React.createElement('span', { className: 'font-semibold' }, b.customer_name || 'Unknown'),
                       React.createElement('span', { className: `px-2 py-0.5 rounded-full text-xs ${statusColors[b.status] || ''}` }, b.status)
                     ),
+                    React.createElement('div', { className: 'text-sm text-gray-600 font-medium mt-1' },
+                      formatBookingDateTime(b.requested_date, b.requested_time)
+                    ),
                     React.createElement('div', { className: 'text-sm text-gray-500 mt-1' },
-                      `${b.requested_date} ${b.requested_time || 'Flexible'} \u2022 ${b.party_size} player${b.party_size > 1 ? 's' : ''} \u2022 ${b.num_carts || 0} cart${b.num_carts !== 1 ? 's' : ''}`
+                      `${b.party_size} player${b.party_size > 1 ? 's' : ''} \u2022 ${b.num_carts || 0} cart${b.num_carts !== 1 ? 's' : ''}`
                     ),
                     React.createElement('div', { className: 'text-sm text-gray-400' },
                       `${b.customer_phone || ''} ${b.customer_email ? '\u2022 ' + b.customer_email : ''}`

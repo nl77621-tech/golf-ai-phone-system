@@ -213,12 +213,30 @@ function DashboardPage() {
 // Helper to format booking date/time nicely
 function formatBookingDateTime(dateStr, timeStr) {
   try {
-    // dateStr format: YYYY-MM-DD, timeStr format: HH:MM
-    const [year, month, day] = dateStr.split('-');
-    const date = new Date(year, parseInt(month) - 1, day);
+    if (!dateStr) return 'No date';
+
+    // Parse date - handle YYYY-MM-DD format
+    let date;
+    if (dateStr.includes('-')) {
+      const [year, month, day] = dateStr.split('-');
+      date = new Date(parseInt(year), parseInt(month) - 1, parseInt(day));
+    } else if (dateStr.includes('/')) {
+      // Handle MM/DD/YYYY format if needed
+      const [month, day, year] = dateStr.split('/');
+      date = new Date(parseInt(year), parseInt(month) - 1, parseInt(day));
+    } else {
+      // Try parsing as ISO string or timestamp
+      date = new Date(dateStr);
+    }
+
+    // Check if date is valid
+    if (isNaN(date.getTime())) {
+      return `${dateStr} ${timeStr || ''}`.trim();
+    }
+
     const dayName = date.toLocaleDateString('en-US', { weekday: 'long' });
     const monthName = date.toLocaleDateString('en-US', { month: 'long' });
-    const dayNum = parseInt(day);
+    const dayNum = date.getDate();
 
     if (!timeStr || timeStr === 'Flexible') {
       return `${dayName}, ${monthName} ${dayNum}`;
@@ -232,7 +250,7 @@ function formatBookingDateTime(dateStr, timeStr) {
 
     return `${dayName}, ${monthName} ${dayNum} at ${timeFormatted}`;
   } catch (e) {
-    return `${dateStr} ${timeStr}`;
+    return `${dateStr} ${timeStr || ''}`.trim();
   }
 }
 

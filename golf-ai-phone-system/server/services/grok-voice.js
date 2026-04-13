@@ -302,6 +302,7 @@ ${callerLine}
         modalities: ['text', 'audio'],
         instructions: systemPrompt,
         voice: 'eve',
+        speed: 1.1,
         input_audio_format: 'pcm16',
         output_audio_format: 'pcm16',
         turn_detection: {

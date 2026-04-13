@@ -364,16 +364,41 @@ function CustomersPage() {
   const [customers, setCustomers] = useState([]);
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+
+  const loadCustomers = async (query = '') => {
+    try {
+      const d = await api(`/api/customers?search=${encodeURIComponent(query)}`);
+      setCustomers(d.customers || []);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
+  };
+
+  const handleRefresh = async () => {
+    setRefreshing(true);
+    await loadCustomers(search);
+  };
 
   useEffect(() => {
     const timeout = setTimeout(() => {
-      api(`/api/customers?search=${encodeURIComponent(search)}`).then(d => setCustomers(d.customers || [])).catch(console.error).finally(() => setLoading(false));
+      loadCustomers(search);
     }, 300);
     return () => clearTimeout(timeout);
   }, [search]);
 
   return React.createElement('div', null,
-    React.createElement('h1', { className: 'text-2xl font-bold text-gray-800 mb-6' }, 'Customers'),
+    React.createElement('div', { className: 'flex items-center gap-3 mb-6' },
+      React.createElement('h1', { className: 'text-2xl font-bold text-gray-800' }, 'Customers'),
+      React.createElement('button', {
+        onClick: handleRefresh, disabled: refreshing,
+        className: 'text-sm px-3 py-1.5 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-lg transition-colors disabled:opacity-50',
+        title: 'Refresh customer list'
+      }, refreshing ? '⟳ Refreshing...' : '⟳ Refresh')
+    ),
     React.createElement('input', {
       type: 'text', placeholder: 'Search by name, phone, or email...',
       value: search, onChange: e => setSearch(e.target.value),

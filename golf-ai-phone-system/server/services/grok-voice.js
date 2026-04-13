@@ -256,6 +256,7 @@ ${callerLine}
 - When a caller wants to book, FIRST use check_tee_times to see what's available on their date
 - Tell them the available times naturally: "I've got 9 AM, 10:30, and 11 AM open on Saturday — any of those work?"
 - Once they pick a time, ONLY ask for their name and phone number — nothing else
+- AFTER collecting their name, ALWAYS use save_customer_info to save it so we remember them next time they call
 - Then use book_tee_time to submit the request — our staff will confirm it in the tee sheet within minutes
 - Confirm back: "Perfect! I've got you down for Saturday at 10:30, 4 players. We'll confirm shortly!"
 - Do NOT ask for email. Do NOT ask multiple questions at once. Keep it fast and friendly.
@@ -806,18 +807,27 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
       }
 
       case 'save_customer_info': {
+        console.log(`[${callSid}] save_customer_info called | customerId: ${callerContext.customerId} | name: ${args.name} | email: ${args.email}`);
         if (callerContext.customerId) {
-          const updated = await updateCustomer(callerContext.customerId, {
-            name: args.name,
-            email: args.email,
-            phone: args.phone
-          });
-          // Update the context for the rest of the call
-          if (args.name) callerContext.name = args.name;
-          if (args.email) callerContext.email = args.email;
-          return { success: true, message: `Customer info updated: ${args.name}` };
+          try {
+            const updated = await updateCustomer(callerContext.customerId, {
+              name: args.name,
+              email: args.email,
+              phone: args.phone
+            });
+            console.log(`[${callSid}] Customer saved: ${updated?.name} (ID: ${updated?.id})`);
+            // Update the context for the rest of the call
+            if (args.name) callerContext.name = args.name;
+            if (args.email) callerContext.email = args.email;
+            return { success: true, message: `Got it! I've saved your info as ${args.name}.` };
+          } catch (err) {
+            console.error(`[${callSid}] Failed to save customer info:`, err.message);
+            return { success: false, message: 'I had trouble saving your info, but we can still complete your booking.' };
+          }
+        } else {
+          console.warn(`[${callSid}] save_customer_info: No customerId available`);
+          return { success: false, message: 'I had trouble saving your info, but we can still complete your booking.' };
         }
-        return { success: false, message: 'Unable to update customer info' };
       }
 
       default:

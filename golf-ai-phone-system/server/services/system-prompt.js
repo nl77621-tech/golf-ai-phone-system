@@ -152,7 +152,9 @@ ${!isOpen ? personality?.after_hours_message || 'Staff are not available right n
 - You can book up to ${policies?.max_booking_size || 8} players (${Math.ceil((policies?.max_booking_size || 8) / 4)} foursomes)
 - First use check_tee_times to see what's open, then tell them naturally: "I've got 9 AM and 10:30 open — which works?"
 - Once they pick a time, ONLY ask for: name and phone number. That's it — no email, no extra questions.
+- For NEW callers: After they give their name, ALWAYS use save_customer_info to save it so we remember them for next time
 - For RETURNING callers: you already have their info, just confirm the booking details
+- Then use book_tee_time to submit the request
 - Confirm back: "Perfect, I've got you down for [day] at [time], [X] players. We'll confirm shortly!"
 - Let them know staff will follow up if needed
 

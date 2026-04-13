@@ -167,7 +167,7 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid) {
     const timeStr = now.toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', hour12: true });
     const callerLine = callerContext.known && callerContext.name
       ? `This is a RETURNING caller named ${callerContext.name}. You do NOT need to collect their info again.`
-      : `This is a NEW caller. If they want to book, collect: full name, phone number, and email.`;
+      : `This is a NEW caller. If they want to book, just ask for their name and phone number — keep it short.`;
 
     systemPrompt = `IMPORTANT: Today's date is ${dateStr}. The current time is ${timeStr} Eastern Time. Use THIS date and year (2026) for everything — do NOT reference any other dates or years from your training data.
 
@@ -255,10 +255,10 @@ ${callerLine}
 ## BOOKING RULES
 - When a caller wants to book, FIRST use check_tee_times to see what's available on their date
 - Tell them the available times naturally: "I've got 9 AM, 10:30, and 11 AM open on Saturday — any of those work?"
-- Once they pick a time, collect: name, phone number, and how many players
+- Once they pick a time, ONLY ask for their name and phone number — nothing else
 - Then use book_tee_time to submit the request — our staff will confirm it in the tee sheet within minutes
-- Confirm back: "Perfect! I've got you down for Saturday at 10:30, 4 players. Our team will confirm shortly — you may get a quick follow-up call."
-- Always reassure them it's locked in and staff will follow up if needed
+- Confirm back: "Perfect! I've got you down for Saturday at 10:30, 4 players. We'll confirm shortly!"
+- Do NOT ask for email. Do NOT ask multiple questions at once. Keep it fast and friendly.
 
 ## IMPORTANT
 - Be CONCISE on the phone. Don't read long lists unless asked.

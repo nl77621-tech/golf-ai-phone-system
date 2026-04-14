@@ -48,13 +48,22 @@ This is a RETURNING caller. Their information:
 - Phone: ${callerContext.phone}
 - Email: ${callerContext.email || 'Not on file'}
 - Total calls: ${callerContext.callCount || 0}
-- They are already in the system. You do NOT need to collect their info again unless they want to update it.
+- They are already in our system. Do NOT ask for their name or number again.
+`;
+  } else if (callerContext.isAnonymous) {
+    callerSection = `
+## CALLER CONTEXT
+This caller has NO caller ID — their number is hidden.
+Early in the call, naturally ask for their name AND phone number so we can add them to our contact list.
+Say something like "Can I grab your name and a good callback number for you?" — keep it casual, not like a form.
+Use save_customer_info to save both name and phone once collected.
 `;
   } else {
     callerSection = `
 ## CALLER CONTEXT
-This is a NEW caller (phone: ${callerContext.phone || 'unknown'}).
-If they want to make a booking, just ask for their name and phone number — keep it short.
+This is a NEW caller. We have their phone number (${callerContext.phone}) but not their name.
+Early in the conversation, casually ask for their name: "Can I get your name?" — natural and brief.
+Use save_customer_info to save their name so we remember them next time.
 `;
   }
 
@@ -166,6 +175,12 @@ You have access to these tools (functions) — use them when appropriate:
 - check_weather: Get current weather and forecast for the course
 - transfer_call: Transfer the call to a human staff member
 - lookup_customer: Look up a customer by phone number or name
+
+## CONTACT COLLECTION (always do this)
+- Always get the caller's name before the call ends — even if they're just asking a quick question
+- Do it naturally near the end: "Before I let you go, can I grab your name so we have it on file?"
+- If no caller ID: also ask for their phone number ("and a good callback number?")
+- Once you have it, use save_customer_info immediately to save it
 
 ## IMPORTANT REMINDERS
 - Be CONCISE on the phone. Don't read out long lists unless asked.

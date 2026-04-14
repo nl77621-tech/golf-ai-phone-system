@@ -176,6 +176,39 @@ router.get('/customers', async (req, res) => {
   }
 });
 
+// POST /api/customers — Manually add a new contact
+router.post('/customers', async (req, res) => {
+  try {
+    const { name, phone, email, notes } = req.body;
+    if (!name && !phone) return res.status(400).json({ error: 'Name or phone required' });
+    const { normalizePhone } = require('../services/caller-lookup');
+    const normalized = phone ? normalizePhone(phone) : null;
+
+    // Check if phone already exists
+    if (normalized) {
+      const existing = await query('SELECT * FROM customers WHERE phone = $1', [normalized]);
+      if (existing.rows.length > 0) {
+        // Update with name if missing
+        const updated = await query(
+          `UPDATE customers SET name = COALESCE($1, name), email = COALESCE($2, email), notes = COALESCE($3, notes) WHERE phone = $4 RETURNING *`,
+          [name || null, email || null, notes || null, normalized]
+        );
+        return res.json(updated.rows[0]);
+      }
+    }
+
+    const result = await query(
+      `INSERT INTO customers (name, phone, email, notes, call_count, first_call_at, last_call_at)
+       VALUES ($1, $2, $3, $4, 0, NOW(), NOW()) RETURNING *`,
+      [name || null, normalized, email || null, notes || null]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Failed to create customer:', err.message);
+    res.status(500).json({ error: 'Failed to create contact' });
+  }
+});
+
 // GET /api/customers/:id — Get a single customer with history
 router.get('/customers/:id', async (req, res) => {
   try {

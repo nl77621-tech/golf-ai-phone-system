@@ -121,11 +121,15 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid) {
     console.error('Failed to create call log:', err.message);
   }
 
+  // Detect anonymous/blocked caller ID
+  const ANONYMOUS_NUMBERS = ['anonymous', 'blocked', 'unknown', '+266696687', '+86282452253'];
+  const isAnonymous = !callerPhone || ANONYMOUS_NUMBERS.some(a => callerPhone.toLowerCase().includes(a));
+
   // Look up caller (graceful fallback if DB unavailable)
   let customer = null;
   let isNew = true;
   try {
-    const result = await registerCall(callerPhone);
+    const result = await registerCall(isAnonymous ? null : callerPhone);
     customer = result.customer;
     isNew = result.isNew;
   } catch (err) {
@@ -133,8 +137,9 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid) {
   }
 
   const callerContext = {
-    phone: callerPhone,
-    known: !isNew && customer?.name,
+    phone: isAnonymous ? null : callerPhone,
+    isAnonymous,
+    known: !isNew && !!customer?.name,
     name: customer?.name,
     email: customer?.email,
     callCount: customer?.call_count,
@@ -166,8 +171,10 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid) {
     const dateStr = now.toLocaleDateString('en-US', { timeZone: 'America/Toronto', weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
     const timeStr = now.toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', hour12: true });
     const callerLine = callerContext.known && callerContext.name
-      ? `This is a RETURNING caller named ${callerContext.name}. You do NOT need to collect their info again.`
-      : `This is a NEW caller. If they want to book, just ask for their name and phone number — keep it short.`;
+      ? `This is a RETURNING caller named ${callerContext.name} (phone: ${callerContext.phone}). You do NOT need to collect their info again.`
+      : callerContext.isAnonymous
+        ? `This caller has NO caller ID — their number is hidden. Early in the call, naturally ask for their name AND phone number so we can add them to our system. Say something like "Can I grab your name and best callback number?"`
+        : `This is a NEW caller (we have their phone: ${callerContext.phone} but not their name). Early in the conversation, naturally ask for their name. Say something like "Can I get your name?" — keep it casual.`;
 
     systemPrompt = `IMPORTANT: Today's date is ${dateStr}. The current time is ${timeStr} Eastern Time. Use THIS date and year (2026) for everything — do NOT reference any other dates or years from your training data.
 
@@ -260,6 +267,12 @@ ${callerLine}
 - Then use book_tee_time to submit the request — our staff will confirm it in the tee sheet within minutes
 - Confirm back: "Perfect! I've got you down for Saturday at 10:30, 4 players. We'll confirm shortly!"
 - Do NOT ask for email. Do NOT ask multiple questions at once. Keep it fast and friendly.
+
+## CONTACT COLLECTION (important)
+- Always get the caller's name before the call ends — use save_customer_info to save it
+- If caller has no caller ID, also ask for their phone number
+- Do this naturally: "Before I let you go, can I grab your name so we have it on file?"
+- Don't make it feel like a form — keep it friendly and brief
 
 ## IMPORTANT
 - Be CONCISE on the phone. Don't read long lists unless asked.

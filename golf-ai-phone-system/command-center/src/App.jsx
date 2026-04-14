@@ -377,81 +377,191 @@ function BookingsPage() {
 }
 
 // ============================================
-// CUSTOMERS PAGE
+// CUSTOMERS PAGE — Contact List
 // ============================================
+function ContactModal({ contact, onClose, onSave }) {
+  const [form, setForm] = useState({
+    name: contact?.name || '',
+    phone: contact?.phone || '',
+    email: contact?.email || '',
+    notes: contact?.notes || ''
+  });
+  const [saving, setSaving] = useState(false);
+
+  const handleSave = async () => {
+    if (!form.name && !form.phone) return alert('Please enter at least a name or phone number.');
+    setSaving(true);
+    try {
+      if (contact?.id) {
+        await api(`/api/customers/${contact.id}`, { method: 'PUT', body: JSON.stringify(form) });
+      } else {
+        await api('/api/customers', { method: 'POST', body: JSON.stringify(form) });
+      }
+      onSave();
+    } catch (err) { alert('Failed to save: ' + err.message); }
+    finally { setSaving(false); }
+  };
+
+  const field = (label, key, type = 'text', placeholder = '') =>
+    React.createElement('div', { className: 'mb-4' },
+      React.createElement('label', { className: 'block text-sm font-medium text-gray-700 mb-1' }, label),
+      React.createElement('input', {
+        type, placeholder, value: form[key],
+        onChange: e => setForm(f => ({ ...f, [key]: e.target.value })),
+        className: 'w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-golf-500 outline-none'
+      })
+    );
+
+  return React.createElement('div', { className: 'fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50', onClick: onClose },
+    React.createElement('div', { className: 'bg-white rounded-2xl shadow-2xl p-6 w-full max-w-md mx-4', onClick: e => e.stopPropagation() },
+      React.createElement('div', { className: 'flex items-center justify-between mb-6' },
+        React.createElement('h2', { className: 'text-lg font-bold text-gray-800' }, contact?.id ? 'Edit Contact' : 'Add New Contact'),
+        React.createElement('button', { onClick: onClose, className: 'text-gray-400 hover:text-gray-600 text-xl' }, '✕')
+      ),
+      field('Full Name', 'name', 'text', 'e.g., Jane Smith'),
+      field('Phone Number', 'phone', 'tel', 'e.g., (416) 555-1234'),
+      field('Email', 'email', 'email', 'e.g., jane@email.com'),
+      React.createElement('div', { className: 'mb-4' },
+        React.createElement('label', { className: 'block text-sm font-medium text-gray-700 mb-1' }, 'Notes'),
+        React.createElement('textarea', {
+          value: form.notes, rows: 2, placeholder: 'Any notes about this customer...',
+          onChange: e => setForm(f => ({ ...f, notes: e.target.value })),
+          className: 'w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-golf-500 outline-none resize-none'
+        })
+      ),
+      React.createElement('div', { className: 'flex gap-3 justify-end' },
+        React.createElement('button', { onClick: onClose, className: 'px-4 py-2 text-sm text-gray-600 hover:text-gray-800' }, 'Cancel'),
+        React.createElement('button', {
+          onClick: handleSave, disabled: saving,
+          className: 'px-5 py-2 bg-golf-600 hover:bg-golf-700 text-white text-sm font-medium rounded-lg disabled:opacity-50'
+        }, saving ? 'Saving...' : contact?.id ? 'Save Changes' : 'Add Contact')
+      )
+    )
+  );
+}
+
 function CustomersPage() {
   const [customers, setCustomers] = useState([]);
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [modal, setModal] = useState(null); // null | 'add' | {contact obj for edit}
 
-  const loadCustomers = async (query = '') => {
+  const loadCustomers = async (q = '') => {
     try {
-      const d = await api(`/api/customers?search=${encodeURIComponent(query)}`);
+      const d = await api(`/api/customers?search=${encodeURIComponent(q)}`);
       setCustomers(d.customers || []);
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-    }
-  };
-
-  const handleRefresh = async () => {
-    setRefreshing(true);
-    await loadCustomers(search);
+    } catch (err) { console.error(err); }
+    finally { setLoading(false); setRefreshing(false); }
   };
 
   useEffect(() => {
-    const timeout = setTimeout(() => {
-      loadCustomers(search);
-    }, 300);
-    return () => clearTimeout(timeout);
+    const t = setTimeout(() => loadCustomers(search), 300);
+    return () => clearTimeout(t);
   }, [search]);
 
+  const handleSaved = () => { setModal(null); loadCustomers(search); };
+  const handleRefresh = () => { setRefreshing(true); loadCustomers(search); };
+
+  const initials = (name) => {
+    if (!name) return '?';
+    return name.split(' ').map(w => w[0]).join('').toUpperCase().slice(0, 2);
+  };
+  const avatarColor = (name) => {
+    const colors = ['bg-golf-600','bg-blue-500','bg-purple-500','bg-orange-500','bg-pink-500','bg-teal-500'];
+    const idx = name ? name.charCodeAt(0) % colors.length : 0;
+    return colors[idx];
+  };
+
+  const unnamed = customers.filter(c => !c.name);
+  const named   = customers.filter(c => c.name);
+
   return React.createElement('div', null,
-    React.createElement('div', { className: 'flex items-center gap-3 mb-6' },
-      React.createElement('h1', { className: 'text-2xl font-bold text-gray-800' }, 'Customers'),
+    // Header
+    React.createElement('div', { className: 'flex items-center justify-between mb-6' },
+      React.createElement('div', { className: 'flex items-center gap-3' },
+        React.createElement('h1', { className: 'text-2xl font-bold text-gray-800' }, 'Contacts'),
+        React.createElement('button', {
+          onClick: handleRefresh, disabled: refreshing,
+          className: 'text-sm px-3 py-1.5 bg-gray-200 hover:bg-gray-300 text-gray-600 rounded-lg disabled:opacity-50'
+        }, refreshing ? '⟳ Refreshing...' : '⟳ Refresh')
+      ),
       React.createElement('button', {
-        onClick: handleRefresh, disabled: refreshing,
-        className: 'text-sm px-3 py-1.5 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-lg transition-colors disabled:opacity-50',
-        title: 'Refresh customer list'
-      }, refreshing ? '⟳ Refreshing...' : '⟳ Refresh')
+        onClick: () => setModal('add'),
+        className: 'flex items-center gap-2 px-4 py-2 bg-golf-600 hover:bg-golf-700 text-white text-sm font-medium rounded-lg transition-colors'
+      }, '+ Add Contact')
     ),
+
+    // Search
     React.createElement('input', {
-      type: 'text', placeholder: 'Search by name, phone, or email...',
+      type: 'text', placeholder: '🔍  Search by name or phone...',
       value: search, onChange: e => setSearch(e.target.value),
-      className: 'w-full max-w-md px-4 py-2 border border-gray-300 rounded-lg mb-4 focus:ring-2 focus:ring-golf-500 focus:border-transparent outline-none'
+      className: 'w-full max-w-md px-4 py-2 border border-gray-300 rounded-lg mb-6 focus:ring-2 focus:ring-golf-500 outline-none text-sm'
     }),
-    React.createElement('div', { className: 'bg-white rounded-xl shadow-sm border overflow-hidden' },
-      React.createElement('table', { className: 'w-full text-sm' },
-        React.createElement('thead', null,
-          React.createElement('tr', { className: 'bg-gray-50 border-b text-left text-gray-500' },
-            React.createElement('th', { className: 'p-4' }, 'Name'),
-            React.createElement('th', { className: 'p-4' }, 'Phone'),
-            React.createElement('th', { className: 'p-4' }, 'Email'),
-            React.createElement('th', { className: 'p-4' }, 'Calls'),
-            React.createElement('th', { className: 'p-4' }, 'Last Call')
-          )
+
+    // Unknown callers banner
+    unnamed.length > 0 && !search && React.createElement('div', { className: 'bg-amber-50 border border-amber-200 rounded-xl p-4 mb-6' },
+      React.createElement('div', { className: 'flex items-center gap-2 mb-2' },
+        React.createElement('span', { className: 'text-amber-600 font-semibold text-sm' }, `⚠️  ${unnamed.length} caller${unnamed.length > 1 ? 's' : ''} without a name`),
+        React.createElement('span', { className: 'text-amber-500 text-xs' }, '— click Edit to add their name')
+      ),
+      unnamed.map(c => React.createElement('div', { key: c.id, className: 'flex items-center justify-between bg-white rounded-lg px-3 py-2 mb-1.5 border border-amber-100' },
+        React.createElement('div', null,
+          React.createElement('span', { className: 'text-sm font-mono text-gray-700' }, c.phone || 'No phone'),
+          React.createElement('span', { className: 'text-xs text-gray-400 ml-2' }, `${c.call_count} call${c.call_count !== 1 ? 's' : ''}`)
         ),
-        React.createElement('tbody', null,
-          customers.map(c =>
-            React.createElement('tr', { key: c.id, className: 'border-b hover:bg-gray-50' },
-              React.createElement('td', { className: 'p-4 font-medium' }, c.name || 'Unknown'),
-              React.createElement('td', { className: 'p-4 text-gray-600' }, c.phone),
-              React.createElement('td', { className: 'p-4 text-gray-600' }, c.email || '--'),
-              React.createElement('td', { className: 'p-4' }, c.call_count),
-              React.createElement('td', { className: 'p-4 text-gray-500' },
-                c.last_call_at ? new Date(c.last_call_at).toLocaleDateString() : '--'
+        React.createElement('button', {
+          onClick: () => setModal(c),
+          className: 'text-xs px-3 py-1 bg-amber-500 hover:bg-amber-600 text-white rounded-lg'
+        }, 'Edit')
+      ))
+    ),
+
+    // Contact list
+    loading
+      ? React.createElement('p', { className: 'text-gray-400 text-center py-12' }, 'Loading...')
+      : named.length === 0 && !unnamed.length
+        ? React.createElement('div', { className: 'text-center py-16' },
+            React.createElement('div', { className: 'text-5xl mb-3' }, '👥'),
+            React.createElement('p', { className: 'text-gray-400' }, 'No contacts yet. They\'ll appear automatically when people call.')
+          )
+        : React.createElement('div', { className: 'bg-white rounded-xl shadow-sm border overflow-hidden' },
+            named.map((c, i) =>
+              React.createElement('div', { key: c.id, className: `flex items-center gap-4 px-4 py-3 hover:bg-gray-50 ${i < named.length - 1 ? 'border-b' : ''}` },
+                // Avatar
+                React.createElement('div', { className: `w-10 h-10 rounded-full flex items-center justify-center text-white font-semibold text-sm flex-shrink-0 ${avatarColor(c.name)}` },
+                  initials(c.name)
+                ),
+                // Info
+                React.createElement('div', { className: 'flex-1 min-w-0' },
+                  React.createElement('div', { className: 'font-semibold text-gray-800 text-sm' }, c.name),
+                  React.createElement('div', { className: 'flex gap-3 mt-0.5' },
+                    c.phone && React.createElement('span', { className: 'text-xs text-gray-500' }, '📞 ' + c.phone),
+                    c.email && React.createElement('span', { className: 'text-xs text-gray-500' }, '✉️ ' + c.email)
+                  )
+                ),
+                // Stats
+                React.createElement('div', { className: 'text-right flex-shrink-0 hidden sm:block' },
+                  React.createElement('div', { className: 'text-xs font-medium text-gray-600' }, `${c.call_count} call${c.call_count !== 1 ? 's' : ''}`),
+                  React.createElement('div', { className: 'text-xs text-gray-400' },
+                    c.last_call_at ? new Date(c.last_call_at).toLocaleDateString() : '--'
+                  )
+                ),
+                // Edit button
+                React.createElement('button', {
+                  onClick: () => setModal(c),
+                  className: 'text-xs px-3 py-1.5 border border-gray-200 hover:border-golf-500 hover:text-golf-600 text-gray-500 rounded-lg transition-colors ml-2'
+                }, 'Edit')
               )
             )
-          )
-        )
-      ),
-      customers.length === 0 && React.createElement('p', { className: 'p-8 text-gray-400 text-center' },
-        loading ? 'Loading...' : 'No customers found'
-      )
-    )
+          ),
+
+    // Modal
+    modal && React.createElement(ContactModal, {
+      contact: modal === 'add' ? null : modal,
+      onClose: () => setModal(null),
+      onSave: handleSaved
+    })
   );
 }
 

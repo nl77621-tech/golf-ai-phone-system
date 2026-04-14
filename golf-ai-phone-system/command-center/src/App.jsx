@@ -99,6 +99,7 @@ function LoginPage({ onLogin }) {
 function Sidebar({ currentPage, onNavigate, onLogout }) {
   const menuItems = [
     { id: 'dashboard', label: 'Dashboard', icon: '\ud83d\udcca' },
+    { id: 'teesheet', label: 'Tee Sheet', icon: '\u26f3' },
     { id: 'bookings', label: 'Bookings', icon: '\ud83d\udcc5' },
     { id: 'customers', label: 'Customers', icon: '\ud83d\udc65' },
     { id: 'calls', label: 'Call Logs', icon: '\ud83d\udcde' },
@@ -765,6 +766,163 @@ function SettingsPage() {
   );
 }
 
+// ============================================
+// TEE SHEET PAGE
+// ============================================
+function TeeSheetPage() {
+  const today = new Date();
+  const toLocalDateStr = (d) => {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  };
+
+  const [selectedDate, setSelectedDate] = useState(toLocalDateStr(today));
+  const [bookings, setBookings] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    setLoading(true);
+    Promise.all([
+      api('/api/bookings?status=pending'),
+      api('/api/bookings?status=confirmed')
+    ]).then(([p, c]) => {
+      setBookings([...(p.bookings || []), ...(c.bookings || [])]);
+    }).catch(console.error).finally(() => setLoading(false));
+  }, [selectedDate]);
+
+  // Generate time slots 7:00 AM – 7:00 PM every 10 min
+  const slots = [];
+  for (let h = 7; h <= 18; h++) {
+    for (let m = 0; m < 60; m += 10) {
+      if (h === 18 && m > 0) break;
+      slots.push(`${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`);
+    }
+  }
+
+  // Match bookings to slots for this day
+  const bookingsBySlot = {};
+  bookings.forEach(b => {
+    const bDate = b.requested_date ? b.requested_date.split('T')[0] : '';
+    if (bDate !== selectedDate) return;
+    const time = b.requested_time ? b.requested_time.substring(0, 5) : null;
+    if (!time) return;
+    if (!bookingsBySlot[time]) bookingsBySlot[time] = [];
+    bookingsBySlot[time].push(b);
+  });
+
+  const prevDay = () => {
+    const d = new Date(selectedDate + 'T12:00:00');
+    d.setDate(d.getDate() - 1);
+    setSelectedDate(toLocalDateStr(d));
+  };
+  const nextDay = () => {
+    const d = new Date(selectedDate + 'T12:00:00');
+    d.setDate(d.getDate() + 1);
+    setSelectedDate(toLocalDateStr(d));
+  };
+
+  const displayDate = (() => {
+    const d = new Date(selectedDate + 'T12:00:00');
+    return d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+  })();
+
+  const statusStyle = {
+    pending:   { bg: 'bg-yellow-100 border-yellow-400', text: 'text-yellow-800', badge: 'bg-yellow-400' },
+    confirmed: { bg: 'bg-green-100 border-green-400',  text: 'text-green-800',  badge: 'bg-green-500'  }
+  };
+
+  const formatSlotLabel = (slot) => {
+    const [h, m] = slot.split(':');
+    const hour = parseInt(h);
+    const ampm = hour >= 12 ? 'PM' : 'AM';
+    const displayHour = hour % 12 || 12;
+    return `${displayHour}:${m} ${ampm}`;
+  };
+
+  const totalBooked = Object.keys(bookingsBySlot).length;
+
+  return React.createElement('div', null,
+    // Header
+    React.createElement('div', { className: 'flex items-center justify-between mb-6' },
+      React.createElement('h1', { className: 'text-2xl font-bold text-gray-800' }, '⛳ Tee Sheet'),
+      React.createElement('button', {
+        onClick: () => setSelectedDate(toLocalDateStr(today)),
+        className: 'text-sm px-3 py-1.5 bg-golf-600 hover:bg-golf-700 text-white rounded-lg transition-colors'
+      }, 'Today')
+    ),
+
+    // Date navigator
+    React.createElement('div', { className: 'flex items-center gap-4 mb-6 bg-white rounded-xl shadow-sm border p-4' },
+      React.createElement('button', { onClick: prevDay, className: 'text-xl font-bold text-gray-500 hover:text-gray-800 px-2' }, '‹'),
+      React.createElement('div', { className: 'flex-1 text-center' },
+        React.createElement('div', { className: 'font-semibold text-lg text-gray-800' }, displayDate),
+        React.createElement('div', { className: 'text-sm text-gray-400 mt-0.5' },
+          loading ? 'Loading...' : `${totalBooked} booked slot${totalBooked !== 1 ? 's' : ''}`
+        )
+      ),
+      React.createElement('button', { onClick: nextDay, className: 'text-xl font-bold text-gray-500 hover:text-gray-800 px-2' }, '›'),
+      React.createElement('input', {
+        type: 'date', value: selectedDate,
+        onChange: e => setSelectedDate(e.target.value),
+        className: 'ml-4 border rounded-lg px-3 py-1.5 text-sm focus:ring-2 focus:ring-golf-500 outline-none'
+      })
+    ),
+
+    // Legend
+    React.createElement('div', { className: 'flex gap-4 mb-4 text-xs' },
+      React.createElement('span', { className: 'flex items-center gap-1.5' },
+        React.createElement('span', { className: 'w-3 h-3 rounded-full bg-green-500 inline-block' }), 'Confirmed'),
+      React.createElement('span', { className: 'flex items-center gap-1.5' },
+        React.createElement('span', { className: 'w-3 h-3 rounded-full bg-yellow-400 inline-block' }), 'Pending'),
+      React.createElement('span', { className: 'flex items-center gap-1.5' },
+        React.createElement('span', { className: 'w-3 h-3 rounded-full bg-gray-200 inline-block' }), 'Available')
+    ),
+
+    // Tee sheet grid
+    React.createElement('div', { className: 'bg-white rounded-xl shadow-sm border overflow-hidden' },
+      slots.map((slot, i) => {
+        const slotBookings = bookingsBySlot[slot] || [];
+        const hasBooking = slotBookings.length > 0;
+        const isHour = slot.endsWith(':00');
+
+        return React.createElement('div', {
+          key: slot,
+          className: `flex items-stretch border-b last:border-b-0 ${isHour ? 'border-gray-300' : 'border-gray-100'} ${hasBooking ? '' : 'hover:bg-gray-50'}`
+        },
+          // Time label
+          React.createElement('div', {
+            className: `w-24 flex-shrink-0 px-3 flex items-center text-right justify-end border-r ${isHour ? 'border-gray-300 bg-gray-50' : 'border-gray-100 bg-white'}`
+          },
+            React.createElement('span', { className: `text-xs font-${isHour ? 'semibold' : 'normal'} ${isHour ? 'text-gray-700' : 'text-gray-400'}` },
+              isHour ? formatSlotLabel(slot) : slot.split(':')[1]
+            )
+          ),
+          // Slot content
+          React.createElement('div', { className: `flex-1 min-h-[36px] flex items-center px-3 py-1 gap-2` },
+            hasBooking
+              ? slotBookings.map((b, bi) => {
+                  const s = statusStyle[b.status] || statusStyle.pending;
+                  return React.createElement('div', {
+                    key: bi,
+                    className: `flex items-center gap-2 px-3 py-1.5 rounded-lg border ${s.bg} flex-1 max-w-sm`
+                  },
+                    React.createElement('span', { className: `w-2 h-2 rounded-full flex-shrink-0 ${s.badge}` }),
+                    React.createElement('span', { className: `font-semibold text-sm ${s.text}` }, b.customer_name || 'Unknown'),
+                    React.createElement('span', { className: `text-xs ${s.text} opacity-75` },
+                      `${b.party_size} player${b.party_size !== 1 ? 's' : ''}${b.num_carts ? ` · ${b.num_carts} cart${b.num_carts !== 1 ? 's' : ''}` : ''}`
+                    )
+                  );
+                })
+              : React.createElement('span', { className: 'text-xs text-gray-300' }, isHour ? '— available —' : '')
+          )
+        );
+      })
+    )
+  );
+}
+
 // Reusable setting field component
 function SettingField({ label, description, value, onSave, saving, type = 'text' }) {
   const [localValue, setLocalValue] = useState(value);
@@ -827,6 +985,7 @@ function App() {
 
   const pages = {
     dashboard: DashboardPage,
+    teesheet: TeeSheetPage,
     bookings: BookingsPage,
     customers: CustomersPage,
     calls: CallLogsPage,

@@ -891,35 +891,50 @@ function TeeSheetPage() {
   const [selectedDate, setSelectedDate] = useState(toLocalDateStr(today));
   const [bookings, setBookings] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [interval, setInterval2] = useState(10); // minutes between tee times
+  const [modal, setModal] = useState(null); // { mode: 'add'|'edit', slot, booking }
+  const [form, setForm] = useState({});
+  const [saving, setSaving] = useState(false);
+  const [saveMsg, setSaveMsg] = useState('');
 
-  useEffect(() => {
+  const loadBookings = () => {
     setLoading(true);
     Promise.all([
-      api('/api/bookings?status=pending'),
-      api('/api/bookings?status=confirmed')
-    ]).then(([p, c]) => {
-      setBookings([...(p.bookings || []), ...(c.bookings || [])]);
+      api('/api/bookings?limit=200'),
+    ]).then(([all]) => {
+      setBookings(all.bookings || []);
     }).catch(console.error).finally(() => setLoading(false));
-  }, [selectedDate]);
+  };
 
-  // Generate time slots 7:00 AM – 7:00 PM every 10 min
+  useEffect(() => { loadBookings(); }, [selectedDate]);
+
+  // Generate time slots 6:00 AM – 7:00 PM by selected interval
   const slots = [];
-  for (let h = 7; h <= 18; h++) {
-    for (let m = 0; m < 60; m += 10) {
-      if (h === 18 && m > 0) break;
-      slots.push(`${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`);
-    }
+  for (let totalMin = 6 * 60; totalMin <= 19 * 60; totalMin += interval) {
+    const h = Math.floor(totalMin / 60);
+    const m = totalMin % 60;
+    slots.push(`${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`);
   }
 
-  // Match bookings to slots for this day
+  // Match bookings to closest slot for this day
   const bookingsBySlot = {};
   bookings.forEach(b => {
     const bDate = b.requested_date ? b.requested_date.split('T')[0] : '';
     if (bDate !== selectedDate) return;
     const time = b.requested_time ? b.requested_time.substring(0, 5) : null;
     if (!time) return;
-    if (!bookingsBySlot[time]) bookingsBySlot[time] = [];
-    bookingsBySlot[time].push(b);
+    // Find closest slot
+    const [bh, bm] = time.split(':').map(Number);
+    const bTotalMin = bh * 60 + bm;
+    let closest = slots[0];
+    let minDiff = Infinity;
+    slots.forEach(s => {
+      const [sh, sm] = s.split(':').map(Number);
+      const diff = Math.abs(bTotalMin - (sh * 60 + sm));
+      if (diff < minDiff) { minDiff = diff; closest = s; }
+    });
+    if (!bookingsBySlot[closest]) bookingsBySlot[closest] = [];
+    bookingsBySlot[closest].push(b);
   });
 
   const prevDay = () => {
@@ -939,8 +954,10 @@ function TeeSheetPage() {
   })();
 
   const statusStyle = {
-    pending:   { bg: 'bg-yellow-100 border-yellow-400', text: 'text-yellow-800', badge: 'bg-yellow-400' },
-    confirmed: { bg: 'bg-green-100 border-green-400',  text: 'text-green-800',  badge: 'bg-green-500'  }
+    pending:   { bg: 'bg-yellow-50 border-yellow-400',  text: 'text-yellow-800', badge: 'bg-yellow-400', label: 'Pending' },
+    confirmed: { bg: 'bg-green-50 border-green-400',    text: 'text-green-800',  badge: 'bg-green-500',  label: 'Confirmed' },
+    cancelled: { bg: 'bg-red-50 border-red-300',        text: 'text-red-700',    badge: 'bg-red-400',    label: 'Cancelled' },
+    rejected:  { bg: 'bg-gray-100 border-gray-300',     text: 'text-gray-500',   badge: 'bg-gray-400',   label: 'Rejected' },
   };
 
   const formatSlotLabel = (slot) => {
@@ -951,28 +968,115 @@ function TeeSheetPage() {
     return `${displayHour}:${m} ${ampm}`;
   };
 
-  const totalBooked = Object.keys(bookingsBySlot).length;
+  const isHourMark = (slot) => slot.endsWith(':00');
+
+  const totalBooked = Object.values(bookingsBySlot).flat().filter(b => b.status !== 'cancelled' && b.status !== 'rejected').length;
+
+  // Open add modal for a slot
+  const openAdd = (slot) => {
+    setForm({ customer_name: '', customer_phone: '', party_size: '4', num_carts: '2', special_requests: '', requested_time: slot, requested_date: selectedDate, status: 'confirmed' });
+    setModal({ mode: 'add', slot });
+    setSaveMsg('');
+  };
+
+  // Open edit modal for a booking
+  const openEdit = (b) => {
+    setForm({
+      customer_name: b.customer_name || '',
+      customer_phone: b.customer_phone || '',
+      customer_email: b.customer_email || '',
+      party_size: String(b.party_size || 4),
+      num_carts: String(b.num_carts || 0),
+      special_requests: b.special_requests || '',
+      staff_notes: b.staff_notes || '',
+      requested_date: b.requested_date ? b.requested_date.split('T')[0] : selectedDate,
+      requested_time: b.requested_time ? b.requested_time.substring(0, 5) : '',
+      status: b.status || 'pending'
+    });
+    setModal({ mode: 'edit', booking: b });
+    setSaveMsg('');
+  };
+
+  const handleSave = async () => {
+    setSaving(true);
+    setSaveMsg('');
+    try {
+      if (modal.mode === 'add') {
+        await api('/api/bookings', {
+          method: 'POST',
+          body: JSON.stringify({ ...form, party_size: parseInt(form.party_size), num_carts: parseInt(form.num_carts) || 0 })
+        });
+        setSaveMsg('Booking created!');
+      } else {
+        // Update details
+        await api(`/api/bookings/${modal.booking.id}`, {
+          method: 'PUT',
+          body: JSON.stringify({ ...form, party_size: parseInt(form.party_size), num_carts: parseInt(form.num_carts) || 0 })
+        });
+        // Update status separately if changed
+        if (form.status !== modal.booking.status) {
+          await api(`/api/bookings/${modal.booking.id}/status`, {
+            method: 'PUT',
+            body: JSON.stringify({ status: form.status, staff_notes: form.staff_notes })
+          });
+        }
+        setSaveMsg('Saved!');
+      }
+      loadBookings();
+      setTimeout(() => setModal(null), 800);
+    } catch (e) {
+      setSaveMsg('Error saving. Try again.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleStatusChange = async (bookingId, newStatus) => {
+    try {
+      await api(`/api/bookings/${bookingId}/status`, { method: 'PUT', body: JSON.stringify({ status: newStatus }) });
+      loadBookings();
+    } catch (e) { console.error(e); }
+  };
+
+  const fv = (key) => ({ value: form[key] || '', onChange: e => setForm(f => ({ ...f, [key]: e.target.value })) });
+  const inputCls = 'border rounded-lg px-3 py-2 text-sm w-full focus:ring-2 focus:ring-golf-500 outline-none';
+  const labelCls = 'block text-xs font-medium text-gray-600 mb-1';
 
   return React.createElement('div', null,
     // Header
-    React.createElement('div', { className: 'flex items-center justify-between mb-6' },
+    React.createElement('div', { className: 'flex items-center justify-between mb-4' },
       React.createElement('h1', { className: 'text-2xl font-bold text-gray-800' }, '⛳ Tee Sheet'),
-      React.createElement('button', {
-        onClick: () => setSelectedDate(toLocalDateStr(today)),
-        className: 'text-sm px-3 py-1.5 bg-golf-600 hover:bg-golf-700 text-white rounded-lg transition-colors'
-      }, 'Today')
+      React.createElement('div', { className: 'flex items-center gap-3' },
+        // Interval selector
+        React.createElement('div', { className: 'flex items-center gap-2 bg-white border rounded-xl px-3 py-2 shadow-sm' },
+          React.createElement('span', { className: 'text-xs text-gray-500 font-medium' }, 'Interval:'),
+          React.createElement('select', {
+            value: interval,
+            onChange: e => setInterval2(parseInt(e.target.value)),
+            className: 'text-sm font-semibold text-golf-700 bg-transparent outline-none cursor-pointer'
+          },
+            [7, 8, 9, 10, 12, 15, 20, 30].map(n =>
+              React.createElement('option', { key: n, value: n }, `${n} min`)
+            )
+          )
+        ),
+        React.createElement('button', {
+          onClick: () => setSelectedDate(toLocalDateStr(today)),
+          className: 'text-sm px-3 py-2 bg-golf-600 hover:bg-golf-700 text-white rounded-xl transition-colors shadow-sm'
+        }, 'Today')
+      )
     ),
 
     // Date navigator
-    React.createElement('div', { className: 'flex items-center gap-4 mb-6 bg-white rounded-xl shadow-sm border p-4' },
-      React.createElement('button', { onClick: prevDay, className: 'text-xl font-bold text-gray-500 hover:text-gray-800 px-2' }, '‹'),
+    React.createElement('div', { className: 'flex items-center gap-4 mb-4 bg-white rounded-xl shadow-sm border p-4' },
+      React.createElement('button', { onClick: prevDay, className: 'text-xl font-bold text-gray-400 hover:text-gray-800 px-2' }, '‹'),
       React.createElement('div', { className: 'flex-1 text-center' },
         React.createElement('div', { className: 'font-semibold text-lg text-gray-800' }, displayDate),
         React.createElement('div', { className: 'text-sm text-gray-400 mt-0.5' },
-          loading ? 'Loading...' : `${totalBooked} booked slot${totalBooked !== 1 ? 's' : ''}`
+          loading ? 'Loading...' : `${totalBooked} booking${totalBooked !== 1 ? 's' : ''} · click any slot to edit`
         )
       ),
-      React.createElement('button', { onClick: nextDay, className: 'text-xl font-bold text-gray-500 hover:text-gray-800 px-2' }, '›'),
+      React.createElement('button', { onClick: nextDay, className: 'text-xl font-bold text-gray-400 hover:text-gray-800 px-2' }, '›'),
       React.createElement('input', {
         type: 'date', value: selectedDate,
         onChange: e => setSelectedDate(e.target.value),
@@ -981,54 +1085,165 @@ function TeeSheetPage() {
     ),
 
     // Legend
-    React.createElement('div', { className: 'flex gap-4 mb-4 text-xs' },
+    React.createElement('div', { className: 'flex gap-4 mb-3 text-xs' },
       React.createElement('span', { className: 'flex items-center gap-1.5' },
-        React.createElement('span', { className: 'w-3 h-3 rounded-full bg-green-500 inline-block' }), 'Confirmed'),
+        React.createElement('span', { className: 'w-2.5 h-2.5 rounded-full bg-green-500 inline-block' }), 'Confirmed'),
       React.createElement('span', { className: 'flex items-center gap-1.5' },
-        React.createElement('span', { className: 'w-3 h-3 rounded-full bg-yellow-400 inline-block' }), 'Pending'),
+        React.createElement('span', { className: 'w-2.5 h-2.5 rounded-full bg-yellow-400 inline-block' }), 'Pending'),
       React.createElement('span', { className: 'flex items-center gap-1.5' },
-        React.createElement('span', { className: 'w-3 h-3 rounded-full bg-gray-200 inline-block' }), 'Available')
+        React.createElement('span', { className: 'w-2.5 h-2.5 rounded-full bg-gray-200 inline-block' }), 'Available — click to add')
     ),
 
     // Tee sheet grid
     React.createElement('div', { className: 'bg-white rounded-xl shadow-sm border overflow-hidden' },
-      slots.map((slot, i) => {
-        const slotBookings = bookingsBySlot[slot] || [];
+      slots.map((slot) => {
+        const slotBookings = (bookingsBySlot[slot] || []).filter(b => b.status !== 'cancelled' && b.status !== 'rejected');
         const hasBooking = slotBookings.length > 0;
-        const isHour = slot.endsWith(':00');
+        const hourMark = isHourMark(slot);
 
         return React.createElement('div', {
           key: slot,
-          className: `flex items-stretch border-b last:border-b-0 ${isHour ? 'border-gray-300' : 'border-gray-100'} ${hasBooking ? '' : 'hover:bg-gray-50'}`
+          className: `flex items-stretch border-b last:border-b-0 ${hourMark ? 'border-gray-200' : 'border-gray-100'}`
         },
           // Time label
           React.createElement('div', {
-            className: `w-24 flex-shrink-0 px-3 flex items-center text-right justify-end border-r ${isHour ? 'border-gray-300 bg-gray-50' : 'border-gray-100 bg-white'}`
+            className: `w-20 flex-shrink-0 flex items-center justify-end px-3 border-r ${hourMark ? 'border-gray-200 bg-gray-50' : 'border-gray-100 bg-white'}`
           },
-            React.createElement('span', { className: `text-xs font-${isHour ? 'semibold' : 'normal'} ${isHour ? 'text-gray-700' : 'text-gray-400'}` },
-              isHour ? formatSlotLabel(slot) : slot.split(':')[1]
+            React.createElement('span', { className: `text-xs ${hourMark ? 'font-semibold text-gray-700' : 'text-gray-400'}` },
+              hourMark ? formatSlotLabel(slot) : `  :${slot.split(':')[1]}`
             )
           ),
-          // Slot content
-          React.createElement('div', { className: `flex-1 min-h-[36px] flex items-center px-3 py-1 gap-2` },
+          // Slot content — click to add booking on empty, click booking chip to edit
+          React.createElement('div', {
+            className: `flex-1 min-h-[34px] flex items-center px-2 py-0.5 gap-2 ${!hasBooking ? 'cursor-pointer hover:bg-golf-50 group' : ''}`,
+            onClick: !hasBooking ? () => openAdd(slot) : undefined
+          },
             hasBooking
               ? slotBookings.map((b, bi) => {
                   const s = statusStyle[b.status] || statusStyle.pending;
                   return React.createElement('div', {
                     key: bi,
-                    className: `flex items-center gap-2 px-3 py-1.5 rounded-lg border ${s.bg} flex-1 max-w-sm`
+                    onClick: () => openEdit(b),
+                    className: `flex items-center gap-2 px-3 py-1 rounded-lg border ${s.bg} cursor-pointer hover:shadow-md transition-shadow flex-1 max-w-lg`
                   },
                     React.createElement('span', { className: `w-2 h-2 rounded-full flex-shrink-0 ${s.badge}` }),
                     React.createElement('span', { className: `font-semibold text-sm ${s.text}` }, b.customer_name || 'Unknown'),
-                    React.createElement('span', { className: `text-xs ${s.text} opacity-75` },
-                      `${b.party_size} player${b.party_size !== 1 ? 's' : ''}${b.num_carts ? ` · ${b.num_carts} cart${b.num_carts !== 1 ? 's' : ''}` : ''}`
+                    React.createElement('span', { className: `text-xs ${s.text} opacity-70 ml-1` },
+                      `${b.party_size || '?'} players${b.num_carts ? ` · ${b.num_carts} cart${b.num_carts !== 1 ? 's' : ''}` : ''}`
+                    ),
+                    b.customer_phone && React.createElement('span', { className: `text-xs ${s.text} opacity-50 ml-auto` }, b.customer_phone),
+                    // Quick confirm/cancel buttons
+                    b.status === 'pending' && React.createElement('div', { className: 'flex gap-1 ml-2', onClick: e => e.stopPropagation() },
+                      React.createElement('button', {
+                        onClick: () => handleStatusChange(b.id, 'confirmed'),
+                        className: 'text-xs px-2 py-0.5 bg-green-500 text-white rounded hover:bg-green-600 transition-colors'
+                      }, '✓'),
+                      React.createElement('button', {
+                        onClick: () => handleStatusChange(b.id, 'cancelled'),
+                        className: 'text-xs px-2 py-0.5 bg-red-400 text-white rounded hover:bg-red-500 transition-colors'
+                      }, '✕')
                     )
                   );
                 })
-              : React.createElement('span', { className: 'text-xs text-gray-300' }, isHour ? '— available —' : '')
+              : React.createElement('span', { className: 'text-xs text-gray-200 group-hover:text-golf-400 transition-colors' },
+                  hourMark ? '+ add booking' : ''
+                )
           )
         );
       })
+    ),
+
+    // MODAL — Add or Edit booking
+    modal && React.createElement('div', {
+      className: 'fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50 p-4',
+      onClick: e => { if (e.target === e.currentTarget) setModal(null); }
+    },
+      React.createElement('div', { className: 'bg-white rounded-2xl shadow-xl w-full max-w-md p-6' },
+        // Modal header
+        React.createElement('div', { className: 'flex items-center justify-between mb-5' },
+          React.createElement('h2', { className: 'font-bold text-lg text-gray-800' },
+            modal.mode === 'add'
+              ? `Add Booking — ${formatSlotLabel(modal.slot)}`
+              : `Edit Booking — ${formatSlotLabel(form.requested_time || '')}`
+          ),
+          React.createElement('button', { onClick: () => setModal(null), className: 'text-gray-400 hover:text-gray-600 text-xl font-bold' }, '×')
+        ),
+
+        // Form fields
+        React.createElement('div', { className: 'grid grid-cols-2 gap-3 mb-4' },
+          // Name
+          React.createElement('div', { className: 'col-span-2' },
+            React.createElement('label', { className: labelCls }, 'Customer Name *'),
+            React.createElement('input', { ...fv('customer_name'), className: inputCls, placeholder: 'Full name' })
+          ),
+          // Phone
+          React.createElement('div', null,
+            React.createElement('label', { className: labelCls }, 'Phone'),
+            React.createElement('input', { ...fv('customer_phone'), className: inputCls, placeholder: '(416) 555-0000' })
+          ),
+          // Email
+          React.createElement('div', null,
+            React.createElement('label', { className: labelCls }, 'Email'),
+            React.createElement('input', { ...fv('customer_email'), className: inputCls, placeholder: 'optional' })
+          ),
+          // Date
+          React.createElement('div', null,
+            React.createElement('label', { className: labelCls }, 'Date'),
+            React.createElement('input', { type: 'date', ...fv('requested_date'), className: inputCls })
+          ),
+          // Time
+          React.createElement('div', null,
+            React.createElement('label', { className: labelCls }, 'Time'),
+            React.createElement('select', { ...fv('requested_time'), className: inputCls },
+              slots.map(s => React.createElement('option', { key: s, value: s }, formatSlotLabel(s)))
+            )
+          ),
+          // Party size
+          React.createElement('div', null,
+            React.createElement('label', { className: labelCls }, 'Players'),
+            React.createElement('select', { ...fv('party_size'), className: inputCls },
+              [1,2,3,4,5,6,7,8].map(n => React.createElement('option', { key: n, value: n }, `${n} player${n !== 1 ? 's' : ''}`))
+            )
+          ),
+          // Carts
+          React.createElement('div', null,
+            React.createElement('label', { className: labelCls }, 'Carts'),
+            React.createElement('select', { ...fv('num_carts'), className: inputCls },
+              [0,1,2,3,4].map(n => React.createElement('option', { key: n, value: n }, n === 0 ? 'No carts' : `${n} cart${n !== 1 ? 's' : ''}`))
+            )
+          ),
+          // Status (edit only)
+          modal.mode === 'edit' && React.createElement('div', { className: 'col-span-2' },
+            React.createElement('label', { className: labelCls }, 'Status'),
+            React.createElement('select', { ...fv('status'), className: inputCls },
+              ['pending', 'confirmed', 'cancelled', 'rejected'].map(s =>
+                React.createElement('option', { key: s, value: s }, s.charAt(0).toUpperCase() + s.slice(1))
+              )
+            )
+          ),
+          // Special requests
+          React.createElement('div', { className: 'col-span-2' },
+            React.createElement('label', { className: labelCls }, 'Special Requests'),
+            React.createElement('textarea', { ...fv('special_requests'), className: inputCls, rows: 2, placeholder: 'e.g. cart with umbrella, accessibility needs...' })
+          ),
+          // Staff notes (edit only)
+          modal.mode === 'edit' && React.createElement('div', { className: 'col-span-2' },
+            React.createElement('label', { className: labelCls }, 'Staff Notes'),
+            React.createElement('textarea', { ...fv('staff_notes'), className: inputCls, rows: 2, placeholder: 'Internal notes (not shared with customer)' })
+          )
+        ),
+
+        // Save button + message
+        saveMsg && React.createElement('p', { className: `text-sm mb-3 ${saveMsg.includes('Error') ? 'text-red-600' : 'text-green-600'}` }, saveMsg),
+        React.createElement('div', { className: 'flex gap-2' },
+          React.createElement('button', {
+            onClick: handleSave,
+            disabled: saving || !form.customer_name,
+            className: `flex-1 py-2.5 rounded-xl font-semibold text-sm transition-colors ${saving || !form.customer_name ? 'bg-gray-200 text-gray-400 cursor-not-allowed' : 'bg-golf-600 hover:bg-golf-700 text-white'}`
+          }, saving ? 'Saving...' : modal.mode === 'add' ? 'Add Booking' : 'Save Changes'),
+          React.createElement('button', { onClick: () => setModal(null), className: 'px-5 py-2.5 rounded-xl font-semibold text-sm bg-gray-100 hover:bg-gray-200 text-gray-600 transition-colors' }, 'Cancel')
+        )
+      )
     )
   );
 }

@@ -7,7 +7,7 @@ const router = express.Router();
 const { requireAuth } = require('../middleware/auth');
 const { query, getSetting, updateSetting } = require('../config/database');
 const {
-  getAllBookings, updateBookingStatus,
+  getAllBookings, updateBookingStatus, createBookingRequest,
   getPendingModifications, updateModificationStatus
 } = require('../services/booking-manager');
 
@@ -91,6 +91,62 @@ router.get('/bookings', async (req, res) => {
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: 'Failed to load bookings' });
+  }
+});
+
+// POST /api/bookings — Create a booking manually from Command Center
+router.post('/bookings', async (req, res) => {
+  try {
+    const { customer_name, customer_phone, customer_email, requested_date, requested_time, party_size, num_carts, special_requests } = req.body;
+    if (!customer_name || !requested_date || !party_size) {
+      return res.status(400).json({ error: 'customer_name, requested_date, and party_size are required' });
+    }
+    const booking = await createBookingRequest({
+      customerName: customer_name,
+      customerPhone: customer_phone || null,
+      customerEmail: customer_email || null,
+      requestedDate: requested_date,
+      requestedTime: requested_time || null,
+      partySize: parseInt(party_size),
+      numCarts: parseInt(num_carts) || 0,
+      specialRequests: special_requests || null,
+      callId: null
+    });
+    res.json(booking);
+  } catch (err) {
+    console.error('Failed to create booking:', err);
+    res.status(500).json({ error: 'Failed to create booking' });
+  }
+});
+
+// PUT /api/bookings/:id — Update booking details from Command Center
+router.put('/bookings/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { customer_name, customer_phone, customer_email, requested_date, requested_time, party_size, num_carts, special_requests, staff_notes } = req.body;
+    const result = await query(
+      `UPDATE booking_requests SET
+        customer_name = COALESCE($1, customer_name),
+        customer_phone = COALESCE($2, customer_phone),
+        customer_email = COALESCE($3, customer_email),
+        requested_date = COALESCE($4, requested_date),
+        requested_time = COALESCE($5, requested_time),
+        party_size = COALESCE($6, party_size),
+        num_carts = COALESCE($7, num_carts),
+        special_requests = COALESCE($8, special_requests),
+        staff_notes = COALESCE($9, staff_notes),
+        updated_at = NOW()
+       WHERE id = $10 RETURNING *`,
+      [customer_name || null, customer_phone || null, customer_email || null,
+       requested_date || null, requested_time || null,
+       party_size ? parseInt(party_size) : null, num_carts !== undefined ? parseInt(num_carts) : null,
+       special_requests || null, staff_notes || null, parseInt(id)]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Booking not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Failed to update booking:', err);
+    res.status(500).json({ error: 'Failed to update booking' });
   }
 });
 

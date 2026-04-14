@@ -892,8 +892,10 @@ function TeeSheetPage() {
   const [bookings, setBookings] = useState([]);
   const [loading, setLoading] = useState(true);
   const [interval, setInterval2] = useState(10); // minutes between tee times
-  const [startHour, setStartHour] = useState(6);  // sheet start hour (6 AM)
-  const [endHour, setEndHour] = useState(19);      // sheet end hour (7 PM)
+  const [startHour, setStartHour] = useState(6);  // sheet start hour
+  const [startMin, setStartMin] = useState(0);    // sheet start minute (0-59)
+  const [endHour, setEndHour] = useState(19);      // sheet end hour
+  const [endMin, setEndMin] = useState(0);         // sheet end minute (0-59)
   const [modal, setModal] = useState(null); // { mode: 'add'|'edit', slot, booking }
   const [form, setForm] = useState({});
   const [saving, setSaving] = useState(false);
@@ -909,9 +911,11 @@ function TeeSheetPage() {
 
   useEffect(() => { loadBookings(); }, [selectedDate]);
 
-  // Generate time slots from startHour to endHour by selected interval
+  // Generate time slots from startHour:startMin to endHour:endMin by selected interval
   const slots = [];
-  for (let totalMin = startHour * 60; totalMin <= endHour * 60; totalMin += interval) {
+  const startTotalMin = startHour * 60 + startMin;
+  const endTotalMin = endHour * 60 + endMin;
+  for (let totalMin = startTotalMin; totalMin <= endTotalMin; totalMin += interval) {
     const h = Math.floor(totalMin / 60);
     const m = totalMin % 60;
     slots.push(`${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`);
@@ -1057,33 +1061,55 @@ function TeeSheetPage() {
     React.createElement('div', { className: 'flex items-center justify-between mb-4 flex-wrap gap-3' },
       React.createElement('h1', { className: 'text-2xl font-bold text-gray-800' }, '⛳ Tee Sheet'),
       React.createElement('div', { className: 'flex items-center gap-2 flex-wrap' },
-        // Start time selector
-        React.createElement('div', { className: 'flex items-center gap-1.5 bg-white border rounded-xl px-3 py-2 shadow-sm' },
+        // Start time selector (hour + minute)
+        React.createElement('div', { className: 'flex items-center gap-1 bg-white border rounded-xl px-2 py-2 shadow-sm' },
           React.createElement('span', { className: 'text-xs text-gray-500 font-medium' }, 'Start:'),
           React.createElement('select', {
             value: startHour,
-            onChange: e => { const v = parseInt(e.target.value); if (v < endHour) setStartHour(v); },
+            onChange: e => { const v = parseInt(e.target.value); if (v < endHour || (v === endHour && startMin <= endMin)) setStartHour(v); },
             className: 'text-sm font-semibold text-golf-700 bg-transparent outline-none cursor-pointer'
           },
             Array.from({length: 18}, (_, i) => i + 4).map(h => {
-              const label = h < 12 ? `${h}:00 AM` : h === 12 ? '12:00 PM' : `${h-12}:00 PM`;
+              const label = h < 12 ? `${h}` : h === 12 ? '12' : `${h-12}`;
               return React.createElement('option', { key: h, value: h }, label);
             })
-          )
+          ),
+          React.createElement('span', { className: 'text-gray-400' }, ':'),
+          React.createElement('select', {
+            value: startMin,
+            onChange: e => { const v = parseInt(e.target.value); if (startHour < endHour || (startHour === endHour && v <= endMin)) setStartMin(v); },
+            className: 'text-sm font-semibold text-golf-700 bg-transparent outline-none cursor-pointer w-12'
+          },
+            Array.from({length: 60}, (_, i) => i).map(m =>
+              React.createElement('option', { key: m, value: m }, String(m).padStart(2, '0'))
+            )
+          ),
+          React.createElement('span', { className: 'text-xs text-gray-400' }, startHour < 12 ? 'AM' : startHour === 12 ? 'PM' : 'PM')
         ),
-        // End time selector
-        React.createElement('div', { className: 'flex items-center gap-1.5 bg-white border rounded-xl px-3 py-2 shadow-sm' },
+        // End time selector (hour + minute)
+        React.createElement('div', { className: 'flex items-center gap-1 bg-white border rounded-xl px-2 py-2 shadow-sm' },
           React.createElement('span', { className: 'text-xs text-gray-500 font-medium' }, 'End:'),
           React.createElement('select', {
             value: endHour,
-            onChange: e => { const v = parseInt(e.target.value); if (v > startHour) setEndHour(v); },
+            onChange: e => { const v = parseInt(e.target.value); if (v > startHour || (v === startHour && endMin >= startMin)) setEndHour(v); },
             className: 'text-sm font-semibold text-golf-700 bg-transparent outline-none cursor-pointer'
           },
             Array.from({length: 18}, (_, i) => i + 5).map(h => {
-              const label = h < 12 ? `${h}:00 AM` : h === 12 ? '12:00 PM' : `${h-12}:00 PM`;
+              const label = h < 12 ? `${h}` : h === 12 ? '12' : `${h-12}`;
               return React.createElement('option', { key: h, value: h }, label);
             })
-          )
+          ),
+          React.createElement('span', { className: 'text-gray-400' }, ':'),
+          React.createElement('select', {
+            value: endMin,
+            onChange: e => { const v = parseInt(e.target.value); if (endHour > startHour || (endHour === startHour && v >= startMin)) setEndMin(v); },
+            className: 'text-sm font-semibold text-golf-700 bg-transparent outline-none cursor-pointer w-12'
+          },
+            Array.from({length: 60}, (_, i) => i).map(m =>
+              React.createElement('option', { key: m, value: m }, String(m).padStart(2, '0'))
+            )
+          ),
+          React.createElement('span', { className: 'text-xs text-gray-400' }, endHour < 12 ? 'AM' : endHour === 12 ? 'PM' : 'PM')
         ),
         // Interval selector
         React.createElement('div', { className: 'flex items-center gap-1.5 bg-white border rounded-xl px-3 py-2 shadow-sm' },

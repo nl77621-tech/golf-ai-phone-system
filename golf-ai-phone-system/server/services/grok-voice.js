@@ -714,6 +714,23 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
             specialRequests: args.special_requests,
             callId: callLogId
           });
+
+          // Auto-save caller's name to customer record so it appears in Contacts
+          if (callerContext.customerId && args.customer_name) {
+            try {
+              const { updateCustomer } = require('./caller-lookup');
+              await updateCustomer(callerContext.customerId, {
+                name: args.customer_name,
+                phone: args.customer_phone || undefined,
+                email: args.customer_email || undefined
+              });
+              callerContext.name = args.customer_name;
+              console.log(`[${callLogId}] Auto-saved customer name from booking: ${args.customer_name}`);
+            } catch (saveErr) {
+              console.warn(`[${callLogId}] Could not auto-save customer name:`, saveErr.message);
+            }
+          }
+
           return {
             success: true,
             message: `Booking request logged for ${args.customer_name}, ${args.date} at ${args.time || 'flexible time'}, ${args.party_size} players. Staff will confirm shortly.`,

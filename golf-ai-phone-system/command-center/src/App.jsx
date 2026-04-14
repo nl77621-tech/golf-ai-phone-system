@@ -892,6 +892,8 @@ function TeeSheetPage() {
   const [bookings, setBookings] = useState([]);
   const [loading, setLoading] = useState(true);
   const [interval, setInterval2] = useState(10); // minutes between tee times
+  const [startHour, setStartHour] = useState(6);  // sheet start hour (6 AM)
+  const [endHour, setEndHour] = useState(19);      // sheet end hour (7 PM)
   const [modal, setModal] = useState(null); // { mode: 'add'|'edit', slot, booking }
   const [form, setForm] = useState({});
   const [saving, setSaving] = useState(false);
@@ -899,22 +901,30 @@ function TeeSheetPage() {
 
   const loadBookings = () => {
     setLoading(true);
-    Promise.all([
-      api('/api/bookings?limit=200'),
-    ]).then(([all]) => {
-      setBookings(all.bookings || []);
-    }).catch(console.error).finally(() => setLoading(false));
+    api('/api/bookings?limit=200')
+      .then((all) => { setBookings(all.bookings || []); })
+      .catch(console.error)
+      .finally(() => setLoading(false));
   };
 
   useEffect(() => { loadBookings(); }, [selectedDate]);
 
-  // Generate time slots 6:00 AM – 7:00 PM by selected interval
+  // Generate time slots from startHour to endHour by selected interval
   const slots = [];
-  for (let totalMin = 6 * 60; totalMin <= 19 * 60; totalMin += interval) {
+  for (let totalMin = startHour * 60; totalMin <= endHour * 60; totalMin += interval) {
     const h = Math.floor(totalMin / 60);
     const m = totalMin % 60;
     slots.push(`${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`);
   }
+
+  // Hour-mark: true for the FIRST slot whose hour is >= to a new integer hour
+  // Works correctly for any interval (7, 8, 9, 10, 12 min, etc.)
+  const hourMarkSet = new Set();
+  let lastHour = -1;
+  slots.forEach(slot => {
+    const h = parseInt(slot.split(':')[0]);
+    if (h !== lastHour) { hourMarkSet.add(slot); lastHour = h; }
+  });
 
   // Match bookings to closest slot for this day
   const bookingsBySlot = {};
@@ -968,7 +978,7 @@ function TeeSheetPage() {
     return `${displayHour}:${m} ${ampm}`;
   };
 
-  const isHourMark = (slot) => slot.endsWith(':00');
+  const isHourMark = (slot) => hourMarkSet.has(slot);
 
   const totalBooked = Object.values(bookingsBySlot).flat().filter(b => b.status !== 'cancelled' && b.status !== 'rejected').length;
 
@@ -1044,11 +1054,39 @@ function TeeSheetPage() {
 
   return React.createElement('div', null,
     // Header
-    React.createElement('div', { className: 'flex items-center justify-between mb-4' },
+    React.createElement('div', { className: 'flex items-center justify-between mb-4 flex-wrap gap-3' },
       React.createElement('h1', { className: 'text-2xl font-bold text-gray-800' }, '⛳ Tee Sheet'),
-      React.createElement('div', { className: 'flex items-center gap-3' },
+      React.createElement('div', { className: 'flex items-center gap-2 flex-wrap' },
+        // Start time selector
+        React.createElement('div', { className: 'flex items-center gap-1.5 bg-white border rounded-xl px-3 py-2 shadow-sm' },
+          React.createElement('span', { className: 'text-xs text-gray-500 font-medium' }, 'Start:'),
+          React.createElement('select', {
+            value: startHour,
+            onChange: e => { const v = parseInt(e.target.value); if (v < endHour) setStartHour(v); },
+            className: 'text-sm font-semibold text-golf-700 bg-transparent outline-none cursor-pointer'
+          },
+            Array.from({length: 18}, (_, i) => i + 4).map(h => {
+              const label = h < 12 ? `${h}:00 AM` : h === 12 ? '12:00 PM' : `${h-12}:00 PM`;
+              return React.createElement('option', { key: h, value: h }, label);
+            })
+          )
+        ),
+        // End time selector
+        React.createElement('div', { className: 'flex items-center gap-1.5 bg-white border rounded-xl px-3 py-2 shadow-sm' },
+          React.createElement('span', { className: 'text-xs text-gray-500 font-medium' }, 'End:'),
+          React.createElement('select', {
+            value: endHour,
+            onChange: e => { const v = parseInt(e.target.value); if (v > startHour) setEndHour(v); },
+            className: 'text-sm font-semibold text-golf-700 bg-transparent outline-none cursor-pointer'
+          },
+            Array.from({length: 18}, (_, i) => i + 5).map(h => {
+              const label = h < 12 ? `${h}:00 AM` : h === 12 ? '12:00 PM' : `${h-12}:00 PM`;
+              return React.createElement('option', { key: h, value: h }, label);
+            })
+          )
+        ),
         // Interval selector
-        React.createElement('div', { className: 'flex items-center gap-2 bg-white border rounded-xl px-3 py-2 shadow-sm' },
+        React.createElement('div', { className: 'flex items-center gap-1.5 bg-white border rounded-xl px-3 py-2 shadow-sm' },
           React.createElement('span', { className: 'text-xs text-gray-500 font-medium' }, 'Interval:'),
           React.createElement('select', {
             value: interval,
@@ -1195,7 +1233,9 @@ function TeeSheetPage() {
           React.createElement('div', null,
             React.createElement('label', { className: labelCls }, 'Time'),
             React.createElement('select', { ...fv('requested_time'), className: inputCls },
-              slots.map(s => React.createElement('option', { key: s, value: s }, formatSlotLabel(s)))
+              slots.filter(s => isHourMark(s) || true).map(s =>
+                React.createElement('option', { key: s, value: s }, formatSlotLabel(s))
+              )
             )
           ),
           // Party size

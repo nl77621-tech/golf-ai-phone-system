@@ -632,6 +632,151 @@ function CallLogsPage() {
 }
 
 // ============================================
+// DAILY INSTRUCTIONS TAB COMPONENT
+// ============================================
+function DailyInstructionsTab({ settings, saveSetting, saving }) {
+  // Build date keys for today + 3 days ahead
+  const toDateKey = (offsetDays) => {
+    const d = new Date();
+    d.setDate(d.getDate() + offsetDays);
+    return d.toLocaleDateString('en-CA'); // YYYY-MM-DD
+  };
+  const toDisplayDate = (offsetDays) => {
+    const d = new Date();
+    d.setDate(d.getDate() + offsetDays);
+    if (offsetDays === 0) return 'Today';
+    if (offsetDays === 1) return 'Tomorrow';
+    return d.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' });
+  };
+
+  const days = [0, 1, 2, 3].map(i => ({ offset: i, key: toDateKey(i), label: toDisplayDate(i) }));
+
+  // Local state: one entry per day key
+  const stored = settings['daily_instructions']?.value || {};
+  const [local, setLocal] = useState(() =>
+    Object.fromEntries(days.map(d => [d.key, { active: !!stored[d.key]?.active, message: stored[d.key]?.message || '' }]))
+  );
+  const [savedKey, setSavedKey] = useState('');
+
+  useEffect(() => {
+    const s = settings['daily_instructions']?.value || {};
+    setLocal(Object.fromEntries(days.map(d => [d.key, { active: !!s[d.key]?.active, message: s[d.key]?.message || '' }])));
+  }, [settings]);
+
+  const updateLocal = (key, field, value) => setLocal(prev => ({ ...prev, [key]: { ...prev[key], [field]: value } }));
+
+  const saveDay = async (dateKey) => {
+    const updated = { ...stored };
+    updated[dateKey] = { ...local[dateKey], updated_at: new Date().toISOString() };
+    await saveSetting('daily_instructions', updated);
+    setSavedKey(dateKey);
+    setTimeout(() => setSavedKey(''), 2000);
+  };
+
+  const clearDay = async (dateKey) => {
+    const updated = { ...stored };
+    updated[dateKey] = { active: false, message: '', updated_at: new Date().toISOString() };
+    await saveSetting('daily_instructions', updated);
+    setLocal(prev => ({ ...prev, [dateKey]: { active: false, message: '' } }));
+  };
+
+  const EXAMPLES = [
+    'Cart path only today due to wet conditions.',
+    'Back 9 closed for aeration — front 9 only.',
+    'Course running ~30 min behind — expect some delays.',
+    'Power carts unavailable — pull carts only.',
+    'Pro shop closed — bookings by phone only.',
+    'Dress code strictly enforced — collared shirts required.',
+    'Beverage cart not running today.',
+    'Driving range closed for maintenance.',
+  ];
+
+  return React.createElement('div', null,
+    // Header
+    React.createElement('div', { className: 'mb-6' },
+      React.createElement('h2', { className: 'text-xl font-bold text-gray-800 mb-1' }, '📋 Daily Instructions'),
+      React.createElement('p', { className: 'text-sm text-gray-500' },
+        'Set special instructions per day. The AI will proactively tell every caller — and can answer questions about upcoming days too.'
+      )
+    ),
+
+    // Quick examples strip
+    React.createElement('div', { className: 'mb-6 p-4 bg-gray-50 rounded-xl border' },
+      React.createElement('p', { className: 'text-xs font-medium text-gray-500 mb-2' }, '⚡ Quick fill — click to copy to any day below:'),
+      React.createElement('div', { className: 'flex flex-wrap gap-2' },
+        EXAMPLES.map(ex => React.createElement('button', {
+          key: ex,
+          onClick: () => {
+            const todayKey = toDateKey(0);
+            updateLocal(todayKey, 'message', ex);
+          },
+          className: 'text-xs px-2.5 py-1 bg-white hover:bg-golf-50 hover:text-golf-700 border border-gray-200 rounded-lg transition-colors text-gray-600'
+        }, ex))
+      )
+    ),
+
+    // Day cards
+    React.createElement('div', { className: 'flex flex-col gap-4' },
+      days.map(({ key, label, offset }) => {
+        const entry = local[key] || { active: false, message: '' };
+        const isToday = offset === 0;
+        const hasContent = entry.message.trim().length > 0;
+
+        return React.createElement('div', {
+          key,
+          className: `rounded-xl border-2 p-5 transition-colors ${entry.active && hasContent ? 'border-amber-400 bg-amber-50' : isToday ? 'border-golf-200 bg-white' : 'border-gray-100 bg-white'}`
+        },
+          // Day header row
+          React.createElement('div', { className: 'flex items-center justify-between mb-3' },
+            React.createElement('div', { className: 'flex items-center gap-3' },
+              React.createElement('div', { className: `px-3 py-1 rounded-full text-xs font-bold ${isToday ? 'bg-golf-600 text-white' : 'bg-gray-100 text-gray-600'}` }, label),
+              React.createElement('span', { className: 'text-xs text-gray-400' }, key),
+              entry.active && hasContent && React.createElement('span', { className: 'text-xs px-2 py-0.5 bg-amber-400 text-white rounded-full font-semibold' }, '📢 LIVE')
+            ),
+            // Toggle
+            React.createElement('div', {
+              onClick: () => updateLocal(key, 'active', !entry.active),
+              className: `relative w-11 h-6 rounded-full cursor-pointer transition-colors flex-shrink-0 ${entry.active ? 'bg-green-500' : 'bg-gray-200'}`
+            },
+              React.createElement('div', {
+                className: `absolute top-1 w-4 h-4 bg-white rounded-full shadow transition-transform ${entry.active ? 'translate-x-6' : 'translate-x-1'}`
+              })
+            )
+          ),
+
+          // Textarea
+          React.createElement('textarea', {
+            value: entry.message,
+            onChange: e => updateLocal(key, 'message', e.target.value),
+            rows: 2,
+            placeholder: isToday
+              ? 'e.g. Cart path only today due to wet conditions.'
+              : `Instructions for ${label.toLowerCase()}... (e.g. Back 9 closed for aeration.)`,
+            className: 'w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-golf-500 focus:border-transparent outline-none resize-none mb-3 bg-white'
+          }),
+
+          // Footer row
+          React.createElement('div', { className: 'flex items-center justify-between' },
+            React.createElement('div', { className: 'flex items-center gap-2' },
+              React.createElement('button', {
+                onClick: () => saveDay(key),
+                disabled: saving === 'daily_instructions',
+                className: 'px-4 py-1.5 bg-golf-600 hover:bg-golf-700 text-white rounded-lg text-xs font-semibold transition-colors disabled:opacity-50'
+              }, saving === 'daily_instructions' ? 'Saving...' : 'Save'),
+              savedKey === key && React.createElement('span', { className: 'text-green-600 text-xs font-medium' }, '✓ Saved!')
+            ),
+            hasContent && React.createElement('button', {
+              onClick: () => clearDay(key),
+              className: 'text-xs text-red-400 hover:text-red-600 transition-colors'
+            }, 'Clear')
+          )
+        );
+      })
+    )
+  );
+}
+
+// ============================================
 // SETTINGS PAGE
 // ============================================
 function SettingsPage() {
@@ -679,6 +824,7 @@ function SettingsPage() {
   if (loading) return React.createElement('div', { className: 'p-8 text-gray-500' }, 'Loading settings...');
 
   const tabs = [
+    { id: 'daily', label: '📋 Daily' },
     { id: 'general', label: 'General' },
     { id: 'hours', label: 'Hours' },
     { id: 'pricing', label: 'Pricing' },
@@ -704,6 +850,9 @@ function SettingsPage() {
     ),
 
     React.createElement('div', { className: 'bg-white rounded-xl shadow-sm border p-6' },
+
+      // DAILY INSTRUCTIONS TAB
+      activeTab === 'daily' && React.createElement(DailyInstructionsTab, { settings, saveSetting, saving }),
 
       // GENERAL TAB
       activeTab === 'general' && React.createElement('div', null,

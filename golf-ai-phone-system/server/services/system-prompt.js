@@ -15,7 +15,8 @@ async function buildSystemPrompt(callerContext = {}) {
     tournaments,
     amenities,
     personality,
-    announcements
+    announcements,
+    dailyInstructions
   ] = await Promise.all([
     getSetting('course_info'),
     getSetting('pricing'),
@@ -25,7 +26,8 @@ async function buildSystemPrompt(callerContext = {}) {
     getSetting('tournaments'),
     getSetting('amenities'),
     getSetting('ai_personality'),
-    getSetting('announcements')
+    getSetting('announcements'),
+    getSetting('daily_instructions')
   ]);
 
   // Determine current day/time context
@@ -64,6 +66,48 @@ Use save_customer_info to save both name and phone once collected.
 This is a NEW caller. We have their phone number (${callerContext.phone}) but not their name.
 Early in the conversation, casually ask for their name: "Can I get your name?" — natural and brief.
 Use save_customer_info to save their name so we remember them next time.
+`;
+  }
+
+  // Build daily instructions section — keyed by YYYY-MM-DD date
+  let dailySection = '';
+  const toDateKey = (offsetDays) => {
+    const d = new Date(now);
+    d.setDate(d.getDate() + offsetDays);
+    return d.toLocaleDateString('en-CA', { timeZone: 'America/Toronto' });
+  };
+  const toFriendlyDay = (offsetDays) => {
+    const d = new Date(now);
+    d.setDate(d.getDate() + offsetDays);
+    return d.toLocaleDateString('en-US', { timeZone: 'America/Toronto', weekday: 'long', month: 'long', day: 'numeric' });
+  };
+
+  const todayKey = toDateKey(0);
+  const todayEntry = dailyInstructions?.[todayKey];
+
+  // Build upcoming days info (tomorrow + 2 more days) for callers who ask
+  const upcomingLines = [];
+  for (let i = 1; i <= 3; i++) {
+    const k = toDateKey(i);
+    const e = dailyInstructions?.[k];
+    if (e?.active && e?.message?.trim()) {
+      upcomingLines.push(`- ${toFriendlyDay(i)}: ${e.message.trim()}`);
+    }
+  }
+
+  if (todayEntry?.active && todayEntry?.message?.trim()) {
+    dailySection = `
+## ⚠️ TODAY'S SPECIAL INSTRUCTIONS (VERY IMPORTANT — say this proactively to every caller)
+${todayEntry.message.trim()}
+
+Bring this up naturally early in every call — don't wait for the caller to ask.
+`;
+  }
+
+  if (upcomingLines.length > 0) {
+    dailySection += `
+## UPCOMING DAYS — SPECIAL CONDITIONS (share only if caller asks about those days)
+${upcomingLines.join('\n')}
 `;
   }
 
@@ -151,8 +195,9 @@ ${memberships?.types ? memberships.types.map(t => `- ${t.name}: $${t.price} (${t
 - Pull carts: ${amenities?.rentals?.pull_carts}
 - Club rentals: ${amenities?.rentals?.club_rentals}
 - Single rider cart: ${amenities?.rentals?.single_rider_cart}
-${callerSection}
+${dailySection}
 ${announcementSection}
+${callerSection}
 
 ## AFTER-HOURS BEHAVIOR
 ${!isOpen ? personality?.after_hours_message || 'Staff are not available right now, but you can still help with bookings and information.' : 'The course is currently open. If the caller needs a human, you can offer to transfer them.'}

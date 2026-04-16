@@ -41,19 +41,15 @@ async function createBookingRequest({
 
   const booking = res.rows[0];
 
-  // Notify staff
+  // Notify staff of new pending booking
   try {
     await sendBookingNotification(booking);
   } catch (err) {
     console.error('Failed to send booking notification:', err.message);
   }
 
-  // Send confirmation SMS to customer (if enabled and they have a phone)
-  try {
-    await sendBookingConfirmationToCustomer(booking);
-  } catch (err) {
-    console.error('Failed to send customer confirmation SMS:', err.message);
-  }
+  // NOTE: We do NOT send SMS to the customer here.
+  // The customer only receives a confirmation text when staff CONFIRMS the booking in Command Center.
 
   return booking;
 }

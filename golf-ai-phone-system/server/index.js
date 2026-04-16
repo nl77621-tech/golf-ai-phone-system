@@ -47,9 +47,14 @@ app.use((req, res, next) => {
 // Routes
 // ============================================
 
-// Health check (Railway uses this)
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', uptime: process.uptime(), timestamp: new Date().toISOString() });
+// Health check (Railway uses this) — verifies DB connectivity
+app.get('/health', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ status: 'ok', uptime: process.uptime(), timestamp: new Date().toISOString() });
+  } catch (err) {
+    res.status(503).json({ status: 'degraded', error: 'database unreachable', uptime: process.uptime() });
+  }
 });
 
 // Twilio webhooks
@@ -116,6 +121,7 @@ wss.on('connection', (ws, req) => {
 
   ws.on('error', (err) => {
     console.error('WebSocket error:', err.message);
+    try { ws.close(); } catch (_) {}
   });
 });
 
@@ -192,10 +198,26 @@ startServer().catch(err => {
 });
 
 // Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received. Shutting down gracefully...');
-  server.close(() => {
+function gracefulShutdown(signal) {
+  console.log(`${signal} received. Shutting down gracefully...`);
+  // Close WebSocket server first
+  wss.clients.forEach(ws => {
+    try { ws.close(); } catch (_) {}
+  });
+  server.close(async () => {
+    try {
+      await pool.end();
+      console.log('Database pool closed.');
+    } catch (_) {}
     console.log('Server closed.');
     process.exit(0);
   });
-});
+  // Force exit after 10s if graceful shutdown stalls
+  setTimeout(() => {
+    console.error('Forced shutdown after timeout');
+    process.exit(1);
+  }, 10000);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));

@@ -292,6 +292,15 @@ ${callerLine}
     }
   });
 
+  // Grok connection timeout — if not connected within 5s, close everything
+  const grokConnectTimeout = setTimeout(() => {
+    if (grokWs.readyState !== WebSocket.OPEN) {
+      console.error(`[${callSid}] Grok connection timeout — closing call`);
+      grokWs.close();
+      if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
+    }
+  }, 5000);
+
   // streamSid is passed in from index.js — it's known from the 'start' event
   // We also update it if Twilio sends another 'start' event
   let conversationActive = true;
@@ -304,8 +313,17 @@ ${callerLine}
   };
 
   // ---- Grok WebSocket handlers ----
+  // Keepalive interval reference (set in grokWs 'open', cleared on close)
+  let keepAlive = null;
+
   grokWs.on('open', () => {
     console.log(`[${callSid}] Connected to Grok`);
+    clearTimeout(grokConnectTimeout);
+
+    // Send a ping every 25s to prevent intermediate proxies from dropping the connection
+    keepAlive = setInterval(() => {
+      if (grokWs.readyState === WebSocket.OPEN) grokWs.ping();
+    }, 25000);
 
     // Send session configuration
     // pcm16 — xAI doesn't honour g711_ulaw, always sends PCM. We convert.
@@ -325,7 +343,8 @@ ${callerLine}
           silence_duration_ms: 250    // 250 ms of silence = end of turn
         },
         tools: tools,
-        tool_choice: 'auto'
+        tool_choice: 'auto',
+        input_audio_transcription: { model: 'whisper-large-v3' }
       }
     }));
 
@@ -423,10 +442,27 @@ ${callerLine}
           }
           break;
 
-        case 'response.function_call_arguments.done':
+        case 'response.function_call_arguments.done': {
           // Grok wants to call a tool
           console.log(`[${callSid}] Tool call: ${event.name}`);
-          const result = await executeToolCall(event.name, JSON.parse(event.arguments || '{}'), callerContext, callLogId);
+          let parsedArgs;
+          try {
+            parsedArgs = JSON.parse(event.arguments || '{}');
+          } catch (parseErr) {
+            console.error(`[${callSid}] Failed to parse tool call arguments for ${event.name}:`, parseErr.message);
+            // Send error result back to Grok so it can recover
+            grokWs.send(JSON.stringify({
+              type: 'conversation.item.create',
+              item: {
+                type: 'function_call_output',
+                call_id: event.call_id,
+                output: JSON.stringify({ error: `Invalid arguments: ${parseErr.message}` })
+              }
+            }));
+            grokWs.send(JSON.stringify({ type: 'response.create' }));
+            break;
+          }
+          const result = await executeToolCall(event.name, parsedArgs, callerContext, callLogId);
           callState.actions.push({ tool: event.name, args: event.arguments });
 
           // Send tool result back to Grok
@@ -442,6 +478,7 @@ ${callerLine}
           // Trigger Grok to respond with the tool result
           grokWs.send(JSON.stringify({ type: 'response.create' }));
           break;
+        }
 
         case 'error':
           console.error(`[${callSid}] Grok error:`, event.error);
@@ -454,6 +491,13 @@ ${callerLine}
 
   grokWs.on('close', () => {
     console.log(`[${callSid}] Grok connection closed`);
+    clearInterval(keepAlive);
+    // If conversation was still active, Grok dropped unexpectedly — close Twilio side cleanly
+    if (conversationActive) {
+      console.warn(`[${callSid}] Grok disconnected unexpectedly while call was active — closing Twilio connection`);
+      conversationActive = false;
+      if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
+    }
     conversationActive = false;
   });
 
@@ -840,7 +884,7 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
       }
 
       case 'save_customer_info': {
-        console.log(`[${callSid}] save_customer_info called | customerId: ${callerContext.customerId} | name: ${args.name} | email: ${args.email}`);
+        console.log(`[${callLogId}] save_customer_info called | customerId: ${callerContext.customerId} | name: ${args.name} | email: ${args.email}`);
         if (callerContext.customerId) {
           try {
             const updated = await updateCustomer(callerContext.customerId, {
@@ -848,17 +892,17 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
               email: args.email,
               phone: args.phone
             });
-            console.log(`[${callSid}] Customer saved: ${updated?.name} (ID: ${updated?.id})`);
+            console.log(`[${callLogId}] Customer saved: ${updated?.name} (ID: ${updated?.id})`);
             // Update the context for the rest of the call
             if (args.name) callerContext.name = args.name;
             if (args.email) callerContext.email = args.email;
             return { success: true, message: `Got it! I've saved your info as ${args.name}.` };
           } catch (err) {
-            console.error(`[${callSid}] Failed to save customer info:`, err.message);
+            console.error(`[${callLogId}] Failed to save customer info:`, err.message);
             return { success: false, message: 'I had trouble saving your info, but we can still complete your booking.' };
           }
         } else {
-          console.warn(`[${callSid}] save_customer_info: No customerId available`);
+          console.warn(`[${callLogId}] save_customer_info: No customerId available`);
           return { success: false, message: 'I had trouble saving your info, but we can still complete your booking.' };
         }
       }

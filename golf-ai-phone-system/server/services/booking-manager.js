@@ -10,14 +10,27 @@ async function createBookingRequest({
   customerId, customerName, customerPhone, customerEmail,
   requestedDate, requestedTime, partySize, numCarts, specialRequests, callId
 }) {
+  // Validate required fields
+  if (!customerName || typeof customerName !== 'string') {
+    throw new Error('customer_name is required');
+  }
+  if (!requestedDate || typeof requestedDate !== 'string') {
+    throw new Error('requested_date is required');
+  }
+  const size = parseInt(partySize) || 1;
+  if (size < 1 || size > 20) {
+    throw new Error('party_size must be between 1 and 20');
+  }
+  const carts = parseInt(numCarts) || 0;
+
   const res = await query(
     `INSERT INTO booking_requests
      (customer_id, customer_name, customer_phone, customer_email,
       requested_date, requested_time, party_size, num_carts, special_requests, call_id)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
      RETURNING *`,
-    [customerId, customerName, customerPhone, customerEmail,
-     requestedDate, requestedTime, partySize || 1, numCarts || 0, specialRequests, callId]
+    [customerId || null, customerName.trim(), customerPhone || null, customerEmail || null,
+     requestedDate, requestedTime || null, size, carts, specialRequests || null, callId || null]
   );
 
   const booking = res.rows[0];

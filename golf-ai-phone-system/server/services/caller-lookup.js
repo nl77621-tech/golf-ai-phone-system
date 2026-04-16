@@ -25,43 +25,30 @@ async function lookupByName(name) {
 }
 
 // Create or update a customer record when they call
+// Uses INSERT ... ON CONFLICT to avoid race conditions with concurrent calls
 async function registerCall(phone, name = null, email = null) {
   const normalized = normalizePhone(phone);
-  const existing = await lookupByPhone(normalized);
-
-  if (existing) {
-    // Update existing customer
-    const updates = [];
-    const values = [];
-    let paramCount = 1;
-
-    if (name && name !== existing.name) {
-      updates.push(`name = $${paramCount++}`);
-      values.push(name);
-    }
-    if (email && email !== existing.email) {
-      updates.push(`email = $${paramCount++}`);
-      values.push(email);
-    }
-
-    updates.push(`call_count = call_count + 1`);
-    updates.push(`last_call_at = NOW()`);
-
-    values.push(normalized);
-    const res = await query(
-      `UPDATE customers SET ${updates.join(', ')} WHERE phone = $${paramCount} RETURNING *`,
-      values
-    );
-    return { customer: res.rows[0], isNew: false };
-  } else {
-    // Create new customer
-    const res = await query(
-      `INSERT INTO customers (phone, name, email, call_count, first_call_at, last_call_at)
-       VALUES ($1, $2, $3, 1, NOW(), NOW()) RETURNING *`,
-      [normalized, name, email]
-    );
-    return { customer: res.rows[0], isNew: true };
+  if (!normalized) {
+    // No valid phone — can't register, return null
+    return { customer: null, isNew: false };
   }
+
+  const res = await query(
+    `INSERT INTO customers (phone, name, email, call_count, first_call_at, last_call_at)
+     VALUES ($1, $2, $3, 1, NOW(), NOW())
+     ON CONFLICT (phone) DO UPDATE SET
+       name = COALESCE(NULLIF($2, ''), customers.name),
+       email = COALESCE(NULLIF($3, ''), customers.email),
+       call_count = customers.call_count + 1,
+       last_call_at = NOW()
+     RETURNING *, (xmax = 0) AS is_new`,
+    [normalized, name, email]
+  );
+
+  const row = res.rows[0];
+  const isNew = row.is_new;
+  delete row.is_new;
+  return { customer: row, isNew };
 }
 
 // Update customer info (from AI collecting details)
@@ -99,8 +86,9 @@ async function updateCustomer(id, updates) {
 
 // Normalize phone number to +1XXXXXXXXXX format
 function normalizePhone(phone) {
-  if (!phone) return '';
+  if (!phone) return null;
   const digits = phone.replace(/\D/g, '');
+  if (digits.length === 0) return null;
   if (digits.length === 10) return `+1${digits}`;
   if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`;
   return `+${digits}`;

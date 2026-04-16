@@ -979,16 +979,28 @@ function SettingsPage() {
         React.createElement(SettingField, { label: 'Notification SMS Phone', description: 'Phone number for SMS booking alerts',
           value: val('notifications')?.sms_to || '',
           onSave: v => saveSetting('notifications', { ...val('notifications'), sms_to: v }), saving: saving === 'notifications' }),
-        React.createElement('div', { className: 'flex gap-6 mt-4' },
-          React.createElement('label', { className: 'flex items-center gap-2' },
-            React.createElement('input', { type: 'checkbox', checked: val('notifications')?.email_enabled ?? true,
-              onChange: e => saveSetting('notifications', { ...val('notifications'), email_enabled: e.target.checked })
-            }), 'Email notifications enabled'
+        React.createElement('div', { className: 'flex flex-col gap-3 mt-4' },
+          React.createElement('div', { className: 'flex gap-6' },
+            React.createElement('label', { className: 'flex items-center gap-2' },
+              React.createElement('input', { type: 'checkbox', checked: val('notifications')?.email_enabled ?? true,
+                onChange: e => saveSetting('notifications', { ...val('notifications'), email_enabled: e.target.checked })
+              }), 'Email notifications to staff'
+            ),
+            React.createElement('label', { className: 'flex items-center gap-2' },
+              React.createElement('input', { type: 'checkbox', checked: val('notifications')?.sms_enabled ?? true,
+                onChange: e => saveSetting('notifications', { ...val('notifications'), sms_enabled: e.target.checked })
+              }), 'SMS notifications to staff'
+            )
           ),
-          React.createElement('label', { className: 'flex items-center gap-2' },
-            React.createElement('input', { type: 'checkbox', checked: val('notifications')?.sms_enabled ?? true,
-              onChange: e => saveSetting('notifications', { ...val('notifications'), sms_enabled: e.target.checked })
-            }), 'SMS notifications enabled'
+          React.createElement('div', { className: 'border-t pt-3 mt-2' },
+            React.createElement('label', { className: 'flex items-center gap-2 font-medium' },
+              React.createElement('input', { type: 'checkbox', checked: val('notifications')?.customer_sms_enabled ?? false,
+                onChange: e => saveSetting('notifications', { ...val('notifications'), customer_sms_enabled: e.target.checked })
+              }), '📱 Send booking confirmation SMS to customers'
+            ),
+            React.createElement('p', { className: 'text-xs text-gray-500 mt-1 ml-6' },
+              'Text callers when their tee time is booked, confirmed, or cancelled. They can reply CANCEL to cancel. ~$0.01 per booking.'
+            )
           )
         )
       ),

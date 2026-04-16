@@ -7,6 +7,7 @@ const router = express.Router();
 const { handleMediaStream } = require('../services/grok-voice');
 const { normalizePhone } = require('../services/caller-lookup');
 const { getSetting } = require('../config/database');
+const { findActiveBookingByPhone, updateBookingStatus } = require('../services/booking-manager');
 require('dotenv').config();
 
 /**
@@ -123,6 +124,60 @@ router.post('/transfer-fallback', (req, res) => {
         <Hangup/>
       </Response>
     `);
+  }
+});
+
+/**
+ * POST /twilio/sms — Incoming SMS webhook
+ * Handles CANCEL replies from customers who got a booking confirmation text
+ */
+router.post('/sms', async (req, res) => {
+  const fromPhone = req.body.From;
+  const body = (req.body.Body || '').trim();
+  const bodyUpper = body.toUpperCase();
+
+  console.log(`📩 Incoming SMS from ${fromPhone}: "${body}"`);
+
+  // Helper to respond with TwiML containing a reply
+  const twimlReply = (text) => {
+    res.type('text/xml');
+    res.send(`<Response><Message>${text}</Message></Response>`);
+  };
+  const twimlSilent = () => {
+    res.type('text/xml');
+    res.send('<Response></Response>');
+  };
+
+  try {
+    const normalized = normalizePhone(fromPhone);
+    if (!normalized) return twimlSilent();
+
+    // CANCEL keyword → cancel most recent active booking
+    if (bodyUpper === 'CANCEL' || bodyUpper === 'CANCEL ALL') {
+      const booking = await findActiveBookingByPhone(normalized);
+      if (!booking) {
+        return twimlReply('Valleymede Golf: No upcoming tee time found on file. Call us if you need help.');
+      }
+      await updateBookingStatus(booking.id, 'cancelled', 'Cancelled by customer via SMS reply');
+      // Note: updateBookingStatus already sends the cancellation SMS; TwiML reply acts as immediate ack
+      return twimlReply(`Valleymede Golf: Your tee time on ${booking.requested_date} at ${booking.requested_time || ''} is cancelled. Thank you!`);
+    }
+
+    // HELP keyword
+    if (bodyUpper === 'HELP') {
+      return twimlReply('Valleymede Golf: Reply CANCEL to cancel your upcoming tee time, or call us directly. Msg&data rates may apply.');
+    }
+
+    // STOP / UNSUBSCRIBE — Twilio handles opt-out automatically but we acknowledge
+    if (bodyUpper === 'STOP' || bodyUpper === 'UNSUBSCRIBE') {
+      return twimlSilent(); // Twilio auto-responds with opt-out confirmation
+    }
+
+    // Unknown reply — gently guide them
+    return twimlReply('Valleymede Golf: Sorry, I can only process CANCEL replies. For other requests please call us.');
+  } catch (err) {
+    console.error('SMS handler error:', err.message);
+    return twimlSilent();
   }
 });
 

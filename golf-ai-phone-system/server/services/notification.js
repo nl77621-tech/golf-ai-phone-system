@@ -127,9 +127,89 @@ async function sendModificationNotification(modification) {
   }
 }
 
+// Format a short, friendly time string: "Sat Apr 18 at 9:30 AM"
+function formatShortDateTime(dateStr, timeStr) {
+  try {
+    const d = new Date(dateStr + 'T00:00:00');
+    const dayPart = d.toLocaleDateString('en-US', {
+      weekday: 'short', month: 'short', day: 'numeric', timeZone: 'America/Toronto'
+    });
+    if (!timeStr) return dayPart;
+    // Convert HH:MM 24hr → 12hr AM/PM
+    const [h, m] = String(timeStr).split(':').map(n => parseInt(n, 10));
+    if (isNaN(h)) return dayPart;
+    const ampm = h >= 12 ? 'PM' : 'AM';
+    const hr12 = h % 12 === 0 ? 12 : h % 12;
+    const mm = String(m || 0).padStart(2, '0');
+    return `${dayPart} at ${hr12}:${mm} ${ampm}`;
+  } catch (_) {
+    return `${dateStr} ${timeStr || ''}`.trim();
+  }
+}
+
+// Send booking confirmation SMS to the CUSTOMER (not staff)
+// Controlled by settings.customer_sms_enabled toggle
+async function sendBookingConfirmationToCustomer(booking) {
+  try {
+    const settings = await getSetting('notifications');
+    if (!settings?.customer_sms_enabled) return null;
+    if (!booking?.customer_phone) return null;
+
+    const when = formatShortDateTime(booking.requested_date, booking.requested_time);
+    const players = booking.party_size || 1;
+    const playerWord = players === 1 ? 'player' : 'players';
+    const msg = `Valleymede Golf: Tee time request for ${when}, ${players} ${playerWord}. We'll confirm shortly. Reply CANCEL to cancel.`;
+
+    return await sendSMS(booking.customer_phone, msg);
+  } catch (err) {
+    console.error('Customer confirmation SMS failed:', err.message);
+    return null;
+  }
+}
+
+// Send a final "confirmed" SMS when staff approves a booking
+async function sendBookingConfirmedToCustomer(booking) {
+  try {
+    const settings = await getSetting('notifications');
+    if (!settings?.customer_sms_enabled) return null;
+    if (!booking?.customer_phone) return null;
+
+    const when = formatShortDateTime(booking.requested_date, booking.requested_time);
+    const players = booking.party_size || 1;
+    const playerWord = players === 1 ? 'player' : 'players';
+    const msg = `Valleymede Golf: Tee time CONFIRMED for ${when}, ${players} ${playerWord}. See you then! Reply CANCEL if plans change.`;
+
+    return await sendSMS(booking.customer_phone, msg);
+  } catch (err) {
+    console.error('Customer confirmed SMS failed:', err.message);
+    return null;
+  }
+}
+
+// Send a cancellation acknowledgement SMS
+async function sendBookingCancelledToCustomer(booking) {
+  try {
+    const settings = await getSetting('notifications');
+    if (!settings?.customer_sms_enabled) return null;
+    if (!booking?.customer_phone) return null;
+
+    const when = formatShortDateTime(booking.requested_date, booking.requested_time);
+    const msg = `Valleymede Golf: Your tee time for ${when} has been cancelled. Call us back anytime to rebook. Thank you!`;
+
+    return await sendSMS(booking.customer_phone, msg);
+  } catch (err) {
+    console.error('Customer cancellation SMS failed:', err.message);
+    return null;
+  }
+}
+
 module.exports = {
   sendEmail,
   sendSMS,
   sendBookingNotification,
-  sendModificationNotification
+  sendModificationNotification,
+  sendBookingConfirmationToCustomer,
+  sendBookingConfirmedToCustomer,
+  sendBookingCancelledToCustomer,
+  formatShortDateTime
 };

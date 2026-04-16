@@ -3,7 +3,13 @@
  * Handles booking requests, modifications, and cancellations
  */
 const { query } = require('../config/database');
-const { sendBookingNotification, sendModificationNotification } = require('./notification');
+const {
+  sendBookingNotification,
+  sendModificationNotification,
+  sendBookingConfirmationToCustomer,
+  sendBookingConfirmedToCustomer,
+  sendBookingCancelledToCustomer
+} = require('./notification');
 
 // Create a new booking request
 async function createBookingRequest({
@@ -40,6 +46,13 @@ async function createBookingRequest({
     await sendBookingNotification(booking);
   } catch (err) {
     console.error('Failed to send booking notification:', err.message);
+  }
+
+  // Send confirmation SMS to customer (if enabled and they have a phone)
+  try {
+    await sendBookingConfirmationToCustomer(booking);
+  } catch (err) {
+    console.error('Failed to send customer confirmation SMS:', err.message);
   }
 
   return booking;
@@ -89,12 +102,31 @@ async function getPendingModifications() {
 
 // Update booking status (from Command Center)
 async function updateBookingStatus(id, status, staffNotes) {
+  // Capture previous status so we only notify on actual transitions
+  const prev = await query('SELECT status FROM booking_requests WHERE id = $1', [id]);
+  const prevStatus = prev.rows[0]?.status;
+
   const res = await query(
     `UPDATE booking_requests SET status = $1, staff_notes = $2, updated_at = NOW()
      WHERE id = $3 RETURNING *`,
     [status, staffNotes, id]
   );
-  return res.rows[0];
+  const booking = res.rows[0];
+
+  // Send customer SMS on status transitions
+  if (booking && prevStatus !== status) {
+    try {
+      if (status === 'confirmed') {
+        await sendBookingConfirmedToCustomer(booking);
+      } else if (status === 'cancelled') {
+        await sendBookingCancelledToCustomer(booking);
+      }
+    } catch (err) {
+      console.error('Failed to send status-change SMS to customer:', err.message);
+    }
+  }
+
+  return booking;
 }
 
 // Update modification status
@@ -151,6 +183,22 @@ async function getAllBookings(page = 1, limit = 50, status = null) {
   };
 }
 
+// Find the most recent active booking for a phone number
+// Used by the SMS CANCEL reply handler
+async function findActiveBookingByPhone(phone) {
+  if (!phone) return null;
+  const res = await query(
+    `SELECT * FROM booking_requests
+     WHERE customer_phone = $1
+       AND status IN ('pending', 'confirmed')
+       AND requested_date >= CURRENT_DATE
+     ORDER BY requested_date ASC, requested_time ASC
+     LIMIT 1`,
+    [phone]
+  );
+  return res.rows[0] || null;
+}
+
 module.exports = {
   createBookingRequest,
   createModificationRequest,
@@ -159,5 +207,6 @@ module.exports = {
   updateBookingStatus,
   updateModificationStatus,
   getBookingsForDateRange,
-  getAllBookings
+  getAllBookings,
+  findActiveBookingByPhone
 };

@@ -168,6 +168,28 @@ router.put('/bookings/:id/status', async (req, res) => {
   }
 });
 
+// POST /api/bookings/:id/sms — Send a custom SMS to the customer for this booking
+router.post('/bookings/:id/sms', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { message } = req.body;
+    if (!message || !message.trim()) {
+      return res.status(400).json({ error: 'Message is required' });
+    }
+    const result = await query('SELECT * FROM booking_requests WHERE id = $1', [parseInt(id)]);
+    const booking = result.rows[0];
+    if (!booking) return res.status(404).json({ error: 'Booking not found' });
+    if (!booking.customer_phone) return res.status(400).json({ error: 'No phone number on this booking' });
+
+    const { sendSMS } = require('../services/notification');
+    await sendSMS(booking.customer_phone, message.trim());
+    res.json({ ok: true, to: booking.customer_phone });
+  } catch (err) {
+    console.error('Custom SMS error:', err.message);
+    res.status(500).json({ error: 'Failed to send SMS: ' + err.message });
+  }
+});
+
 // ============================================
 // MODIFICATIONS
 // ============================================

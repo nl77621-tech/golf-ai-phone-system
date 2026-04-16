@@ -260,6 +260,9 @@ function BookingsPage() {
   const [modifications, setModifications] = useState([]);
   const [filter, setFilter] = useState('pending');
   const [loading, setLoading] = useState(true);
+  const [replyOpenId, setReplyOpenId] = useState(null);
+  const [replyText, setReplyText] = useState('');
+  const [replySending, setReplySending] = useState(false);
 
   const loadData = useCallback(async () => {
     try {
@@ -281,6 +284,26 @@ function BookingsPage() {
       await api(`/api/bookings/${id}/status`, { method: 'PUT', body: JSON.stringify({ status, staff_notes: notes || '' }) });
       loadData();
     } catch (err) { alert('Failed to update: ' + err.message); }
+  };
+
+  const openReply = (booking) => {
+    setReplyOpenId(booking.id);
+    setReplyText(`Hi ${booking.customer_name?.split(' ')[0] || 'there'}, unfortunately that time isn't available. Can I offer you `);
+  };
+
+  const sendReply = async (booking) => {
+    if (!replyText.trim()) return;
+    setReplySending(true);
+    try {
+      await api(`/api/bookings/${booking.id}/sms`, { method: 'POST', body: JSON.stringify({ message: replyText.trim() }) });
+      setReplyOpenId(null);
+      setReplyText('');
+      alert('Message sent!');
+    } catch (err) {
+      alert('Failed to send: ' + err.message);
+    } finally {
+      setReplySending(false);
+    }
   };
 
   const processModification = async (id, status) => {
@@ -342,32 +365,68 @@ function BookingsPage() {
           ? React.createElement('p', { className: 'p-8 text-gray-400 text-center' }, `No ${filter} bookings`)
           : React.createElement('div', { className: 'divide-y' },
               bookings.map(b =>
-                React.createElement('div', { key: b.id, className: 'p-4 flex items-center justify-between hover:bg-gray-50' },
-                  React.createElement('div', { className: 'flex-1' },
-                    React.createElement('div', { className: 'flex items-center gap-3' },
-                      React.createElement('span', { className: 'font-semibold' }, b.customer_name || 'Unknown'),
-                      React.createElement('span', { className: `px-2 py-0.5 rounded-full text-xs ${statusColors[b.status] || ''}` }, b.status)
+                React.createElement('div', { key: b.id, className: 'border-b last:border-0' },
+                  // Main booking row
+                  React.createElement('div', { className: 'p-4 flex items-center justify-between hover:bg-gray-50' },
+                    React.createElement('div', { className: 'flex-1' },
+                      React.createElement('div', { className: 'flex items-center gap-3' },
+                        React.createElement('span', { className: 'font-semibold' }, b.customer_name || 'Unknown'),
+                        React.createElement('span', { className: `px-2 py-0.5 rounded-full text-xs ${statusColors[b.status] || ''}` }, b.status)
+                      ),
+                      React.createElement('div', { className: 'text-sm text-gray-600 font-medium mt-1' },
+                        formatBookingDateTime(b.requested_date, b.requested_time)
+                      ),
+                      React.createElement('div', { className: 'text-sm text-gray-500 mt-1' },
+                        `${b.party_size} player${b.party_size > 1 ? 's' : ''} \u2022 ${b.num_carts || 0} cart${b.num_carts !== 1 ? 's' : ''}`
+                      ),
+                      React.createElement('div', { className: 'text-sm text-gray-400' },
+                        `${b.customer_phone || ''} ${b.customer_email ? '\u2022 ' + b.customer_email : ''}`
+                      ),
+                      b.special_requests && React.createElement('div', { className: 'text-sm text-gray-600 mt-1 italic' }, b.special_requests)
                     ),
-                    React.createElement('div', { className: 'text-sm text-gray-600 font-medium mt-1' },
-                      formatBookingDateTime(b.requested_date, b.requested_time)
-                    ),
-                    React.createElement('div', { className: 'text-sm text-gray-500 mt-1' },
-                      `${b.party_size} player${b.party_size > 1 ? 's' : ''} \u2022 ${b.num_carts || 0} cart${b.num_carts !== 1 ? 's' : ''}`
-                    ),
-                    React.createElement('div', { className: 'text-sm text-gray-400' },
-                      `${b.customer_phone || ''} ${b.customer_email ? '\u2022 ' + b.customer_email : ''}`
-                    ),
-                    b.special_requests && React.createElement('div', { className: 'text-sm text-gray-600 mt-1 italic' }, b.special_requests)
+                    b.status === 'pending' && React.createElement('div', { className: 'flex gap-2 ml-4' },
+                      React.createElement('button', {
+                        onClick: () => updateStatus(b.id, 'confirmed'),
+                        className: 'bg-green-500 hover:bg-green-600 text-white px-4 py-2 rounded-lg text-sm font-medium'
+                      }, 'Confirm'),
+                      React.createElement('button', {
+                        onClick: () => updateStatus(b.id, 'rejected'),
+                        className: 'bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-lg text-sm font-medium'
+                      }, 'Reject'),
+                      b.customer_phone && React.createElement('button', {
+                        onClick: () => replyOpenId === b.id ? setReplyOpenId(null) : openReply(b),
+                        className: 'bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-medium'
+                      }, '\uD83D\uDCAC Reply')
+                    )
                   ),
-                  b.status === 'pending' && React.createElement('div', { className: 'flex gap-2 ml-4' },
-                    React.createElement('button', {
-                      onClick: () => updateStatus(b.id, 'confirmed'),
-                      className: 'bg-green-500 hover:bg-green-600 text-white px-4 py-2 rounded-lg text-sm font-medium'
-                    }, 'Confirm'),
-                    React.createElement('button', {
-                      onClick: () => updateStatus(b.id, 'rejected'),
-                      className: 'bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-lg text-sm font-medium'
-                    }, 'Reject')
+                  // Inline reply panel — expands when Reply is clicked
+                  replyOpenId === b.id && React.createElement('div', { className: 'px-4 pb-4 bg-blue-50 border-t border-blue-100' },
+                    React.createElement('p', { className: 'text-xs text-blue-600 font-medium mt-3 mb-2' },
+                      `\uD83D\uDCF1 Text to ${b.customer_name?.split(' ')[0] || 'customer'} at ${b.customer_phone}`
+                    ),
+                    React.createElement('textarea', {
+                      className: 'w-full border border-blue-200 rounded-lg p-3 text-sm resize-none focus:outline-none focus:ring-2 focus:ring-blue-300',
+                      rows: 3,
+                      value: replyText,
+                      onChange: e => setReplyText(e.target.value),
+                      placeholder: 'Type your message...'
+                    }),
+                    React.createElement('div', { className: 'flex items-center justify-between mt-2' },
+                      React.createElement('span', { className: `text-xs ${replyText.length > 160 ? 'text-red-500 font-medium' : 'text-gray-400'}` },
+                        `${replyText.length}/160 chars${replyText.length > 160 ? ' — will split into 2 messages' : ''}`
+                      ),
+                      React.createElement('div', { className: 'flex gap-2' },
+                        React.createElement('button', {
+                          onClick: () => { setReplyOpenId(null); setReplyText(''); },
+                          className: 'px-3 py-1.5 text-sm text-gray-500 hover:text-gray-700'
+                        }, 'Cancel'),
+                        React.createElement('button', {
+                          onClick: () => sendReply(b),
+                          disabled: replySending || !replyText.trim(),
+                          className: 'bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white px-4 py-1.5 rounded-lg text-sm font-medium'
+                        }, replySending ? 'Sending...' : 'Send Text')
+                      )
+                    )
                   )
                 )
               )

@@ -333,14 +333,14 @@ ${callerLine}
         modalities: ['text', 'audio'],
         instructions: systemPrompt,
         voice: 'eve',
-        speed: 1.2,                  // 20% faster — snappier phone pace
+        speed: 1.15,                 // slightly faster than normal — natural phone pace
         input_audio_format: 'pcm16',
         output_audio_format: 'pcm16',
         turn_detection: {
           type: 'server_vad',
-          threshold: 0.35,            // sensitive but not hair-trigger (avoids false positives)
-          prefix_padding_ms: 100,     // small pre-speech buffer
-          silence_duration_ms: 250    // 250 ms of silence = end of turn
+          threshold: 0.30,            // slightly more sensitive — catches speech sooner for faster barge-in
+          prefix_padding_ms: 50,      // reduced from 100 — fires barge-in faster when caller speaks
+          silence_duration_ms: 300    // slightly longer — avoids cutting off callers mid-sentence
         },
         tools: tools,
         tool_choice: 'auto',

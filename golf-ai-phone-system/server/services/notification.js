@@ -127,39 +127,49 @@ async function sendModificationNotification(modification) {
   }
 }
 
-// Format a short, friendly time string: "Sat Apr 18 at 9:30 AM"
+// Format a short, friendly time string: "Sun Apr 19 at 11:46 AM" — NO timezone garbage
 function formatShortDateTime(dateStr, timeStr) {
   try {
-    // Validate input
-    if (!dateStr) {
-      return timeStr || '';
+    if (!dateStr) return timeStr || '';
+
+    // Extract just the date part if it has extra junk (YYYY-MM-DD format)
+    let cleanDate = String(dateStr);
+    if (cleanDate.includes('T')) cleanDate = cleanDate.split('T')[0];
+    if (cleanDate.includes(' ')) cleanDate = cleanDate.split(' ')[0];
+
+    // Parse just YYYY-MM-DD
+    const [year, month, day] = cleanDate.split('-').map(Number);
+    if (!year || !month || !day) {
+      return `${cleanDate} ${timeStr || ''}`.trim();
     }
 
-    // Try to parse the date
-    const d = new Date(dateStr + 'T00:00:00');
-
-    // Check if date is actually valid (Invalid Date has NaN getTime())
-    if (isNaN(d.getTime())) {
-      console.warn('formatShortDateTime: Invalid date string:', dateStr);
-      return `${dateStr} ${timeStr || ''}`.trim();
-    }
-
+    // Create date in UTC, then format in Toronto timezone
+    const d = new Date(Date.UTC(year, month - 1, day));
     const dayPart = d.toLocaleDateString('en-US', {
-      weekday: 'short', month: 'short', day: 'numeric', timeZone: 'America/Toronto'
+      weekday: 'short',
+      month: 'short',
+      day: 'numeric',
+      timeZone: 'America/Toronto'
     });
 
     if (!timeStr) return dayPart;
 
-    // Convert HH:MM 24hr → 12hr AM/PM
-    const [h, m] = String(timeStr).split(':').map(n => parseInt(n, 10));
+    // Parse HH:MM and convert to 12hr AM/PM
+    const timeParts = String(timeStr).split(':');
+    const h = parseInt(timeParts[0], 10);
+    const m = parseInt(timeParts[1], 10) || 0;
+
     if (isNaN(h)) return dayPart;
+
     const ampm = h >= 12 ? 'PM' : 'AM';
     const hr12 = h % 12 === 0 ? 12 : h % 12;
-    const mm = String(m || 0).padStart(2, '0');
+    const mm = String(m).padStart(2, '0');
+
     return `${dayPart} at ${hr12}:${mm} ${ampm}`;
   } catch (err) {
     console.error('formatShortDateTime error:', err.message, { dateStr, timeStr });
-    return `${dateStr || ''} ${timeStr || ''}`.trim();
+    // Last resort: just return the clean parts
+    return `${String(dateStr).split('T')[0]} ${timeStr || ''}`.trim();
   }
 }
 

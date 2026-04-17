@@ -107,12 +107,13 @@ wss.on('connection', (ws, req) => {
         const params = msg.start.customParameters || {};
         const callerPhone = params.callerPhone || 'unknown';
         const callSid = params.callSid || msg.start.callSid || 'unknown';
+        const appUrl = params.appUrl || process.env.APP_URL || '';
 
         const streamSid = msg.start.streamSid;
-        console.log(`Media stream started: caller=${callerPhone}, sid=${callSid}, stream=${streamSid}`);
+        console.log(`Media stream started: caller=${callerPhone}, sid=${callSid}, stream=${streamSid}, appUrl=${appUrl}`);
 
-        // Hand off to the Grok voice bridge — pass streamSid so audio can flow back
-        handleMediaStream(ws, callerPhone, callSid, streamSid);
+        // Hand off to the Grok voice bridge — pass streamSid and appUrl so transfer can work
+        handleMediaStream(ws, callerPhone, callSid, streamSid, appUrl);
       }
     } catch (err) {
       // Not JSON or not a start event — ignore, the handler will process it

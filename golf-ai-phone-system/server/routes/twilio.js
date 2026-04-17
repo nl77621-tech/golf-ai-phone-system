@@ -53,6 +53,7 @@ router.post('/voice', async (req, res) => {
         <Stream url="${wsUrl}/twilio/media-stream">
           <Parameter name="callerPhone" value="${callerPhone}" />
           <Parameter name="callSid" value="${callSid}" />
+          <Parameter name="appUrl" value="${appUrl}" />
         </Stream>
       </Connect>
     </Response>
@@ -75,7 +76,13 @@ router.post('/status', (req, res) => {
  */
 router.post('/transfer', async (req, res) => {
   try {
-    const transferNumber = await getSetting('transfer_number');
+    let transferNumber = await getSetting('transfer_number');
+    // Normalize — getSetting returns parsed JSON, which could be a string with or without quotes
+    if (typeof transferNumber === 'string') {
+      transferNumber = transferNumber.replace(/[^+\d]/g, ''); // strip everything except + and digits
+    }
+    console.log(`📞 Transfer endpoint hit — dialing: ${transferNumber}`);
+
     if (!transferNumber) {
       res.type('text/xml');
       res.send(`
@@ -92,7 +99,7 @@ router.post('/transfer', async (req, res) => {
       <Response>
         <Say voice="alice">One moment, I'm connecting you with a staff member.</Say>
         <Dial timeout="30" action="/twilio/transfer-fallback">
-          ${JSON.parse(transferNumber)}
+          ${transferNumber}
         </Dial>
       </Response>
     `);

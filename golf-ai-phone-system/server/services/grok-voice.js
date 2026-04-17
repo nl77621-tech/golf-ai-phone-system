@@ -105,7 +105,7 @@ function mulaw8kToPcm16(inputBuf) {
 /**
  * Handle an incoming Twilio media stream WebSocket connection
  */
-async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid) {
+async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid, appUrl) {
   console.log(`[${callSid}] New call from ${callerPhone}`);
 
   // Create call log entry
@@ -485,29 +485,25 @@ ${callerLine}
           // after a short delay so the AI can say "connecting you now"
           if (event.name === 'transfer_call' && result.success) {
             const transferDelay = 3000; // let the AI say goodbye first
-            console.log(`[${callSid}] Transfer requested — will redirect call in ${transferDelay}ms`);
-            console.log(`[${callSid}] APP_URL=${process.env.APP_URL || '(NOT SET)'}, callSid=${callSid}`);
+            const transferUrl = appUrl || process.env.APP_URL || '';
+            console.log(`[${callSid}] 📞 Transfer requested — will redirect in ${transferDelay}ms to ${transferUrl}/twilio/transfer`);
 
-            setTimeout(async () => {
-              try {
-                const appUrl = process.env.APP_URL;
-                if (!appUrl) {
-                  console.error(`[${callSid}] ❌ APP_URL env var is not set! Cannot redirect call for transfer.`);
-                  return;
+            if (!transferUrl) {
+              console.error(`[${callSid}] ❌ No APP_URL available — cannot transfer call`);
+            } else {
+              setTimeout(async () => {
+                try {
+                  const twilio = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+                  await twilio.calls(callSid).update({
+                    url: `${transferUrl}/twilio/transfer`,
+                    method: 'POST'
+                  });
+                  console.log(`[${callSid}] ✓ Call redirected to ${transferUrl}/twilio/transfer`);
+                } catch (transferErr) {
+                  console.error(`[${callSid}] ❌ Transfer redirect failed:`, transferErr.message);
                 }
-
-                console.log(`[${callSid}] Redirecting call to ${appUrl}/twilio/transfer`);
-                const twilio = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-                await twilio.calls(callSid).update({
-                  url: `${appUrl}/twilio/transfer`,
-                  method: 'POST'
-                });
-                console.log(`[${callSid}] ✓ Call redirected successfully`);
-              } catch (transferErr) {
-                console.error(`[${callSid}] ❌ Transfer redirect failed:`, transferErr.message);
-                console.error(`[${callSid}] Full error:`, transferErr);
-              }
-            }, transferDelay);
+              }, transferDelay);
+            }
           }
 
           break;

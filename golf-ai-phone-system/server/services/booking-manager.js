@@ -23,6 +23,14 @@ async function createBookingRequest({
   if (!requestedDate || typeof requestedDate !== 'string') {
     throw new Error('requested_date is required');
   }
+  // Normalize date — ensure it's a valid YYYY-MM-DD format for PostgreSQL
+  let normalizedDate = requestedDate.trim();
+  const parsed = new Date(normalizedDate + 'T12:00:00');
+  if (isNaN(parsed.getTime())) {
+    throw new Error(`Invalid date format: "${requestedDate}". Expected YYYY-MM-DD.`);
+  }
+  // Always store as YYYY-MM-DD
+  normalizedDate = parsed.toISOString().split('T')[0];
   const size = parseInt(partySize) || 1;
   if (size < 1 || size > 20) {
     throw new Error('party_size must be between 1 and 20');
@@ -37,7 +45,7 @@ async function createBookingRequest({
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending')
        RETURNING *`,
       [customerId || null, customerName.trim(), customerPhone || null, customerEmail || null,
-       requestedDate, requestedTime || null, size, carts, specialRequests || null, callId || null]
+       normalizedDate, requestedTime || null, size, carts, specialRequests || null, callId || null]
     );
 
     const booking = res.rows[0];

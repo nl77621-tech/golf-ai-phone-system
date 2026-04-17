@@ -18,7 +18,7 @@ const teeon = require('./teeon-automation');
 require('dotenv').config();
 
 const GROK_REALTIME_URL = 'wss://api.x.ai/v1/realtime';
-const GROK_MODEL = 'grok-3-fast';
+const GROK_MODEL = 'grok-4.20-latest';  // Latest Grok 4.20 (April 2026 release)
 
 /**
  * Convert linear 16-bit PCM sample to G.711 μ-law byte (ITU-T G.711 standard)

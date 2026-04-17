@@ -130,11 +130,26 @@ async function sendModificationNotification(modification) {
 // Format a short, friendly time string: "Sat Apr 18 at 9:30 AM"
 function formatShortDateTime(dateStr, timeStr) {
   try {
+    // Validate input
+    if (!dateStr) {
+      return timeStr || '';
+    }
+
+    // Try to parse the date
     const d = new Date(dateStr + 'T00:00:00');
+
+    // Check if date is actually valid (Invalid Date has NaN getTime())
+    if (isNaN(d.getTime())) {
+      console.warn('formatShortDateTime: Invalid date string:', dateStr);
+      return `${dateStr} ${timeStr || ''}`.trim();
+    }
+
     const dayPart = d.toLocaleDateString('en-US', {
       weekday: 'short', month: 'short', day: 'numeric', timeZone: 'America/Toronto'
     });
+
     if (!timeStr) return dayPart;
+
     // Convert HH:MM 24hr → 12hr AM/PM
     const [h, m] = String(timeStr).split(':').map(n => parseInt(n, 10));
     if (isNaN(h)) return dayPart;
@@ -142,8 +157,9 @@ function formatShortDateTime(dateStr, timeStr) {
     const hr12 = h % 12 === 0 ? 12 : h % 12;
     const mm = String(m || 0).padStart(2, '0');
     return `${dayPart} at ${hr12}:${mm} ${ampm}`;
-  } catch (_) {
-    return `${dateStr} ${timeStr || ''}`.trim();
+  } catch (err) {
+    console.error('formatShortDateTime error:', err.message, { dateStr, timeStr });
+    return `${dateStr || ''} ${timeStr || ''}`.trim();
   }
 }
 

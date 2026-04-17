@@ -747,6 +747,30 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
         // completing bookings via the golfer web interface. Bookings are queued
         // for staff to confirm. To enable live bookings, create a non-admin
         // golfer account in Tee-On and update TEEON_USERNAME/TEEON_PASSWORD.
+
+        // Validate required arguments
+        if (!args.customer_name || typeof args.customer_name !== 'string' || !args.customer_name.trim()) {
+          console.warn(`[${callLogId}] ⚠️ book_tee_time called with invalid customer_name:`, args.customer_name);
+          return { success: false, message: 'I need your name to complete the booking. Can you tell me your name?' };
+        }
+        if (!args.date || typeof args.date !== 'string') {
+          console.warn(`[${callLogId}] ⚠️ book_tee_time called with invalid date:`, args.date);
+          return { success: false, message: 'I need a date for the booking. What date works for you?' };
+        }
+        if (!args.party_size || args.party_size < 1 || args.party_size > 20) {
+          console.warn(`[${callLogId}] ⚠️ book_tee_time called with invalid party_size:`, args.party_size);
+          return { success: false, message: 'How many players will be in your group?' };
+        }
+
+        console.log(`[${callLogId}] 📅 Processing booking:`, {
+          customer: args.customer_name,
+          phone: args.customer_phone || callerContext.phone,
+          date: args.date,
+          time: args.time,
+          partySize: args.party_size,
+          carts: args.num_carts
+        });
+
         try {
           const booking = await createBookingRequest({
             customerId: callerContext.customerId,
@@ -783,7 +807,18 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
             bookingId: booking.id
           };
         } catch (dbErr) {
-          return { success: true, message: `Got it — I've noted your booking request for ${args.date} at ${args.time}. Staff will follow up to confirm.` };
+          console.error(`[${callLogId}] ❌ BOOKING CREATION FAILED:`, dbErr.message, {
+            customer: args.customer_name,
+            date: args.date,
+            time: args.time,
+            partySize: args.party_size
+          });
+          // Return error message — do NOT pretend booking succeeded
+          return {
+            success: false,
+            message: `I had trouble saving your booking request. Please try again or call us back at the number for Valleymede Columbus Golf.`,
+            error: dbErr.message
+          };
         }
       }
 

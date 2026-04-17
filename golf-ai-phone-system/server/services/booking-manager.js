@@ -29,29 +29,53 @@ async function createBookingRequest({
   }
   const carts = parseInt(numCarts) || 0;
 
-  const res = await query(
-    `INSERT INTO booking_requests
-     (customer_id, customer_name, customer_phone, customer_email,
-      requested_date, requested_time, party_size, num_carts, special_requests, call_id, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending')
-     RETURNING *`,
-    [customerId || null, customerName.trim(), customerPhone || null, customerEmail || null,
-     requestedDate, requestedTime || null, size, carts, specialRequests || null, callId || null]
-  );
-
-  const booking = res.rows[0];
-
-  // Notify staff of new pending booking
   try {
-    await sendBookingNotification(booking);
+    const res = await query(
+      `INSERT INTO booking_requests
+       (customer_id, customer_name, customer_phone, customer_email,
+        requested_date, requested_time, party_size, num_carts, special_requests, call_id, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending')
+       RETURNING *`,
+      [customerId || null, customerName.trim(), customerPhone || null, customerEmail || null,
+       requestedDate, requestedTime || null, size, carts, specialRequests || null, callId || null]
+    );
+
+    const booking = res.rows[0];
+
+    if (!booking) {
+      console.error('Booking insert returned no rows. Expected booking with status=pending');
+      throw new Error('Booking insertion returned no rows');
+    }
+
+    console.log('✓ Booking created:', {
+      id: booking.id,
+      customer: customerName,
+      date: requestedDate,
+      time: requestedTime,
+      status: booking.status,
+      phone: customerPhone
+    });
+
+    // Notify staff of new pending booking
+    try {
+      await sendBookingNotification(booking);
+    } catch (err) {
+      console.error('Failed to send booking notification:', err.message);
+    }
+
+    // NOTE: We do NOT send SMS to the customer here.
+    // The customer only receives a confirmation text when staff CONFIRMS the booking in Command Center.
+
+    return booking;
   } catch (err) {
-    console.error('Failed to send booking notification:', err.message);
+    console.error('Failed to create booking:', err.message, {
+      customerName,
+      requestedDate,
+      requestedTime,
+      partySize: size
+    });
+    throw err;
   }
-
-  // NOTE: We do NOT send SMS to the customer here.
-  // The customer only receives a confirmation text when staff CONFIRMS the booking in Command Center.
-
-  return booking;
 }
 
 // Create a modification or cancellation request

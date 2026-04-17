@@ -265,8 +265,8 @@ ${callerLine}
 - Tell them the available times naturally: "I've got 9 AM, 10:30, and 11 AM open on Saturday — any of those work?"
 - Once they pick a time, ONLY ask for their name and phone number — nothing else
 - AFTER collecting their name, ALWAYS use save_customer_info to save it so we remember them next time they call
-- Then use book_tee_time to submit the request — our staff will confirm it in the tee sheet within minutes
-- Confirm back: "Perfect! I've got you down for Saturday at 10:30, 4 players. We'll confirm shortly!"
+- ⚠️ CRITICAL: You MUST call the book_tee_time tool to create the booking. The booking DOES NOT EXIST until you call this tool. NEVER say "I've got you down" or "request submitted" WITHOUT actually calling book_tee_time first. If you skip the tool call, the booking will not be created and the customer will never get a confirmation text.
+- Flow: collect info → call book_tee_time → wait for result → THEN confirm to caller
 - Do NOT ask for email. Do NOT ask multiple questions at once. Keep it fast and friendly.
 
 ## CONTACT COLLECTION (important)
@@ -639,7 +639,7 @@ function buildToolDefinitions() {
     {
       type: 'function',
       name: 'book_tee_time',
-      description: 'Book a tee time directly in Tee-On. Use check_tee_times first to confirm availability. Collect name, phone, date, time, party size before calling this.',
+      description: 'REQUIRED to create a booking — you MUST call this tool to submit the booking request. The booking does NOT exist until this tool is called. Never tell the caller the booking was submitted without calling this first. Collect name, date, time, and party size, then call this immediately.',
       parameters: {
         type: 'object',
         properties: {

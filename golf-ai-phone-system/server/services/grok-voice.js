@@ -481,22 +481,33 @@ ${callerLine}
           // Trigger Grok to respond with the tool result
           grokWs.send(JSON.stringify({ type: 'response.create' }));
 
-          // If this was a transfer_call and it succeeded, redirect the Twilio call
+          // If this was a transfer_call and it succeeded, redirect the live Twilio call
           // after a short delay so the AI can say "connecting you now"
           if (event.name === 'transfer_call' && result.success) {
+            const transferDelay = 3000; // let the AI say goodbye first
+            console.log(`[${callSid}] Transfer requested — will redirect call in ${transferDelay}ms`);
+            console.log(`[${callSid}] APP_URL=${process.env.APP_URL || '(NOT SET)'}, callSid=${callSid}`);
+
             setTimeout(async () => {
               try {
-                const appUrl = process.env.APP_URL || '';
+                const appUrl = process.env.APP_URL;
+                if (!appUrl) {
+                  console.error(`[${callSid}] ❌ APP_URL env var is not set! Cannot redirect call for transfer.`);
+                  return;
+                }
+
+                console.log(`[${callSid}] Redirecting call to ${appUrl}/twilio/transfer`);
                 const twilio = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
                 await twilio.calls(callSid).update({
                   url: `${appUrl}/twilio/transfer`,
                   method: 'POST'
                 });
-                console.log(`[${callSid}] Call redirected to /twilio/transfer`);
+                console.log(`[${callSid}] ✓ Call redirected successfully`);
               } catch (transferErr) {
-                console.error(`[${callSid}] Failed to redirect call for transfer:`, transferErr.message);
+                console.error(`[${callSid}] ❌ Transfer redirect failed:`, transferErr.message);
+                console.error(`[${callSid}] Full error:`, transferErr);
               }
-            }, 3000); // 3 second delay — lets the AI say goodbye first
+            }, transferDelay);
           }
 
           break;

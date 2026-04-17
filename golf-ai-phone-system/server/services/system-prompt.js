@@ -38,7 +38,7 @@ async function buildSystemPrompt(callerContext = {}) {
   const dateStr = now.toLocaleDateString('en-US', { ...options, weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
 
   const todayHours = hours?.[dayName];
-  const isOpen = todayHours ? isCurrentlyOpen(todayHours, options) : false;
+  const isOpen = todayHours ? isCurrentlyOpen(todayHours) : false;
 
   // Build caller context section
   let callerSection = '';
@@ -147,6 +147,9 @@ ${personality?.style || 'Friendly, warm, and conversational. Sound like a real p
 - The course is currently: ${isOpen ? 'OPEN' : 'CLOSED'}
 ${todayHours ? `- Today's hours: ${todayHours.open} - ${todayHours.close}` : '- Hours not set for today'}
 
+## DATE REFERENCE (use this to convert what callers say to YYYY-MM-DD)
+${buildDateReference()}
+
 ## COURSE INFORMATION
 - Name: ${courseInfo?.name}
 - Address: ${courseInfo?.address}
@@ -213,6 +216,8 @@ ${!isOpen ? personality?.after_hours_message || 'Staff are not available right n
 
 ## BOOKING RULES
 - You can book up to ${policies?.max_booking_size || 8} players (${Math.ceil((policies?.max_booking_size || 8) / 4)} foursomes)
+- CRITICAL: When the caller says a day like "Sunday", "tomorrow", "next Saturday", etc. — YOU convert it to YYYY-MM-DD using the DATE REFERENCE above. NEVER ask the caller to provide a date in YYYY-MM-DD format. They are on the phone — speak naturally.
+- If the caller says "today" or "this Sunday" etc., just match it to the correct date from your reference and proceed.
 - First use check_tee_times to see what's open, then tell them naturally: "I've got 9 AM and 10:30 open — which works?"
 - Once they pick a time, ONLY ask for: name and phone number. That's it — no email, no extra questions.
 - For NEW callers: After they give their name, ALWAYS use save_customer_info to save it so we remember them for next time
@@ -248,16 +253,44 @@ You have access to these tools (functions) — use them when appropriate:
   return systemPrompt;
 }
 
-function isCurrentlyOpen(todayHours, options) {
-  if (!todayHours) return false;
+function buildDateReference() {
+  // Build a reference of upcoming dates so the AI can convert
+  // "today", "tomorrow", "Sunday", "next Saturday" etc. to YYYY-MM-DD
   const now = new Date();
-  const eastern = new Date(now.toLocaleString('en-US', { timeZone: 'America/Toronto' }));
+  const lines = [];
+  for (let i = 0; i <= 13; i++) {
+    const d = new Date(now);
+    d.setDate(d.getDate() + i);
+    const dateKey = d.toLocaleDateString('en-CA', { timeZone: 'America/Toronto' }); // YYYY-MM-DD
+    const dayLabel = d.toLocaleDateString('en-US', { timeZone: 'America/Toronto', weekday: 'long', month: 'short', day: 'numeric' });
+    const prefix = i === 0 ? ' (TODAY)' : i === 1 ? ' (tomorrow)' : '';
+    lines.push(`- ${dayLabel}${prefix} = ${dateKey}`);
+  }
+  return lines.join('\n');
+}
+
+function getEasternTime() {
+  // Reliably get current hour/minute in Eastern time using Intl.DateTimeFormat
+  // This works correctly regardless of what timezone the server is in
+  const now = new Date();
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Toronto',
+    hour: 'numeric',
+    minute: 'numeric',
+    hour12: false
+  });
+  const parts = formatter.formatToParts(now);
+  const hour = parseInt(parts.find(p => p.type === 'hour').value);
+  const minute = parseInt(parts.find(p => p.type === 'minute').value);
+  return { hour, minute, totalMinutes: hour * 60 + minute };
+}
+
+function isCurrentlyOpen(todayHours) {
+  if (!todayHours) return false;
+  const { totalMinutes } = getEasternTime();
   const [openH, openM] = todayHours.open.split(':').map(Number);
   const [closeH, closeM] = todayHours.close.split(':').map(Number);
-  const currentMinutes = eastern.getHours() * 60 + eastern.getMinutes();
-  const openMinutes = openH * 60 + openM;
-  const closeMinutes = closeH * 60 + closeM;
-  return currentMinutes >= openMinutes && currentMinutes <= closeMinutes;
+  return totalMinutes >= (openH * 60 + openM) && totalMinutes <= (closeH * 60 + closeM);
 }
 
 module.exports = { buildSystemPrompt };

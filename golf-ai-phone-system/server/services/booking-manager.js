@@ -32,8 +32,8 @@ async function createBookingRequest({
   const res = await query(
     `INSERT INTO booking_requests
      (customer_id, customer_name, customer_phone, customer_email,
-      requested_date, requested_time, party_size, num_carts, special_requests, call_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      requested_date, requested_time, party_size, num_carts, special_requests, call_id, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending')
      RETURNING *`,
     [customerId || null, customerName.trim(), customerPhone || null, customerEmail || null,
      requestedDate, requestedTime || null, size, carts, specialRequests || null, callId || null]

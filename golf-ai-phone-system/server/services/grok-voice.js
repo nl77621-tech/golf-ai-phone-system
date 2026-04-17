@@ -480,6 +480,25 @@ ${callerLine}
 
           // Trigger Grok to respond with the tool result
           grokWs.send(JSON.stringify({ type: 'response.create' }));
+
+          // If this was a transfer_call and it succeeded, redirect the Twilio call
+          // after a short delay so the AI can say "connecting you now"
+          if (event.name === 'transfer_call' && result.success) {
+            setTimeout(async () => {
+              try {
+                const appUrl = process.env.APP_URL || '';
+                const twilio = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+                await twilio.calls(callSid).update({
+                  url: `${appUrl}/twilio/transfer`,
+                  method: 'POST'
+                });
+                console.log(`[${callSid}] Call redirected to /twilio/transfer`);
+              } catch (transferErr) {
+                console.error(`[${callSid}] Failed to redirect call for transfer:`, transferErr.message);
+              }
+            }, 3000); // 3 second delay — lets the AI say goodbye first
+          }
+
           break;
         }
 
@@ -893,10 +912,18 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
 
       case 'transfer_call': {
         const transferNumber = await getSetting('transfer_number');
+        if (!transferNumber) {
+          return {
+            success: false,
+            message: 'No staff phone number configured. I can take a message and have someone call you back.'
+          };
+        }
+
         // Check if we're in business hours
         const hours = await getSetting('business_hours');
         const personality = await getSetting('ai_personality');
         const now = new Date();
+        const eastern = new Date(now.toLocaleString('en-US', { timeZone: 'America/Toronto' }));
         const dayName = now.toLocaleDateString('en-US', { timeZone: 'America/Toronto', weekday: 'long' }).toLowerCase();
         const todayHours = hours?.[dayName];
 
@@ -907,10 +934,25 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
           };
         }
 
+        // Check if currently within open hours
+        const [openH, openM] = todayHours.open.split(':').map(Number);
+        const [closeH, closeM] = todayHours.close.split(':').map(Number);
+        const currentMinutes = eastern.getHours() * 60 + eastern.getMinutes();
+        const openMinutes = openH * 60 + openM;
+        const closeMinutes = closeH * 60 + closeM;
+
+        if (currentMinutes < openMinutes || currentMinutes > closeMinutes) {
+          return {
+            success: false,
+            message: personality?.after_hours_message || `Staff aren't in right now — we're open ${todayHours.open} to ${todayHours.close}. But I can help you with bookings, course info, or anything else!`
+          };
+        }
+
+        console.log(`[${callLogId}] 📞 Transfer requested — will redirect call to ${transferNumber}. Reason: ${args.reason}`);
         return {
           success: true,
           transfer_to: transferNumber,
-          message: `Transferring to staff now. Reason: ${args.reason}`
+          message: `Tell the caller you're connecting them to a staff member now. Say something brief like "One sec, let me connect you." Then STOP talking — the call will be transferred automatically.`
         };
       }
 

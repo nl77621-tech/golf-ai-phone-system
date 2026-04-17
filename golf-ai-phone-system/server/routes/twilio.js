@@ -165,7 +165,7 @@ router.post('/sms', async (req, res) => {
 
     // HELP keyword
     if (bodyUpper === 'HELP') {
-      return twimlReply('Valleymede Golf: Reply CANCEL to cancel your upcoming tee time, or call us directly. Msg&data rates may apply.');
+      return twimlReply('Valleymede Golf: For any changes or cancellations, please call us at 905 655 6300. Msg&data rates may apply.');
     }
 
     // STOP / UNSUBSCRIBE — Twilio handles opt-out automatically but we acknowledge
@@ -173,8 +173,8 @@ router.post('/sms', async (req, res) => {
       return twimlSilent(); // Twilio auto-responds with opt-out confirmation
     }
 
-    // Unknown reply — gently guide them
-    return twimlReply('Valleymede Golf: Sorry, I can only process CANCEL replies. For other requests please call us.');
+    // Unknown reply — gently guide them to call
+    return twimlReply('Valleymede Golf: For any changes or requests, please call us at 905 655 6300. Thank you!');
   } catch (err) {
     console.error('SMS handler error:', err.message);
     return twimlSilent();

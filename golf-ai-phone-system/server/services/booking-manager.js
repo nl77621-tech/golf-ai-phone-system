@@ -150,13 +150,37 @@ async function updateBookingStatus(id, status, staffNotes) {
 }
 
 // Update modification status
+// When a cancellation request is processed, also cancel the matching booking
 async function updateModificationStatus(id, status, staffNotes) {
   const res = await query(
     `UPDATE modification_requests SET status = $1, staff_notes = $2, updated_at = NOW()
      WHERE id = $3 RETURNING *`,
     [status, staffNotes, id]
   );
-  return res.rows[0];
+  const mod = res.rows[0];
+
+  // If staff processed a cancellation request, auto-cancel the matching booking
+  if (mod && mod.request_type === 'cancel' && status === 'processed') {
+    try {
+      // Find the matching active booking by phone + date
+      const matchQuery = await query(
+        `SELECT id FROM booking_requests
+         WHERE customer_phone = $1
+           AND status IN ('pending', 'confirmed')
+           AND ($2::date IS NULL OR requested_date = $2::date)
+         ORDER BY requested_date ASC
+         LIMIT 1`,
+        [mod.customer_phone, mod.original_date || null]
+      );
+      if (matchQuery.rows[0]) {
+        await updateBookingStatus(matchQuery.rows[0].id, 'cancelled', staffNotes || 'Cancelled by customer via phone call');
+      }
+    } catch (err) {
+      console.error('Failed to auto-cancel matching booking:', err.message);
+    }
+  }
+
+  return mod;
 }
 
 // Get bookings for a date range

@@ -51,6 +51,7 @@ This is a RETURNING caller. Their information:
 - Email: ${callerContext.email || 'Not on file'}
 - Total calls: ${callerContext.callCount || 0}
 - They are already in our system. Do NOT ask for their name or number again.
+- IMPORTANT: Start the conversation by greeting them by name immediately. They're a returning customer — make them feel recognized and welcome right away.
 `;
   } else if (callerContext.isAnonymous) {
     callerSection = `

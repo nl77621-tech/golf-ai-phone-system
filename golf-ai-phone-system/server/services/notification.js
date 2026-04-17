@@ -184,7 +184,7 @@ async function sendBookingConfirmationToCustomer(booking) {
     const when = formatShortDateTime(booking.requested_date, booking.requested_time);
     const players = booking.party_size || 1;
     const playerWord = players === 1 ? 'player' : 'players';
-    const msg = `Valleymede Golf: Tee time request for ${when}, ${players} ${playerWord}. We'll confirm shortly. Reply CANCEL to cancel.`;
+    const msg = `Valleymede Golf: Tee time request for ${when}, ${players} ${playerWord}. Your booking is not confirmed until you receive a confirmation text!! If plans change please call us back at 905 655 6300.`;
 
     return await sendSMS(booking.customer_phone, msg);
   } catch (err) {
@@ -203,7 +203,7 @@ async function sendBookingConfirmedToCustomer(booking) {
     const when = formatShortDateTime(booking.requested_date, booking.requested_time);
     const players = booking.party_size || 1;
     const playerWord = players === 1 ? 'player' : 'players';
-    const msg = `Valleymede Golf: Tee time CONFIRMED for ${when}, ${players} ${playerWord}. See you then! Reply CANCEL if plans change.`;
+    const msg = `Valleymede Golf: Tee time CONFIRMED for ${when}, ${players} ${playerWord}. See you then! If plans change please call us back at 905 655 6300.`;
 
     return await sendSMS(booking.customer_phone, msg);
   } catch (err) {

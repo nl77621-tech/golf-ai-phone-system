@@ -1058,7 +1058,7 @@ function SettingsPage() {
               }), '📱 Send booking confirmation SMS to customers'
             ),
             React.createElement('p', { className: 'text-xs text-gray-500 mt-1 ml-6' },
-              'Text callers when their tee time is booked, confirmed, or cancelled. They can reply CANCEL to cancel. ~$0.01 per booking.'
+              'Text callers when their tee time is booked, confirmed, or cancelled. Customers are told to call back at 905 655 6300 if plans change. ~$0.01 per booking.'
             )
           )
         )

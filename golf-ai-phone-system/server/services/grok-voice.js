@@ -349,6 +349,9 @@ ${callerLine}
     }));
 
     // Send initial greeting as a conversation item
+    const greetingInstruction = callerContext.known && callerContext.name
+      ? `[System: A returning caller named ${callerContext.name} just called. Greet them IMMEDIATELY by name — start with their name right away, warm and personal like you recognize them. Use this greeting but make it sound natural and unscripted: "${greeting}". Do NOT sound like you are reading from a script. Do NOT ask for their name.]`
+      : `[System: Someone just called. Answer the phone naturally like a real person would — warm, casual, friendly. Use this greeting but make it sound natural and unscripted: "${greeting}". Do NOT sound like you are reading from a script.]`;
     grokWs.send(JSON.stringify({
       type: 'conversation.item.create',
       item: {
@@ -356,7 +359,7 @@ ${callerLine}
         role: 'user',
         content: [{
           type: 'input_text',
-          text: '[System: Someone just called. Answer the phone naturally like a real person would — warm, casual, friendly. Use this greeting but make it sound natural and unscripted: "' + greeting + '". Do NOT sound like you are reading from a script.]'
+          text: greetingInstruction
         }]
       }
     }));

@@ -135,15 +135,29 @@ function formatShortDateTime(dateStr, timeStr) {
       return timeStr || '';
     }
 
-    // Try to parse the date
-    const d = new Date(dateStr + 'T00:00:00');
+    // Handle Date objects from database — convert to YYYY-MM-DD string
+    let dateString = dateStr;
+    if (dateStr instanceof Date) {
+      // It's a Date object, convert to ISO string and extract just the date part
+      dateString = dateStr.toISOString().split('T')[0];
+    } else if (typeof dateStr === 'string') {
+      // Already a string, but clean it up if it has time info
+      dateString = dateStr.includes('T') ? dateStr.split('T')[0] : dateStr;
+    } else {
+      // Unknown format, return as-is
+      return `${dateStr || ''} ${timeStr || ''}`.trim();
+    }
+
+    // Try to parse the date — add T00:00:00Z for UTC parsing
+    const d = new Date(dateString + 'T00:00:00Z');
 
     // Check if date is actually valid (Invalid Date has NaN getTime())
     if (isNaN(d.getTime())) {
-      console.warn('formatShortDateTime: Invalid date string:', dateStr);
-      return `${dateStr} ${timeStr || ''}`.trim();
+      console.warn('formatShortDateTime: Invalid date string:', dateString);
+      return `${dateString} ${timeStr || ''}`.trim();
     }
 
+    // Format the day part: "Sun Apr 19" — use local Toronto time
     const dayPart = d.toLocaleDateString('en-US', {
       weekday: 'short', month: 'short', day: 'numeric', timeZone: 'America/Toronto'
     });

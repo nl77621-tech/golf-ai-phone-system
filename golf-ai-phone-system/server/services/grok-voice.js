@@ -846,19 +846,37 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
       }
 
       case 'cancel_booking': {
+        const phone = args.customer_phone || callerContext.phone;
+
+        // Try to find and directly cancel the actual booking
+        const { findActiveBookingByPhone, updateBookingStatus } = require('./booking-manager');
+        const booking = await findActiveBookingByPhone(phone);
+
+        if (booking) {
+          // Directly cancel the booking — it will show as cancelled on the bookings page
+          // and send the cancellation SMS to the customer
+          await updateBookingStatus(booking.id, 'cancelled', args.details || 'Cancelled by customer via phone call');
+          return {
+            success: true,
+            message: `Booking for ${booking.requested_date} has been cancelled successfully.`,
+            bookingId: booking.id
+          };
+        }
+
+        // No matching booking found — create a modification request so staff can handle it
         const cancel = await createModificationRequest({
           customerId: callerContext.customerId,
           customerName: args.customer_name,
-          customerPhone: args.customer_phone || callerContext.phone,
+          customerPhone: phone,
           requestType: 'cancel',
           originalDate: args.original_date,
           originalTime: args.original_time,
-          details: args.details || 'Cancellation requested by caller',
+          details: args.details || 'Cancellation requested by caller — no matching booking found',
           callId: callLogId
         });
         return {
           success: true,
-          message: `Cancellation request submitted. Staff will process it.`,
+          message: `Cancellation request submitted. Staff will look into it.`,
           requestId: cancel.id
         };
       }

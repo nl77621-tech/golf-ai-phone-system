@@ -76,14 +76,23 @@ router.post('/status', (req, res) => {
  */
 router.post('/transfer', async (req, res) => {
   try {
-    let transferNumber = await getSetting('transfer_number');
-    // Normalize — getSetting returns parsed JSON, which could be a string with or without quotes
-    if (typeof transferNumber === 'string') {
-      transferNumber = transferNumber.replace(/[^+\d]/g, ''); // strip everything except + and digits
+    const rawSetting = await getSetting('transfer_number');
+    console.log(`📞 Transfer endpoint hit — raw setting value: ${JSON.stringify(rawSetting)} (type: ${typeof rawSetting})`);
+
+    // Normalize the phone number from whatever format it's stored in
+    let transferNumber = String(rawSetting || '').replace(/[^+\d]/g, ''); // strip everything except + and digits
+    // Ensure E.164 format for Twilio
+    if (transferNumber && !transferNumber.startsWith('+')) {
+      if (transferNumber.length === 10) {
+        transferNumber = '+1' + transferNumber; // North American 10-digit
+      } else if (transferNumber.length === 11 && transferNumber.startsWith('1')) {
+        transferNumber = '+' + transferNumber;
+      }
     }
-    console.log(`📞 Transfer endpoint hit — dialing: ${transferNumber}`);
+    console.log(`📞 Normalized transfer number: ${transferNumber}`);
 
     if (!transferNumber) {
+      console.error('❌ No transfer number configured');
       res.type('text/xml');
       res.send(`
         <Response>

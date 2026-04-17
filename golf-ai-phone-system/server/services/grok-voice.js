@@ -918,40 +918,13 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
       }
 
       case 'transfer_call': {
+        // Always attempt the transfer — if nobody picks up, Twilio's fallback
+        // handles it gracefully after 30 seconds ("sorry, nobody was able to pick up")
         const transferNumber = await getSetting('transfer_number');
         if (!transferNumber) {
           return {
             success: false,
             message: 'No staff phone number configured. I can take a message and have someone call you back.'
-          };
-        }
-
-        // Check if we're in business hours
-        const hours = await getSetting('business_hours');
-        const personality = await getSetting('ai_personality');
-        const now = new Date();
-        const eastern = new Date(now.toLocaleString('en-US', { timeZone: 'America/Toronto' }));
-        const dayName = now.toLocaleDateString('en-US', { timeZone: 'America/Toronto', weekday: 'long' }).toLowerCase();
-        const todayHours = hours?.[dayName];
-
-        if (!todayHours) {
-          return {
-            success: false,
-            message: personality?.after_hours_message || 'No staff available right now. But I can help you with bookings, course info, or anything else!'
-          };
-        }
-
-        // Check if currently within open hours
-        const [openH, openM] = todayHours.open.split(':').map(Number);
-        const [closeH, closeM] = todayHours.close.split(':').map(Number);
-        const currentMinutes = eastern.getHours() * 60 + eastern.getMinutes();
-        const openMinutes = openH * 60 + openM;
-        const closeMinutes = closeH * 60 + closeM;
-
-        if (currentMinutes < openMinutes || currentMinutes > closeMinutes) {
-          return {
-            success: false,
-            message: personality?.after_hours_message || `Staff aren't in right now — we're open ${todayHours.open} to ${todayHours.close}. But I can help you with bookings, course info, or anything else!`
           };
         }
 

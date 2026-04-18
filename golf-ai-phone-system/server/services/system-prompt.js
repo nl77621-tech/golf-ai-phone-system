@@ -58,6 +58,10 @@ This is a RETURNING caller. Their information:
 - Total calls: ${callerContext.callCount || 0}
 - They are already in our system. Do NOT ask for their name or number again.
 - IMPORTANT: Start the conversation by greeting them by name immediately. They're a returning customer — make them feel recognized and welcome right away.
+${callerContext.customerKnowledge ? `
+### WHAT WE KNOW ABOUT THIS CALLER (use naturally, don't read it all out):
+${callerContext.customerKnowledge}
+` : ''}
 `;
   } else if (callerContext.isAnonymous) {
     callerSection = `

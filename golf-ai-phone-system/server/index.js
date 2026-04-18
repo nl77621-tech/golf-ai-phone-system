@@ -164,6 +164,16 @@ async function initializeDatabaseIfNeeded() {
     // Run migrations — add new columns if they don't exist
     try {
       await client.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS custom_greeting TEXT`);
+      await client.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS custom_greetings JSONB DEFAULT '[]'`);
+      await client.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS customer_knowledge TEXT`);
+      // Migrate old custom_greeting → custom_greetings array if needed
+      await client.query(`
+        UPDATE customers
+        SET custom_greetings = jsonb_build_array(custom_greeting)
+        WHERE custom_greeting IS NOT NULL
+          AND custom_greeting != ''
+          AND (custom_greetings IS NULL OR custom_greetings = '[]'::jsonb)
+      `);
       console.log('✅ Migrations applied');
     } catch (migErr) {
       console.warn('⚠️  Migration warning:', migErr.message);

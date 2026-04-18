@@ -439,23 +439,37 @@ function BookingsPage() {
 // CUSTOMERS PAGE — Contact List
 // ============================================
 function ContactModal({ contact, onClose, onSave }) {
+  // Parse custom_greetings from DB (JSONB array) or fall back to legacy custom_greeting
+  const initGreetings = () => {
+    if (contact?.custom_greetings && Array.isArray(contact.custom_greetings) && contact.custom_greetings.length > 0) {
+      return contact.custom_greetings;
+    }
+    if (contact?.custom_greeting) return [contact.custom_greeting];
+    return [''];
+  };
+
   const [form, setForm] = useState({
     name: contact?.name || '',
     phone: contact?.phone || '',
     email: contact?.email || '',
     notes: contact?.notes || '',
-    custom_greeting: contact?.custom_greeting || ''
+    customer_knowledge: contact?.customer_knowledge || ''
   });
+  const [greetings, setGreetings] = useState(initGreetings);
   const [saving, setSaving] = useState(false);
 
   const handleSave = async () => {
     if (!form.name && !form.phone) return alert('Please enter at least a name or phone number.');
     setSaving(true);
     try {
+      const payload = {
+        ...form,
+        custom_greetings: greetings.filter(g => g && g.trim())
+      };
       if (contact?.id) {
-        await api(`/api/customers/${contact.id}`, { method: 'PUT', body: JSON.stringify(form) });
+        await api(`/api/customers/${contact.id}`, { method: 'PUT', body: JSON.stringify(payload) });
       } else {
-        await api('/api/customers', { method: 'POST', body: JSON.stringify(form) });
+        await api('/api/customers', { method: 'POST', body: JSON.stringify(payload) });
       }
       onSave();
     } catch (err) { alert('Failed to save: ' + err.message); }
@@ -472,8 +486,12 @@ function ContactModal({ contact, onClose, onSave }) {
       })
     );
 
+  const addGreeting = () => setGreetings(g => [...g, '']);
+  const removeGreeting = (idx) => setGreetings(g => g.filter((_, i) => i !== idx));
+  const updateGreeting = (idx, val) => setGreetings(g => g.map((v, i) => i === idx ? val : v));
+
   return React.createElement('div', { className: 'fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50', onClick: onClose },
-    React.createElement('div', { className: 'bg-white rounded-2xl shadow-2xl p-6 w-full max-w-md mx-4', onClick: e => e.stopPropagation() },
+    React.createElement('div', { className: 'bg-white rounded-2xl shadow-2xl p-6 w-full max-w-lg mx-4 max-h-[85vh] overflow-y-auto', onClick: e => e.stopPropagation() },
       React.createElement('div', { className: 'flex items-center justify-between mb-6' },
         React.createElement('h2', { className: 'text-lg font-bold text-gray-800' }, contact?.id ? 'Edit Contact' : 'Add New Contact'),
         React.createElement('button', { onClick: onClose, className: 'text-gray-400 hover:text-gray-600 text-xl' }, '✕')
@@ -489,16 +507,45 @@ function ContactModal({ contact, onClose, onSave }) {
           className: 'w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-golf-500 outline-none resize-none'
         })
       ),
+
+      // Customer Knowledge for AI
       React.createElement('div', { className: 'mb-4' },
-        React.createElement('label', { className: 'block text-sm font-medium text-gray-700 mb-1' }, 'Custom Greeting'),
+        React.createElement('label', { className: 'block text-sm font-medium text-gray-700 mb-1' }, 'Customer Knowledge (for AI)'),
         React.createElement('textarea', {
-          value: form.custom_greeting, rows: 2,
-          placeholder: 'e.g., "Hey {name}! Great to hear from you again. How can I help today?" — Use {name} to insert their name.',
-          onChange: e => setForm(f => ({ ...f, custom_greeting: e.target.value })),
+          value: form.customer_knowledge, rows: 3,
+          placeholder: 'e.g., "Prefers morning tee times. Member since 2020. Usually plays with his son. Likes to walk, no cart."',
+          onChange: e => setForm(f => ({ ...f, customer_knowledge: e.target.value })),
           className: 'w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-golf-500 outline-none resize-none'
         }),
-        React.createElement('p', { className: 'text-xs text-gray-400 mt-1' }, 'If set, the AI will use this greeting instead of a random one when this person calls. Use {name} for their name.')
+        React.createElement('p', { className: 'text-xs text-gray-400 mt-1' }, 'The AI will know this about the caller and use it naturally in conversation.')
       ),
+
+      // Multiple Custom Greetings
+      React.createElement('div', { className: 'mb-4' },
+        React.createElement('div', { className: 'flex items-center justify-between mb-1' },
+          React.createElement('label', { className: 'block text-sm font-medium text-gray-700' }, 'Custom Greetings'),
+          React.createElement('button', {
+            onClick: addGreeting, type: 'button',
+            className: 'text-xs px-2 py-1 bg-golf-50 hover:bg-golf-100 text-golf-700 rounded border border-golf-200'
+          }, '+ Add Greeting')
+        ),
+        React.createElement('p', { className: 'text-xs text-gray-400 mb-2' }, 'Add multiple greetings — the AI will randomly pick one each time they call. Use {name} for their name.'),
+        greetings.map((g, idx) =>
+          React.createElement('div', { key: idx, className: 'flex gap-2 mb-2' },
+            React.createElement('input', {
+              type: 'text', value: g,
+              placeholder: idx === 0 ? 'e.g., "Hey {name}! How are you today?"' : 'e.g., "{name}! Good to hear from you!"',
+              onChange: e => updateGreeting(idx, e.target.value),
+              className: 'flex-1 border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-golf-500 outline-none'
+            }),
+            greetings.length > 1 && React.createElement('button', {
+              onClick: () => removeGreeting(idx), type: 'button',
+              className: 'text-red-400 hover:text-red-600 text-lg px-1'
+            }, '✕')
+          )
+        )
+      ),
+
       React.createElement('div', { className: 'flex gap-3 justify-end' },
         React.createElement('button', { onClick: onClose, className: 'px-4 py-2 text-sm text-gray-600 hover:text-gray-800' }, 'Cancel'),
         React.createElement('button', {
@@ -592,9 +639,15 @@ function CustomerDetailPanel({ customerId, onClose, onEdit }) {
               React.createElement('div', { className: 'text-xs text-gray-400' }, 'Last Call'),
               React.createElement('div', { className: 'text-sm font-medium text-gray-600' }, formatDate(c?.last_call_at))
             ),
-            c?.custom_greeting && React.createElement('div', { className: 'flex-1' },
-              React.createElement('div', { className: 'text-xs text-gray-400' }, 'Custom Greeting'),
-              React.createElement('div', { className: 'text-xs text-golf-600 italic truncate' }, c.custom_greeting)
+            (c?.custom_greetings?.length > 0 || c?.custom_greeting) && React.createElement('div', null,
+              React.createElement('div', { className: 'text-xs text-gray-400' }, 'Greetings'),
+              React.createElement('div', { className: 'text-sm font-medium text-golf-600' },
+                (c.custom_greetings?.filter(g => g && g.trim()).length || (c.custom_greeting ? 1 : 0)) + ' custom'
+              )
+            ),
+            c?.customer_knowledge && React.createElement('div', { className: 'flex-1' },
+              React.createElement('div', { className: 'text-xs text-gray-400' }, 'AI Knowledge'),
+              React.createElement('div', { className: 'text-xs text-gray-500 italic truncate' }, c.customer_knowledge)
             )
           )
         ),

@@ -143,7 +143,8 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid, appU
     name: customer?.name,
     email: customer?.email,
     callCount: customer?.call_count,
-    customerId: customer?.id
+    customerId: customer?.id,
+    customerKnowledge: customer?.customer_knowledge || null
   };
 
   // Update call log with customer ID
@@ -151,13 +152,23 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid, appU
     query('UPDATE call_logs SET customer_id = $1 WHERE id = $2', [customer.id, callLogId]).catch(() => {});
   }
 
-  // Get greeting — use per-customer custom greeting if set, otherwise random from DB
+  // Get greeting — use per-customer custom greetings (random pick) if set, otherwise random from DB
   let greeting = 'Thanks for calling Valleymede Columbus Golf Course! How can I help you today?';
   try {
-    if (customer?.custom_greeting && callerContext.known) {
-      // Use the personalized greeting set by staff for this customer
+    // Check for multiple custom greetings first (new system), then fall back to single custom_greeting (legacy)
+    const greetings = customer?.custom_greetings;
+    const hasCustomGreetings = Array.isArray(greetings) && greetings.filter(g => g && g.trim()).length > 0;
+
+    if (hasCustomGreetings && callerContext.known) {
+      // Pick a random greeting from the customer's personalized list
+      const validGreetings = greetings.filter(g => g && g.trim());
+      const picked = validGreetings[Math.floor(Math.random() * validGreetings.length)];
+      greeting = picked.replace(/{name}/g, callerContext.name || '');
+      console.log(`[${callLogId}] Using custom greeting ${validGreetings.indexOf(picked) + 1}/${validGreetings.length} for ${callerContext.name}`);
+    } else if (customer?.custom_greeting && callerContext.known) {
+      // Legacy: single custom greeting
       greeting = customer.custom_greeting.replace(/{name}/g, callerContext.name || '');
-      console.log(`[${callLogId}] Using custom greeting for ${callerContext.name}`);
+      console.log(`[${callLogId}] Using legacy custom greeting for ${callerContext.name}`);
     } else {
       greeting = await getRandomGreeting(callerContext.known, callerContext.name);
     }

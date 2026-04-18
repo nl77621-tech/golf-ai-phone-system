@@ -315,7 +315,7 @@ router.get('/customers/:id', async (req, res) => {
 router.put('/customers/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, email, phone, notes, custom_greeting } = req.body;
+    const { name, email, phone, notes, custom_greeting, custom_greetings, customer_knowledge } = req.body;
     const fields = [];
     const values = [];
     let p = 1;
@@ -325,6 +325,8 @@ router.put('/customers/:id', async (req, res) => {
     if (phone !== undefined) { fields.push(`phone = $${p++}`); values.push(phone); }
     if (notes !== undefined) { fields.push(`notes = $${p++}`); values.push(notes); }
     if (custom_greeting !== undefined) { fields.push(`custom_greeting = $${p++}`); values.push(custom_greeting || null); }
+    if (custom_greetings !== undefined) { fields.push(`custom_greetings = $${p++}`); values.push(JSON.stringify(custom_greetings || [])); }
+    if (customer_knowledge !== undefined) { fields.push(`customer_knowledge = $${p++}`); values.push(customer_knowledge || null); }
 
     if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
 

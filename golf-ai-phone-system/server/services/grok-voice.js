@@ -151,10 +151,16 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid, appU
     query('UPDATE call_logs SET customer_id = $1 WHERE id = $2', [customer.id, callLogId]).catch(() => {});
   }
 
-  // Get a random greeting (with fallback if DB unavailable)
+  // Get greeting — use per-customer custom greeting if set, otherwise random from DB
   let greeting = 'Thanks for calling Valleymede Columbus Golf Course! How can I help you today?';
   try {
-    greeting = await getRandomGreeting(callerContext.known, callerContext.name);
+    if (customer?.custom_greeting && callerContext.known) {
+      // Use the personalized greeting set by staff for this customer
+      greeting = customer.custom_greeting.replace(/{name}/g, callerContext.name || '');
+      console.log(`[${callLogId}] Using custom greeting for ${callerContext.name}`);
+    } else {
+      greeting = await getRandomGreeting(callerContext.known, callerContext.name);
+    }
   } catch (err) {
     console.error('Failed to get greeting (using default):', err.message);
   }
@@ -195,9 +201,10 @@ You are on a PHONE CALL. Speak exactly like a real person would:
 - Speak in plain language — no formal or corporate-sounding phrases
 - When you need info from them, ask ONE question at a time, not three at once
 - Natural transitions: "so", "and", "okay so", "right", "got it"
+- NEVER say dates in numeric format like "2026-04-19". Say "Sunday, April nineteenth" or "tomorrow". Use YYYY-MM-DD ONLY inside tool calls, never out loud.
 
 ## CURRENT DATE & TIME
-Today is ${dateStr}, current time: ${timeStr} Eastern. The year is 2026.
+Today is ${dateStr}, current time: ${timeStr} Eastern.
 
 ## COURSE INFORMATION
 - Name: Valleymede Columbus Golf Course

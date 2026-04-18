@@ -161,6 +161,14 @@ async function initializeDatabaseIfNeeded() {
       console.log('✅ Database tables already exist');
     }
 
+    // Run migrations — add new columns if they don't exist
+    try {
+      await client.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS custom_greeting TEXT`);
+      console.log('✅ Migrations applied');
+    } catch (migErr) {
+      console.warn('⚠️  Migration warning:', migErr.message);
+    }
+
     client.release();
   } catch (err) {
     console.error('⚠️  Database initialization warning:', err.message);

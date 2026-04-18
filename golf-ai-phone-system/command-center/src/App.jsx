@@ -443,7 +443,8 @@ function ContactModal({ contact, onClose, onSave }) {
     name: contact?.name || '',
     phone: contact?.phone || '',
     email: contact?.email || '',
-    notes: contact?.notes || ''
+    notes: contact?.notes || '',
+    custom_greeting: contact?.custom_greeting || ''
   });
   const [saving, setSaving] = useState(false);
 
@@ -488,6 +489,16 @@ function ContactModal({ contact, onClose, onSave }) {
           className: 'w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-golf-500 outline-none resize-none'
         })
       ),
+      React.createElement('div', { className: 'mb-4' },
+        React.createElement('label', { className: 'block text-sm font-medium text-gray-700 mb-1' }, 'Custom Greeting'),
+        React.createElement('textarea', {
+          value: form.custom_greeting, rows: 2,
+          placeholder: 'e.g., "Hey {name}! Great to hear from you again. How can I help today?" — Use {name} to insert their name.',
+          onChange: e => setForm(f => ({ ...f, custom_greeting: e.target.value })),
+          className: 'w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-golf-500 outline-none resize-none'
+        }),
+        React.createElement('p', { className: 'text-xs text-gray-400 mt-1' }, 'If set, the AI will use this greeting instead of a random one when this person calls. Use {name} for their name.')
+      ),
       React.createElement('div', { className: 'flex gap-3 justify-end' },
         React.createElement('button', { onClick: onClose, className: 'px-4 py-2 text-sm text-gray-600 hover:text-gray-800' }, 'Cancel'),
         React.createElement('button', {
@@ -499,12 +510,169 @@ function ContactModal({ contact, onClose, onSave }) {
   );
 }
 
+// ============================================
+// CUSTOMER DETAIL PANEL (call history + bookings)
+// ============================================
+function CustomerDetailPanel({ customerId, onClose, onEdit }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [tab, setTab] = useState('calls');
+
+  useEffect(() => {
+    if (!customerId) return;
+    setLoading(true);
+    api(`/api/customers/${customerId}`)
+      .then(d => setData(d))
+      .catch(err => console.error('Failed to load customer:', err))
+      .finally(() => setLoading(false));
+  }, [customerId]);
+
+  if (!customerId) return null;
+
+  const formatDate = (d) => {
+    if (!d) return '--';
+    return new Date(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  };
+  const formatTime = (d) => {
+    if (!d) return '';
+    return new Date(d).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+  };
+  const formatDuration = (s) => {
+    if (!s) return '--';
+    const m = Math.floor(s / 60);
+    const sec = s % 60;
+    return m > 0 ? `${m}m ${sec}s` : `${sec}s`;
+  };
+
+  const c = data?.customer;
+  const calls = data?.calls || [];
+  const bookings = data?.bookings || [];
+
+  return React.createElement('div', { className: 'fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50', onClick: onClose },
+    React.createElement('div', {
+      className: 'bg-white rounded-2xl shadow-2xl w-full max-w-2xl mx-4 max-h-[85vh] flex flex-col',
+      onClick: e => e.stopPropagation()
+    },
+      // Header
+      loading ? React.createElement('div', { className: 'p-8 text-center text-gray-400' }, 'Loading...') :
+      React.createElement(React.Fragment, null,
+        React.createElement('div', { className: 'p-6 border-b' },
+          React.createElement('div', { className: 'flex items-center justify-between' },
+            React.createElement('div', { className: 'flex items-center gap-4' },
+              React.createElement('div', { className: 'w-14 h-14 rounded-full bg-golf-600 flex items-center justify-center text-white font-bold text-lg' },
+                c?.name ? c.name.split(' ').map(w => w[0]).join('').toUpperCase().slice(0, 2) : '?'
+              ),
+              React.createElement('div', null,
+                React.createElement('h2', { className: 'text-xl font-bold text-gray-800' }, c?.name || 'Unknown'),
+                React.createElement('div', { className: 'flex gap-3 mt-1' },
+                  c?.phone && React.createElement('span', { className: 'text-sm text-gray-500' }, c.phone),
+                  c?.email && React.createElement('span', { className: 'text-sm text-gray-500' }, c.email)
+                )
+              )
+            ),
+            React.createElement('div', { className: 'flex items-center gap-2' },
+              React.createElement('button', {
+                onClick: () => onEdit(c),
+                className: 'text-xs px-3 py-1.5 border border-gray-200 hover:border-golf-500 hover:text-golf-600 text-gray-500 rounded-lg'
+              }, 'Edit'),
+              React.createElement('button', { onClick: onClose, className: 'text-gray-400 hover:text-gray-600 text-xl ml-2' }, '✕')
+            )
+          ),
+          // Stats row
+          React.createElement('div', { className: 'flex gap-6 mt-4' },
+            React.createElement('div', null,
+              React.createElement('div', { className: 'text-xs text-gray-400' }, 'Total Calls'),
+              React.createElement('div', { className: 'text-lg font-bold text-gray-700' }, c?.call_count || 0)
+            ),
+            React.createElement('div', null,
+              React.createElement('div', { className: 'text-xs text-gray-400' }, 'First Call'),
+              React.createElement('div', { className: 'text-sm font-medium text-gray-600' }, formatDate(c?.first_call_at))
+            ),
+            React.createElement('div', null,
+              React.createElement('div', { className: 'text-xs text-gray-400' }, 'Last Call'),
+              React.createElement('div', { className: 'text-sm font-medium text-gray-600' }, formatDate(c?.last_call_at))
+            ),
+            c?.custom_greeting && React.createElement('div', { className: 'flex-1' },
+              React.createElement('div', { className: 'text-xs text-gray-400' }, 'Custom Greeting'),
+              React.createElement('div', { className: 'text-xs text-golf-600 italic truncate' }, c.custom_greeting)
+            )
+          )
+        ),
+
+        // Tabs
+        React.createElement('div', { className: 'flex border-b px-6' },
+          React.createElement('button', {
+            onClick: () => setTab('calls'),
+            className: `px-4 py-2.5 text-sm font-medium border-b-2 ${tab === 'calls' ? 'border-golf-600 text-golf-700' : 'border-transparent text-gray-400 hover:text-gray-600'}`
+          }, `Calls (${calls.length})`),
+          React.createElement('button', {
+            onClick: () => setTab('bookings'),
+            className: `px-4 py-2.5 text-sm font-medium border-b-2 ${tab === 'bookings' ? 'border-golf-600 text-golf-700' : 'border-transparent text-gray-400 hover:text-gray-600'}`
+          }, `Bookings (${bookings.length})`)
+        ),
+
+        // Content
+        React.createElement('div', { className: 'flex-1 overflow-y-auto p-6' },
+          tab === 'calls' ? (
+            calls.length === 0
+              ? React.createElement('p', { className: 'text-gray-400 text-sm text-center py-8' }, 'No call history yet.')
+              : calls.map(call =>
+                  React.createElement('div', { key: call.id, className: 'border rounded-lg p-3 mb-3 hover:bg-gray-50' },
+                    React.createElement('div', { className: 'flex items-center justify-between mb-1' },
+                      React.createElement('span', { className: 'text-sm font-medium text-gray-700' },
+                        formatDate(call.started_at) + ' at ' + formatTime(call.started_at)
+                      ),
+                      React.createElement('span', { className: 'text-xs text-gray-400' },
+                        formatDuration(call.duration_seconds)
+                      )
+                    ),
+                    call.summary && React.createElement('p', { className: 'text-xs text-gray-500 mt-1' }, call.summary),
+                    call.actions_taken && React.createElement('div', { className: 'mt-1' },
+                      React.createElement('span', { className: 'text-xs text-golf-600' }, 'Actions: ' + (
+                        Array.isArray(call.actions_taken) ? call.actions_taken.join(', ') : String(call.actions_taken)
+                      ))
+                    )
+                  )
+                )
+          ) : (
+            bookings.length === 0
+              ? React.createElement('p', { className: 'text-gray-400 text-sm text-center py-8' }, 'No bookings yet.')
+              : bookings.map(b =>
+                  React.createElement('div', { key: b.id, className: 'border rounded-lg p-3 mb-3 hover:bg-gray-50' },
+                    React.createElement('div', { className: 'flex items-center justify-between' },
+                      React.createElement('div', null,
+                        React.createElement('span', { className: 'text-sm font-medium text-gray-700' },
+                          formatDate(b.requested_date)
+                        ),
+                        b.requested_time && React.createElement('span', { className: 'text-sm text-gray-500 ml-2' }, b.requested_time),
+                        React.createElement('span', { className: 'text-xs text-gray-400 ml-2' }, `${b.party_size} player${b.party_size !== 1 ? 's' : ''}`)
+                      ),
+                      React.createElement('span', {
+                        className: `text-xs px-2 py-0.5 rounded-full font-medium ${
+                          b.status === 'confirmed' ? 'bg-green-100 text-green-700' :
+                          b.status === 'pending' ? 'bg-yellow-100 text-yellow-700' :
+                          b.status === 'cancelled' ? 'bg-red-100 text-red-700' :
+                          'bg-gray-100 text-gray-600'
+                        }`
+                      }, b.status)
+                    ),
+                    b.special_requests && React.createElement('p', { className: 'text-xs text-gray-500 mt-1' }, b.special_requests)
+                  )
+                )
+          )
+        )
+      )
+    )
+  );
+}
+
 function CustomersPage() {
   const [customers, setCustomers] = useState([]);
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [modal, setModal] = useState(null); // null | 'add' | {contact obj for edit}
+  const [detailId, setDetailId] = useState(null); // customer ID to show detail panel
 
   const loadCustomers = async (q = '') => {
     try {
@@ -586,7 +754,11 @@ function CustomersPage() {
           )
         : React.createElement('div', { className: 'bg-white rounded-xl shadow-sm border overflow-hidden' },
             named.map((c, i) =>
-              React.createElement('div', { key: c.id, className: `flex items-center gap-4 px-4 py-3 hover:bg-gray-50 ${i < named.length - 1 ? 'border-b' : ''}` },
+              React.createElement('div', {
+                key: c.id,
+                className: `flex items-center gap-4 px-4 py-3 hover:bg-gray-50 cursor-pointer ${i < named.length - 1 ? 'border-b' : ''}`,
+                onClick: () => setDetailId(c.id)
+              },
                 // Avatar
                 React.createElement('div', { className: `w-10 h-10 rounded-full flex items-center justify-center text-white font-semibold text-sm flex-shrink-0 ${avatarColor(c.name)}` },
                   initials(c.name)
@@ -608,7 +780,7 @@ function CustomersPage() {
                 ),
                 // Edit button
                 React.createElement('button', {
-                  onClick: () => setModal(c),
+                  onClick: (e) => { e.stopPropagation(); setModal(c); },
                   className: 'text-xs px-3 py-1.5 border border-gray-200 hover:border-golf-500 hover:text-golf-600 text-gray-500 rounded-lg transition-colors ml-2'
                 }, 'Edit')
               )
@@ -620,6 +792,13 @@ function CustomersPage() {
       contact: modal === 'add' ? null : modal,
       onClose: () => setModal(null),
       onSave: handleSaved
+    }),
+
+    // Customer detail panel
+    detailId && React.createElement(CustomerDetailPanel, {
+      customerId: detailId,
+      onClose: () => setDetailId(null),
+      onEdit: (c) => { setDetailId(null); setModal(c); }
     })
   );
 }

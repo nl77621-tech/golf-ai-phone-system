@@ -922,6 +922,7 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
         // Always attempt the transfer — if nobody picks up, Twilio's fallback
         // handles it gracefully after 30 seconds ("sorry, nobody was able to pick up")
         const transferNumber = await getSetting('transfer_number');
+        console.log(`[${callLogId}] 📞 Transfer setting raw value: ${JSON.stringify(transferNumber)} (type: ${typeof transferNumber})`);
         if (!transferNumber) {
           return {
             success: false,
@@ -929,7 +930,9 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
           };
         }
 
-        console.log(`[${callLogId}] 📞 Transfer requested — will redirect call to ${transferNumber}. Reason: ${args.reason}`);
+        // Normalize to digits for logging
+        const normalizedForLog = String(transferNumber).replace(/[^+\d]/g, '');
+        console.log(`[${callLogId}] 📞 Transfer requested — will redirect to ${normalizedForLog}. Reason: ${args.reason}`);
         return {
           success: true,
           transfer_to: transferNumber,

@@ -129,11 +129,14 @@ router.post('/transfer', async (req, res) => {
  */
 router.post('/transfer-fallback', (req, res) => {
   const dialStatus = req.body.DialCallStatus;
+  const dialSid = req.body.DialCallSid;
+  console.log(`📞 Transfer fallback — DialCallStatus: ${dialStatus}, DialCallSid: ${dialSid}`);
   res.type('text/xml');
 
   if (dialStatus === 'completed') {
     res.send('<Response><Hangup/></Response>');
   } else {
+    console.log(`📞 Transfer failed (${dialStatus}) — telling caller nobody picked up`);
     res.send(`
       <Response>
         <Say voice="alice">Sorry, nobody was able to pick up. You can try again later, or I can continue helping you. Goodbye!</Say>

@@ -103,29 +103,87 @@ function httpsPost(url, formData, headers = {}) {
 
 function detectPageType(html) {
   const lower = html.toLowerCase();
-  if (lower.includes('no times available')) return 'NO_TIMES';
+  // Check for actual tee time slot boxes first — they're the real indicator
+  if (lower.includes('search-results-tee-times-box') && !lower.includes('search-results-tee-times-box message-cell')) {
+    // Page has slot boxes — check if any are real time slots (not just the message box)
+    if (/class="time"/.test(html)) return 'SHEET';
+  }
+  // The "no times available" div is ALWAYS in the HTML (hidden with display:none)
+  // Only treat as NO_TIMES if there are zero actual slot boxes
   if (lower.includes('signin') || lower.includes('sign in') || lower.includes('username') || lower.includes('password')) return 'LOGIN';
-  if (/\d{1,2}:\d{2}\s*(am|pm)/i.test(lower)) return 'SHEET';
-  return 'UNKNOWN';
+  // Check for time patterns in the structured slot format: <p class="time">7:30<span class="am-pm">am</span>
+  if (/class="time"/.test(html)) return 'SHEET';
+  // Fallback: check stripped text for time patterns
+  const textOnly = html.replace(/<[^>]+>/g, ' ');
+  if (/\d{1,2}:\d{2}\s*(am|pm)/i.test(textOnly)) return 'SHEET';
+  return 'NO_TIMES';
 }
 
 function parseTimesFromHTML(html) {
-  if (/no times available/i.test(html)) return [];
-  const textOnly = html.replace(/<[^>]+>/g, ' ').replace(/&amp;/g, '&').replace(/&nbsp;/g, ' ');
   const slots = [];
   const seen = new Set();
-  // Match e.g. "7:30AM", "7:30 AM", "7:30am"
-  const timeRegex = /\b(\d{1,2}:\d{2})\s*(AM|PM|am|pm)\b/g;
+
+  // PRIMARY: Parse structured Tee-On slot boxes
+  // Format: <div class="search-results-tee-times-box nine-holes COLU-box" id="COLUB2026-04-19-07.30.00.0009">
+  //           <p class="time">7:30<span class="am-pm">am</span></p>
+  //           <p class="nine">Back</p>  or  <p class="eighteen">Front</p>
+  //           <p class="price">$45.00</p>
+  //           ...players-allowed... 2 - 4 Players ...booking-holes... 9 Holes
+  const boxRegex = /<div\s+class="search-results-tee-times-box[^"]*"[^>]*>([\s\S]*?)<\/div>\s*(?=<div\s+class="search-results-tee-times-box|<div\s+class="specials-or-search-box|<\/div>)/gi;
+  // Simpler approach: extract each slot's key data with targeted regexes
+  const timeBlockRegex = /<p\s+class="time">\s*(\d{1,2}:\d{2})\s*<span\s+class="am-pm">(am|pm)<\/span>\s*<\/p>/gi;
+  const fullHtml = html;
   let match;
-  while ((match = timeRegex.exec(textOnly)) !== null) {
-    const full = match[1] + match[2].toUpperCase();
+
+  while ((match = timeBlockRegex.exec(fullHtml)) !== null) {
+    const timeNum = match[1];
+    const ampm = match[2].toUpperCase();
+    const full = timeNum + ampm;
     if (seen.has(full)) continue;
     seen.add(full);
-    const context = textOnly.substring(match.index, match.index + 100);
-    const course = /front/i.test(context) ? 'Front' : /back/i.test(context) ? 'Back' : 'Course';
-    const holes = /\b18\b/.test(context) ? 18 : /\b9\b/.test(context) ? 9 : 18;
-    slots.push({ time: match[1] + ' ' + match[2].toUpperCase(), raw: full, course, holes });
+
+    // Look at surrounding context (500 chars after the match) for course/holes/price/players
+    const context = fullHtml.substring(match.index, match.index + 600);
+    const course = /class="nine"[^>]*>\s*Back/i.test(context) ? 'Back 9' :
+                   /class="nine"[^>]*>\s*Front/i.test(context) ? 'Front 9' :
+                   /class="eighteen"[^>]*>\s*Back/i.test(context) ? 'Back 18' :
+                   /class="eighteen"[^>]*>\s*Front/i.test(context) ? 'Front 18' :
+                   /Back/i.test(context) ? 'Back' :
+                   /Front/i.test(context) ? 'Front' : 'Course';
+    const holes = /nine-holes/i.test(context) ? 9 : 18;
+    const priceMatch = context.match(/class="price"[^>]*>\s*\$?([\d.]+)/i);
+    const price = priceMatch ? '$' + priceMatch[1] : null;
+    const playersMatch = context.match(/([\d]+)\s*-\s*([\d]+)\s*Players/i);
+    const minPlayers = playersMatch ? parseInt(playersMatch[1]) : 1;
+    const maxPlayers = playersMatch ? parseInt(playersMatch[2]) : 4;
+
+    slots.push({
+      time: timeNum + ' ' + ampm,
+      raw: full,
+      course,
+      holes,
+      price,
+      minPlayers,
+      maxPlayers
+    });
   }
+
+  // FALLBACK: If structured parse found nothing, try text-based extraction
+  if (slots.length === 0) {
+    const textOnly = html.replace(/<[^>]+>/g, ' ').replace(/&amp;/g, '&').replace(/&nbsp;/g, ' ');
+    const fallbackRegex = /\b(\d{1,2}:\d{2})\s*(AM|PM|am|pm)\b/g;
+    while ((match = fallbackRegex.exec(textOnly)) !== null) {
+      const full = match[1] + match[2].toUpperCase();
+      if (seen.has(full)) continue;
+      seen.add(full);
+      const ctx = textOnly.substring(match.index, match.index + 100);
+      const course = /front/i.test(ctx) ? 'Front' : /back/i.test(ctx) ? 'Back' : 'Course';
+      const holes = /\b18\b/.test(ctx) ? 18 : /\b9\b/.test(ctx) ? 9 : 18;
+      slots.push({ time: match[1] + ' ' + match[2].toUpperCase(), raw: full, course, holes });
+    }
+  }
+
+  console.log(`[TeeOn-Parser] Parsed ${slots.length} slots from HTML`);
   return slots;
 }
 
@@ -133,15 +191,16 @@ function parseTimesFromHTML(html) {
 
 let httpSession = null;
 let httpSessionTime = 0;
-const HTTP_SESSION_TTL = 20 * 60 * 1000;
+const HTTP_SESSION_TTL = 5 * 60 * 1000; // Refresh session every 5 min for fresh tee sheet data
 
-async function checkAvailabilityHTTP(date, partySize = 1) {
-  console.log(`[TeeOn-HTTP] Checking availability for ${date} (party of ${partySize})`);
+async function checkAvailabilityHTTP(date, partySize = 1, retryCount = 0) {
+  console.log(`[TeeOn-HTTP] Checking availability for ${date} (party of ${partySize})${retryCount > 0 ? ' [RETRY ' + retryCount + ']' : ''}`);
 
   try {
-    // Step 1: Establish session via public landing page (required for servlet state)
+    // Step 1: Always get a fresh session for each check to ensure live data
+    // (sessions can go stale quickly on Tee-On)
     const sessionExpired = !httpSession || (Date.now() - httpSessionTime > HTTP_SESSION_TTL);
-    if (sessionExpired) {
+    if (sessionExpired || retryCount > 0) {
       console.log('[TeeOn-HTTP] Getting fresh session...');
       const landing = await httpsGet(
         `${PUBLIC_SHEET_BASE}?CourseCode=${COURSE_CODE}&CourseGroupID=${COURSE_GROUP_ID}&Referrer=`
@@ -149,49 +208,51 @@ async function checkAvailabilityHTTP(date, partySize = 1) {
       httpSession = landing.cookies;
       httpSessionTime = Date.now();
       const pt = detectPageType(landing.body);
-      console.log(`[TeeOn-HTTP] Session: ${pt} | Cookies: ${httpSession ? 'yes' : 'none'}`);
-      console.log(`[TeeOn-HTTP] Landing preview: ${landing.body.substring(0, 300).replace(/\s+/g, ' ')}`);
+      console.log(`[TeeOn-HTTP] Session established | Type: ${pt} | Cookies: ${httpSession ? 'yes' : 'none'}`);
     }
 
     const cookieHeader = httpSession ? { Cookie: httpSession } : {};
     const referer = `${PUBLIC_SHEET_BASE}?CourseCode=${COURSE_CODE}&CourseGroupID=${COURSE_GROUP_ID}&Referrer=`;
 
-    // Step 2: POST with Date=YYYY-MM-DD (this is exactly what changeDate() does)
-    // The Tee-On changeDate() function submits: { Date, CourseCode, CourseGroupID }
+    // Step 2: POST with Date=YYYY-MM-DD (exactly what changeDate() does on the page)
     console.log(`[TeeOn-HTTP] POST with Date=${date}...`);
     const postResult = await httpsPost(
       `${PUBLIC_SHEET_BASE}?CourseCode=${COURSE_CODE}&Referrer=`,
       {
-        Date: date,              // YYYY-MM-DD — confirmed from changeDate() source
+        Date: date,
         CourseCode: COURSE_CODE,
-        CourseGroupID: COURSE_GROUP_ID  // '12' — confirmed from changeDate() source
+        CourseGroupID: COURSE_GROUP_ID
       },
       { ...cookieHeader, Referer: referer }
     );
 
+    // Merge any new cookies from the POST response
+    if (postResult.cookies) {
+      httpSession = [httpSession, postResult.cookies].filter(Boolean).join('; ');
+    }
+
     const pageType = detectPageType(postResult.body);
     console.log(`[TeeOn-HTTP] POST result | Status: ${postResult.status} | Type: ${pageType}`);
-    console.log(`[TeeOn-HTTP] Body preview: ${postResult.body.substring(0, 400).replace(/\s+/g, ' ')}`);
 
     let slots = parseTimesFromHTML(postResult.body);
 
-    // Step 3: If POST gave us a login page or nothing useful, try GET
-    if (slots.length === 0 && pageType !== 'NO_TIMES') {
-      console.log(`[TeeOn-HTTP] POST had no times (${pageType}), trying GET...`);
+    // If POST returned a login page or unknown, try GET as fallback
+    if (slots.length === 0 && pageType !== 'SHEET') {
+      console.log(`[TeeOn-HTTP] POST had no slots (${pageType}), trying GET...`);
       const getResult = await httpsGet(
         `${PUBLIC_SHEET_BASE}?CourseCode=${COURSE_CODE}&CourseGroupID=${COURSE_GROUP_ID}&Date=${encodeURIComponent(date)}&Referrer=`,
         { ...cookieHeader, Referer: referer }
       );
       const pt2 = detectPageType(getResult.body);
       console.log(`[TeeOn-HTTP] GET result | Status: ${getResult.status} | Type: ${pt2}`);
-      console.log(`[TeeOn-HTTP] GET body preview: ${getResult.body.substring(0, 400).replace(/\s+/g, ' ')}`);
       slots = parseTimesFromHTML(getResult.body);
 
       // If we got a login page, reset session and retry once
-      if (pt2 === 'LOGIN' || pageType === 'LOGIN') {
-        console.log('[TeeOn-HTTP] Got login page — resetting session...');
+      if ((pt2 === 'LOGIN' || pageType === 'LOGIN') && retryCount === 0) {
+        console.log('[TeeOn-HTTP] Got login page — resetting session and retrying...');
         httpSession = null;
         httpSessionTime = 0;
+        return checkAvailabilityHTTP(date, partySize, retryCount + 1);
       }
     }
 
@@ -200,6 +261,9 @@ async function checkAvailabilityHTTP(date, partySize = 1) {
 
   } catch (err) {
     console.error('[TeeOn-HTTP] Error:', err.message);
+    // On error, reset session so next call gets fresh state
+    httpSession = null;
+    httpSessionTime = 0;
     throw err;
   }
 }

@@ -44,10 +44,27 @@ async function sendEmail(to, subject, htmlBody) {
   }
 }
 
+// Normalize phone to E.164 format for Twilio
+function normalizeToE164(phone) {
+  if (!phone) return null;
+  let num = String(phone).replace(/[^+\d]/g, '');
+  if (!num) return null;
+  if (!num.startsWith('+')) {
+    if (num.length === 10) num = '+1' + num;
+    else if (num.length === 11 && num.startsWith('1')) num = '+' + num;
+  }
+  return num;
+}
+
 // Send SMS via Twilio
 async function sendSMS(to, message) {
   if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) {
     console.warn('Twilio not configured. Skipping SMS.');
+    return null;
+  }
+  const normalized = normalizeToE164(to);
+  if (!normalized) {
+    console.warn(`SMS skipped — invalid phone number: ${to}`);
     return null;
   }
   try {
@@ -55,12 +72,12 @@ async function sendSMS(to, message) {
     const msg = await twilio.messages.create({
       body: message,
       from: process.env.TWILIO_PHONE_NUMBER,
-      to
+      to: normalized
     });
-    console.log('SMS sent:', msg.sid);
+    console.log(`SMS sent to ${normalized}:`, msg.sid);
     return msg;
   } catch (err) {
-    console.error('SMS send failed:', err.message);
+    console.error(`SMS send failed to ${normalized}:`, err.message);
     throw err;
   }
 }
@@ -70,11 +87,15 @@ async function sendBookingNotification(booking) {
   const settings = await getSetting('notifications');
   if (!settings) return;
 
+  // Default sms_enabled and email_enabled to true if not explicitly set
+  const smsEnabled = settings.sms_enabled ?? true;
+  const emailEnabled = settings.email_enabled ?? true;
+
   const dateStr = new Date(booking.requested_date).toLocaleDateString('en-US', {
     weekday: 'long', month: 'long', day: 'numeric'
   });
 
-  if (settings.email_enabled && settings.email_to) {
+  if (emailEnabled && settings.email_to) {
     const html = `
       <h2>🏌️ New Tee Time Request</h2>
       <table style="border-collapse:collapse; font-family:sans-serif;">
@@ -92,7 +113,7 @@ async function sendBookingNotification(booking) {
     await sendEmail(settings.email_to, `New Tee Time Request - ${booking.customer_name || 'Unknown'} - ${dateStr}`, html);
   }
 
-  if (settings.sms_enabled && settings.sms_to) {
+  if (smsEnabled && settings.sms_to) {
     const sms = `New tee time request: ${booking.customer_name || 'Unknown'}, ${dateStr} ${booking.requested_time || ''}, ${booking.party_size} players. Check Command Center to confirm.`;
     await sendSMS(settings.sms_to, sms);
   }
@@ -103,9 +124,11 @@ async function sendModificationNotification(modification) {
   const settings = await getSetting('notifications');
   if (!settings) return;
 
+  const smsEnabled = settings.sms_enabled ?? true;
+  const emailEnabled = settings.email_enabled ?? true;
   const type = modification.request_type === 'cancel' ? 'Cancellation' : 'Modification';
 
-  if (settings.email_enabled && settings.email_to) {
+  if (emailEnabled && settings.email_to) {
     const html = `
       <h2>📝 Booking ${type} Request</h2>
       <table style="border-collapse:collapse; font-family:sans-serif;">
@@ -121,7 +144,7 @@ async function sendModificationNotification(modification) {
     await sendEmail(settings.email_to, `Booking ${type} - ${modification.customer_name || 'Unknown'}`, html);
   }
 
-  if (settings.sms_enabled && settings.sms_to) {
+  if (smsEnabled && settings.sms_to) {
     const sms = `Booking ${type.toLowerCase()}: ${modification.customer_name || 'Unknown'}, ${modification.original_date || ''} ${modification.original_time || ''}. ${modification.details || ''} Check Command Center.`;
     await sendSMS(settings.sms_to, sms);
   }

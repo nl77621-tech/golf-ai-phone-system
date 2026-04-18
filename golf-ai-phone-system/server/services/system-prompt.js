@@ -16,7 +16,10 @@ async function buildSystemPrompt(callerContext = {}) {
     amenities,
     personality,
     announcements,
-    dailyInstructions
+    dailyInstructions,
+    generalKnowledge,
+    faq,
+    seasonalNotes
   ] = await Promise.all([
     getSetting('course_info'),
     getSetting('pricing'),
@@ -27,7 +30,10 @@ async function buildSystemPrompt(callerContext = {}) {
     getSetting('amenities'),
     getSetting('ai_personality'),
     getSetting('announcements'),
-    getSetting('daily_instructions')
+    getSetting('daily_instructions'),
+    getSetting('general_knowledge'),
+    getSetting('faq'),
+    getSetting('seasonal_notes')
   ]);
 
   // Determine current day/time context
@@ -206,7 +212,16 @@ ${memberships?.types ? memberships.types.map(t => `- ${t.name}: $${t.price} (${t
 - Pull carts: ${amenities?.rentals?.pull_carts}
 - Club rentals: ${amenities?.rentals?.club_rentals}
 - Single rider cart: ${amenities?.rentals?.single_rider_cart}
-${dailySection}
+${generalKnowledge ? `
+## GENERAL COURSE KNOWLEDGE
+${generalKnowledge}
+` : ''}${faq ? `
+## FREQUENTLY ASKED QUESTIONS
+${faq}
+` : ''}${seasonalNotes ? `
+## SEASONAL / CURRENT NOTES
+${seasonalNotes}
+` : ''}${dailySection}
 ${announcementSection}
 ${callerSection}
 

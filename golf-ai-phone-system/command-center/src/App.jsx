@@ -885,6 +885,7 @@ function SettingsPage() {
   const tabs = [
     { id: 'daily', label: '📋 Daily' },
     { id: 'general', label: 'General' },
+    { id: 'knowledge', label: 'Knowledge' },
     { id: 'hours', label: 'Hours' },
     { id: 'pricing', label: 'Pricing' },
     { id: 'greetings', label: 'Greetings' },
@@ -957,6 +958,20 @@ function SettingsPage() {
         React.createElement(SettingTextarea, { label: 'Course Announcements (JSON)', description: 'Active announcements. Format: [{"message": "...", "active": true}]',
           value: JSON.stringify(val('announcements') || [], null, 2),
           onSave: v => { try { saveSetting('announcements', JSON.parse(v)); } catch(e) { alert('Invalid JSON'); } }, saving: saving === 'announcements' })
+      ),
+
+      // KNOWLEDGE TAB
+      activeTab === 'knowledge' && React.createElement('div', null,
+        React.createElement('p', { className: 'text-sm text-gray-500 mb-6' }, 'Add general knowledge about your golf course that the AI assistant can reference during calls. This can include tips, local info, course conditions, food & drink options, dress code, or anything else callers might ask about.'),
+        React.createElement(SettingTextarea, { label: 'General Course Knowledge', description: 'Write anything you want the AI to know. Use plain language — one topic per line or paragraph works great. Example: "We have a fully stocked pro shop with club rentals available. The clubhouse restaurant serves lunch from 11am-3pm."',
+          value: val('general_knowledge') || '', rows: 12,
+          onSave: v => saveSetting('general_knowledge', v), saving: saving === 'general_knowledge' }),
+        React.createElement(SettingTextarea, { label: 'Frequently Asked Questions', description: 'Add common questions and answers. Format each as "Q: ... A: ..." on separate lines. The AI will use these to answer callers accurately.',
+          value: val('faq') || '', rows: 10,
+          onSave: v => saveSetting('faq', v), saving: saving === 'faq' }),
+        React.createElement(SettingTextarea, { label: 'Seasonal / Temporary Notes', description: 'Info that changes often — course conditions, temporary closures, special events coming up, etc. Update this anytime.',
+          value: val('seasonal_notes') || '', rows: 6,
+          onSave: v => saveSetting('seasonal_notes', v), saving: saving === 'seasonal_notes' })
       ),
 
       // HOURS TAB

@@ -776,6 +776,7 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
         if (teeon.isAvailable()) {
           try {
             const partySize = args.party_size || 1;
+            console.log(`[${callLogId}] check_tee_times called | date: ${args.date} | party_size: ${partySize} | raw args:`, JSON.stringify(args));
             const allSlots = await teeon.checkAvailability(args.date, partySize);
 
             // CRITICAL: Filter slots by party size!
@@ -800,41 +801,51 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
               return { available: false, message: `No available tee times found for ${args.date}. The tee sheet is fully booked for that day.` };
             }
 
-            // Separate 18-hole and 9-hole slots for clear presentation
+            // Separate 18-hole and 9-hole slots
             const full18 = slots.filter(s => s.holes === 18);
             const back9 = slots.filter(s => s.holes === 9);
-
-            // Build a structured response for the AI
-            let message = `Available tee times for ${args.date} that can fit ${partySize} player${partySize > 1 ? 's' : ''}:\n`;
-
-            if (full18.length > 0) {
-              message += `\n18 HOLES (start on hole 1, play full course):\n`;
-              message += full18.map(s => `  ${s.time} — ${s.price || ''}, up to ${s.maxPlayers} players can book`).join('\n');
-            }
-
-            if (back9.length > 0) {
-              message += `\n\n9 HOLES ONLY (start on hole 10, back nine only):\n`;
-              message += back9.map(s => `  ${s.time} — ${s.price || ''}, up to ${s.maxPlayers} players can book`).join('\n');
-            }
-
-            // Smart suggestion: if caller wants morning 18 holes but none available, suggest back 9
-            const morningFull18 = full18.filter(s => s.time.includes('AM'));
+            const morning18 = full18.filter(s => s.time.includes('AM'));
+            const afternoon18 = full18.filter(s => s.time.includes('PM'));
             const morningBack9 = back9.filter(s => s.time.includes('AM'));
-            let suggestion = '';
-            if (morningFull18.length === 0 && morningBack9.length > 0) {
-              suggestion = '\nNOTE: No morning 18-hole times available for this group size, but there are morning 9-hole (back nine) slots starting on hole 10. Suggest this as an alternative if the caller wants a morning round.';
+
+            // Build a CONCISE response — don't dump all 30+ slots, just the key times
+            let message = `AVAILABLE tee times for ${args.date} (${partySize} players):\n`;
+
+            if (morning18.length > 0) {
+              message += `\nMorning 18-hole times: ${morning18.map(s => s.time).join(', ')}`;
+              message += ` (${morning18[0].price} each)`;
+            }
+
+            if (afternoon18.length > 0) {
+              const earlyPM = afternoon18.slice(0, 6);
+              const latePM = afternoon18.filter(s => {
+                const h = parseInt(s.time.split(':')[0]);
+                const isPM = s.time.includes('PM');
+                return isPM && h >= 3 && h < 6;
+              });
+              message += `\nAfternoon 18-hole times: ${earlyPM.map(s => s.time).join(', ')}`;
+              if (afternoon18.length > 6) message += ` and ${afternoon18.length - 6} more`;
+              if (latePM.length > 0 && latePM[0].price !== morning18?.[0]?.price) {
+                message += ` (twilight rate ${latePM[0].price} starts around 3 PM)`;
+              }
+            }
+
+            if (morningBack9.length > 0) {
+              message += `\nMorning 9-hole only (back nine, starts hole 10): ${morningBack9.map(s => s.time).join(', ')} (${morningBack9[0].price} each)`;
+            }
+
+            // Smart suggestions
+            if (morning18.length === 0 && morningBack9.length > 0) {
+              message += '\nNOTE: No morning 18-hole times for this group size, but morning 9-hole back nine is available.';
             }
             if (full18.length === 0 && back9.length > 0) {
-              suggestion = '\nNOTE: No 18-hole times available for this group size on this date. Only 9-hole back nine slots are open. Let the caller know.';
+              message += '\nNOTE: No 18-hole times for this group size today. Only 9-hole back nine available.';
             }
 
-            message += suggestion;
-            message += '\n\nIMPORTANT RULES:';
-            message += '\n- "18 holes" = start on hole 1, play the full course. "9 holes" = start on hole 10, back nine only.';
-            message += '\n- Each tee time holds MAX 4 golfers total. Slots already have some players booked — only the remaining open spots are shown above.';
-            message += '\n- ONLY offer times from this list. Do NOT offer times that are not listed — they are either booked or do not have enough room.';
+            message += '\n\nRULES: 18 holes = start hole 1, full course. 9 holes = start hole 10, back nine only. ONLY offer times from this list.';
 
-            return { available: true, date: args.date, partySize, eighteen_hole_count: full18.length, nine_hole_count: back9.length, total_fitting: slots.length, slots, message };
+            console.log(`[${callLogId}] Tee times for ${args.date}: ${full18.length} x 18-hole, ${back9.length} x 9-hole (party of ${partySize})`);
+            return { available: true, date: args.date, partySize, total: slots.length, message };
           } catch (err) {
             console.error('[TeeOn] checkAvailability error:', err.message);
             return { available: null, message: 'Unable to check live availability right now. You can check online at valleymedecolumbusgolf.com or I can take a booking request.' };

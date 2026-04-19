@@ -242,7 +242,9 @@ async function checkAvailabilityHTTP(date, partySize = 1, retryCount = 0) {
     }
 
     const pageType = detectPageType(postResult.body);
-    console.log(`[TeeOn-HTTP] POST result | Status: ${postResult.status} | Type: ${pageType}`);
+    const hasTimeClass = /class="time"/.test(postResult.body);
+    const hasSlotBox = /search-results-tee-times-box/.test(postResult.body);
+    console.log(`[TeeOn-HTTP] POST result | Status: ${postResult.status} | Type: ${pageType} | HTML: ${postResult.body.length} chars | hasTimeClass: ${hasTimeClass} | hasSlotBox: ${hasSlotBox}`);
 
     let slots = parseTimesFromHTML(postResult.body);
 
@@ -339,7 +341,6 @@ async function checkAvailabilityPuppeteer(date, partySize = 1) {
     await page.goto(publicUrl, { waitUntil: 'networkidle2', timeout: 30000 });
 
     // Use changeDate() exactly as the page's date-navigation arrows do
-    // This submits the form with Date=YYYY-MM-DD, CourseCode, CourseGroupID
     console.log(`[TeeOn-Puppeteer] Calling changeDate('${date}')...`);
     await Promise.all([
       page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 }),
@@ -349,28 +350,20 @@ async function checkAvailabilityPuppeteer(date, partySize = 1) {
     // Wait briefly for any lazy rendering
     await new Promise(r => setTimeout(r, 1000));
 
-    const result = await page.evaluate(() => {
-      const text = document.body.innerText || '';
-      if (/no times available/i.test(text)) return { noTimes: true, slots: [] };
-      const slots = [];
-      const seen = new Set();
-      const re = /\b(\d{1,2}:\d{2})(AM|PM)\b/g;
-      let m;
-      while ((m = re.exec(text)) !== null) {
-        const full = m[1] + m[2];
-        if (seen.has(full)) continue;
-        seen.add(full);
-        const ctx = text.substring(m.index, m.index + 80);
-        const course = /Front/i.test(ctx) ? 'Front' : /Back/i.test(ctx) ? 'Back' : 'Course';
-        const holes = /\b18\b/.test(ctx) ? 18 : 9;
-        slots.push({ time: m[1] + ' ' + m[2], raw: full, course, holes });
-      }
-      return { noTimes: false, slots };
-    });
+    // Get the raw HTML instead of innerText — use same parser as HTTP path
+    const html = await page.content();
+    console.log(`[TeeOn-Puppeteer] Got page HTML (${html.length} chars)`);
 
-    console.log(`[TeeOn-Puppeteer] Found ${result.slots.length} slots for ${date}`);
-    if (result.noTimes) return [];
-    return result.slots;
+    const pageType = detectPageType(html);
+    console.log(`[TeeOn-Puppeteer] Page type: ${pageType}`);
+
+    if (pageType === 'LOGIN') {
+      throw new Error('Got login page — session invalid');
+    }
+
+    const slots = parseTimesFromHTML(html);
+    console.log(`[TeeOn-Puppeteer] Found ${slots.length} slots for ${date}`);
+    return slots;
   } finally {
     await page.close();
   }
@@ -379,19 +372,33 @@ async function checkAvailabilityPuppeteer(date, partySize = 1) {
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 async function checkAvailability(date, partySize = 1) {
-  // Try Puppeteer first (if available) — uses public page, no login/ALTCHA
+  // HTTP-first: it's faster, lighter (no browser), and our HTML parser is battle-tested.
+  // Puppeteer is a fallback only — in case Tee-On blocks raw HTTP or requires JS rendering.
+  try {
+    console.log('[TeeOn] Trying HTTP method (primary)...');
+    const httpSlots = await checkAvailabilityHTTP(date, partySize);
+    if (httpSlots.length > 0) {
+      return httpSlots;
+    }
+    console.log('[TeeOn] HTTP returned 0 slots — will try Puppeteer fallback if available');
+  } catch (err) {
+    console.warn('[TeeOn] HTTP method failed:', err.message);
+  }
+
+  // Puppeteer fallback — renders the actual page with JS
   if (puppeteer) {
     try {
-      console.log('[TeeOn] Trying Puppeteer method (public page, no login)...');
+      console.log('[TeeOn] Trying Puppeteer fallback...');
       return await checkAvailabilityPuppeteer(date, partySize);
     } catch (err) {
-      console.warn('[TeeOn] Puppeteer failed, falling back to HTTP:', err.message);
-      // Reset browser so next call gets a fresh one
+      console.warn('[TeeOn] Puppeteer also failed:', err.message);
       if (browser) { try { await browser.close(); } catch (e) {} browser = null; }
     }
   }
 
-  return await checkAvailabilityHTTP(date, partySize);
+  // Both methods failed — return empty
+  console.error('[TeeOn] All methods exhausted — returning empty');
+  return [];
 }
 
 function isAvailable() {

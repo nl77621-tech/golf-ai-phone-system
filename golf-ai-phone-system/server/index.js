@@ -57,6 +57,32 @@ app.get('/health', async (req, res) => {
   }
 });
 
+// Diagnostic: test tee time scraper directly from production
+// Usage: GET /test-tee-times?date=2026-04-19&party_size=4
+const teeon = require('./services/teeon-automation');
+app.get('/test-tee-times', async (req, res) => {
+  const date = req.query.date || new Date().toISOString().split('T')[0];
+  const partySize = parseInt(req.query.party_size) || 4;
+  console.log(`[Diagnostic] Testing tee times for ${date}, party of ${partySize}`);
+  try {
+    const startTime = Date.now();
+    const allSlots = await teeon.checkAvailability(date, partySize);
+    const filtered = allSlots.filter(s => s.maxPlayers >= partySize);
+    const elapsed = Date.now() - startTime;
+    res.json({
+      date,
+      partySize,
+      totalSlots: allSlots.length,
+      fittingParty: filtered.length,
+      elapsedMs: elapsed,
+      slots: allSlots.slice(0, 10), // First 10 for debugging
+      allTimes: allSlots.map(s => `${s.time} (${s.course}, ${s.minPlayers}-${s.maxPlayers} players, ${s.price})`)
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, stack: err.stack });
+  }
+});
+
 // Twilio webhooks
 app.use('/twilio', twilioRoutes);
 

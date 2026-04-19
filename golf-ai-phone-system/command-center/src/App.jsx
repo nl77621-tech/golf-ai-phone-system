@@ -490,8 +490,8 @@ function ContactModal({ contact, onClose, onSave }) {
   const removeGreeting = (idx) => setGreetings(g => g.filter((_, i) => i !== idx));
   const updateGreeting = (idx, val) => setGreetings(g => g.map((v, i) => i === idx ? val : v));
 
-  return React.createElement('div', { className: 'fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50', onClick: onClose },
-    React.createElement('div', { className: 'bg-white rounded-2xl shadow-2xl p-6 w-full max-w-lg mx-4 max-h-[85vh] overflow-y-auto', onClick: e => e.stopPropagation() },
+  return React.createElement('div', { className: 'fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50', onMouseDown: e => { if (e.target === e.currentTarget) onClose(); } },
+    React.createElement('div', { className: 'bg-white rounded-2xl shadow-2xl p-6 w-full max-w-lg mx-4 max-h-[85vh] overflow-y-auto' },
       React.createElement('div', { className: 'flex items-center justify-between mb-6' },
         React.createElement('h2', { className: 'text-lg font-bold text-gray-800' }, contact?.id ? 'Edit Contact' : 'Add New Contact'),
         React.createElement('button', { onClick: onClose, className: 'text-gray-400 hover:text-gray-600 text-xl' }, '✕')
@@ -564,6 +564,7 @@ function CustomerDetailPanel({ customerId, onClose, onEdit }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [tab, setTab] = useState('calls');
+  const [expandedCall, setExpandedCall] = useState(null); // call ID to show transcript
 
   useEffect(() => {
     if (!customerId) return;
@@ -595,10 +596,9 @@ function CustomerDetailPanel({ customerId, onClose, onEdit }) {
   const calls = data?.calls || [];
   const bookings = data?.bookings || [];
 
-  return React.createElement('div', { className: 'fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50', onClick: onClose },
+  return React.createElement('div', { className: 'fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50', onMouseDown: e => { if (e.target === e.currentTarget) onClose(); } },
     React.createElement('div', {
-      className: 'bg-white rounded-2xl shadow-2xl w-full max-w-2xl mx-4 max-h-[85vh] flex flex-col',
-      onClick: e => e.stopPropagation()
+      className: 'bg-white rounded-2xl shadow-2xl w-full max-w-2xl mx-4 max-h-[85vh] flex flex-col'
     },
       // Header
       loading ? React.createElement('div', { className: 'p-8 text-center text-gray-400' }, 'Loading...') :
@@ -670,20 +670,69 @@ function CustomerDetailPanel({ customerId, onClose, onEdit }) {
             calls.length === 0
               ? React.createElement('p', { className: 'text-gray-400 text-sm text-center py-8' }, 'No call history yet.')
               : calls.map(call =>
-                  React.createElement('div', { key: call.id, className: 'border rounded-lg p-3 mb-3 hover:bg-gray-50' },
-                    React.createElement('div', { className: 'flex items-center justify-between mb-1' },
-                      React.createElement('span', { className: 'text-sm font-medium text-gray-700' },
-                        formatDate(call.started_at) + ' at ' + formatTime(call.started_at)
+                  React.createElement('div', { key: call.id, className: 'border rounded-lg mb-3 hover:bg-gray-50' },
+                    React.createElement('div', {
+                      className: 'p-3 cursor-pointer',
+                      onClick: () => setExpandedCall(expandedCall === call.id ? null : call.id)
+                    },
+                      React.createElement('div', { className: 'flex items-center justify-between mb-1' },
+                        React.createElement('div', { className: 'flex items-center gap-2' },
+                          React.createElement('span', { className: 'text-sm font-medium text-gray-700' },
+                            formatDate(call.started_at) + ' at ' + formatTime(call.started_at)
+                          ),
+                          call.transcript && React.createElement('span', {
+                            className: 'text-xs text-golf-500'
+                          }, expandedCall === call.id ? '▼ transcript' : '▶ transcript')
+                        ),
+                        React.createElement('span', { className: 'text-xs text-gray-400' },
+                          formatDuration(call.duration_seconds)
+                        )
                       ),
-                      React.createElement('span', { className: 'text-xs text-gray-400' },
-                        formatDuration(call.duration_seconds)
+                      call.summary && React.createElement('p', { className: 'text-xs text-gray-500 mt-1' }, call.summary),
+                      call.actions_taken && React.createElement('div', { className: 'mt-1' },
+                        React.createElement('span', { className: 'text-xs text-golf-600' }, 'Actions: ' + (
+                          Array.isArray(call.actions_taken) ? call.actions_taken.join(', ') : String(call.actions_taken)
+                        ))
                       )
                     ),
-                    call.summary && React.createElement('p', { className: 'text-xs text-gray-500 mt-1' }, call.summary),
-                    call.actions_taken && React.createElement('div', { className: 'mt-1' },
-                      React.createElement('span', { className: 'text-xs text-golf-600' }, 'Actions: ' + (
-                        Array.isArray(call.actions_taken) ? call.actions_taken.join(', ') : String(call.actions_taken)
-                      ))
+                    // Expandable transcript
+                    expandedCall === call.id && call.transcript && React.createElement('div', {
+                      className: 'border-t bg-gray-50 px-3 py-3 rounded-b-lg'
+                    },
+                      React.createElement('div', { className: 'text-xs font-medium text-gray-500 mb-2' }, 'Call Transcript'),
+                      React.createElement('div', { className: 'space-y-1.5 max-h-64 overflow-y-auto text-xs' },
+                        call.transcript.split('\n').filter(line => line.trim()).map((line, i) => {
+                          const isCaller = line.toLowerCase().startsWith('caller:');
+                          const isAssistant = line.toLowerCase().startsWith('assistant:');
+                          const label = isCaller ? 'Caller' : isAssistant ? 'AI' : null;
+                          const text = label ? line.substring(line.indexOf(':') + 1).trim() : line;
+                          return React.createElement('div', {
+                            key: i,
+                            className: `flex gap-2 ${isCaller ? '' : 'flex-row-reverse'}`
+                          },
+                            React.createElement('div', {
+                              className: `max-w-[85%] px-3 py-1.5 rounded-lg ${
+                                isCaller
+                                  ? 'bg-white border text-gray-700'
+                                  : isAssistant
+                                    ? 'bg-golf-50 border border-golf-200 text-golf-800'
+                                    : 'bg-gray-100 text-gray-600'
+                              }`
+                            },
+                              label && React.createElement('span', {
+                                className: `font-semibold ${isCaller ? 'text-gray-500' : 'text-golf-600'}`
+                              }, label + ': '),
+                              text
+                            )
+                          );
+                        })
+                      )
+                    ),
+                    // No transcript available
+                    expandedCall === call.id && !call.transcript && React.createElement('div', {
+                      className: 'border-t bg-gray-50 px-3 py-3 rounded-b-lg'
+                    },
+                      React.createElement('p', { className: 'text-xs text-gray-400 italic text-center' }, 'No transcript available for this call.')
                     )
                   )
                 )

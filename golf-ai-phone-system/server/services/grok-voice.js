@@ -644,7 +644,7 @@ function buildToolDefinitions() {
     {
       type: 'function',
       name: 'check_tee_times',
-      description: 'Check live available tee times on the Tee-On tee sheet for a specific date. Use this BEFORE booking so you can tell the caller what times are open.',
+      description: 'Check live available tee times on the Tee-On tee sheet for a specific date. Use this BEFORE booking so you can tell the caller what times are open. Results show 18-hole slots (start hole 1, full course) and 9-hole slots (start hole 10, back nine only) separately. If no 18-hole morning times, suggest 9-hole back nine as alternative.',
       parameters: {
         type: 'object',
         properties: {
@@ -775,10 +775,42 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
           try {
             const slots = await teeon.checkAvailability(args.date, args.party_size || 1);
             if (slots.length === 0) {
-              return { available: false, message: `No available tee times found for ${args.date} with ${args.party_size || 1} players.` };
+              return { available: false, message: `No available tee times found for ${args.date}. The tee sheet is fully booked for that day.` };
             }
-            const times = slots.map(s => s.time).join(', ');
-            return { available: true, date: args.date, slots, message: `Available times on ${args.date}: ${times}` };
+
+            // Separate 18-hole and 9-hole slots for clear presentation
+            const full18 = slots.filter(s => s.holes === 18);
+            const back9 = slots.filter(s => s.holes === 9);
+
+            // Build a structured response for the AI
+            let message = `Available tee times for ${args.date}:\n`;
+
+            if (full18.length > 0) {
+              message += `\n18 HOLES (start on hole 1, play full course):\n`;
+              message += full18.map(s => `  ${s.time} — ${s.price || ''}, ${s.minPlayers}-${s.maxPlayers} players`).join('\n');
+            }
+
+            if (back9.length > 0) {
+              message += `\n\n9 HOLES ONLY (start on hole 10, back nine only):\n`;
+              message += back9.map(s => `  ${s.time} — ${s.price || ''}, ${s.minPlayers}-${s.maxPlayers} players`).join('\n');
+            }
+
+            // Smart suggestion: if caller wants morning 18 holes but none available, suggest back 9
+            const morningFull18 = full18.filter(s => s.time.includes('AM'));
+            const morningBack9 = back9.filter(s => s.time.includes('AM'));
+            let suggestion = '';
+            if (morningFull18.length === 0 && morningBack9.length > 0) {
+              suggestion = '\nNOTE: No morning 18-hole times available, but there are morning 9-hole (back nine) slots starting on hole 10. Suggest this as an alternative if the caller wants a morning round.';
+            }
+            if (full18.length === 0 && back9.length > 0) {
+              suggestion = '\nNOTE: No 18-hole times available at all for this date. Only 9-hole back nine slots are open. Let the caller know.';
+            }
+
+            message += suggestion;
+            message += '\n\nIMPORTANT: "18 holes" means they start on hole 1 and play the full course. "9 holes" means they start on hole 10 and play the back nine only. Do NOT confuse these — tell the caller clearly which option you are offering.';
+
+            console.log(`[${callLogId}] Tee times for ${args.date}: ${full18.length} x 18-hole, ${back9.length} x 9-hole`);
+            return { available: true, date: args.date, eighteen_hole_count: full18.length, nine_hole_count: back9.length, slots, message };
           } catch (err) {
             console.error('[TeeOn] checkAvailability error:', err.message);
             return { available: null, message: 'Unable to check live availability right now. You can check online at valleymedecolumbusgolf.com or I can take a booking request.' };
@@ -851,7 +883,7 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
 
           return {
             success: true,
-            message: `Booking request logged for ${args.customer_name}, ${args.date} at ${args.time || 'flexible time'}, ${args.party_size} players. Staff will confirm shortly.`,
+            message: `Booking REQUEST submitted for ${args.customer_name}, ${args.date} at ${args.time || 'flexible time'}, ${args.party_size} players. IMPORTANT: Tell the caller this is a REQUEST only — it is NOT confirmed yet. They WILL receive a confirmation TEXT MESSAGE once staff approves it. The tee time is NOT guaranteed until they get that text. Make sure they understand to watch for the text.`,
             bookingId: booking.id
           };
         } catch (dbErr) {

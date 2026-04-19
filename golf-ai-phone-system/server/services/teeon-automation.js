@@ -144,13 +144,18 @@ function parseTimesFromHTML(html) {
 
     // Look at surrounding context (500 chars after the match) for course/holes/price/players
     const context = fullHtml.substring(match.index, match.index + 600);
-    const course = /class="nine"[^>]*>\s*Back/i.test(context) ? 'Back 9' :
-                   /class="nine"[^>]*>\s*Front/i.test(context) ? 'Front 9' :
-                   /class="eighteen"[^>]*>\s*Back/i.test(context) ? 'Back 18' :
-                   /class="eighteen"[^>]*>\s*Front/i.test(context) ? 'Front 18' :
-                   /Back/i.test(context) ? 'Back' :
-                   /Front/i.test(context) ? 'Front' : 'Course';
-    const holes = /nine-holes/i.test(context) ? 9 : 18;
+
+    // Tee-On labeling for Valleymede Columbus:
+    //   "Front" + eighteen-holes class = 18 holes, starts on hole 1
+    //   "Back"  + nine-holes class     = 9 holes only, starts on hole 10 (back nine)
+    const isNineHoles = /nine-holes/i.test(context);
+    const isEighteenHoles = /eighteen-holes/i.test(context);
+    const holes = isNineHoles ? 9 : 18;
+    const course = (isEighteenHoles || (!isNineHoles && /Front/i.test(context)))
+      ? '18 holes (starts hole 1)'
+      : isNineHoles
+        ? '9 holes only (starts hole 10)'
+        : 'Course';
     const priceMatch = context.match(/class="price"[^>]*>\s*\$?([\d.]+)/i);
     const price = priceMatch ? '$' + priceMatch[1] : null;
     const playersMatch = context.match(/([\d]+)\s*-\s*([\d]+)\s*Players/i);

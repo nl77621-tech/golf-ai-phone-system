@@ -679,36 +679,49 @@ function buildToolDefinitions() {
     },
     {
       type: 'function',
+      name: 'lookup_my_bookings',
+      description: 'Look up the caller\'s confirmed upcoming bookings. ALWAYS call this FIRST when a caller wants to cancel or modify a booking — read their bookings back to them so they can confirm which one. Only returns confirmed bookings (not pending or cancelled).',
+      parameters: {
+        type: 'object',
+        properties: {},
+        required: []
+      }
+    },
+    {
+      type: 'function',
       name: 'edit_booking',
-      description: 'Request to modify an existing booking. Collect the original booking details and what they want to change.',
+      description: 'Request to modify a specific confirmed booking. You MUST call lookup_my_bookings first and read the bookings back to the caller. Then use the booking_id from the booking they want to change. The modification goes to staff for approval.',
       parameters: {
         type: 'object',
         properties: {
+          booking_id: { type: 'integer', description: 'The ID of the confirmed booking to modify (from lookup_my_bookings result)' },
           customer_name: { type: 'string', description: 'Customer name' },
           customer_phone: { type: 'string', description: 'Customer phone' },
           original_date: { type: 'string', description: 'Original booking date (YYYY-MM-DD)' },
           original_time: { type: 'string', description: 'Original booking time (HH:MM)' },
           new_date: { type: 'string', description: 'New requested date (YYYY-MM-DD)' },
           new_time: { type: 'string', description: 'New requested time (HH:MM)' },
+          new_party_size: { type: 'integer', description: 'New party size if changing' },
           details: { type: 'string', description: 'Description of what needs to change' }
         },
-        required: ['customer_name', 'details']
+        required: ['booking_id', 'details']
       }
     },
     {
       type: 'function',
       name: 'cancel_booking',
-      description: 'Request to cancel an existing booking.',
+      description: 'Request to cancel a specific confirmed booking. You MUST call lookup_my_bookings first and read the bookings back to the caller. Then use the booking_id from the booking they want to cancel. The cancellation goes to staff for approval.',
       parameters: {
         type: 'object',
         properties: {
+          booking_id: { type: 'integer', description: 'The ID of the confirmed booking to cancel (from lookup_my_bookings result)' },
           customer_name: { type: 'string', description: 'Customer name' },
           customer_phone: { type: 'string', description: 'Customer phone' },
-          original_date: { type: 'string', description: 'Booking date to cancel (YYYY-MM-DD)' },
-          original_time: { type: 'string', description: 'Booking time to cancel (HH:MM)' },
+          original_date: { type: 'string', description: 'Booking date being cancelled (YYYY-MM-DD)' },
+          original_time: { type: 'string', description: 'Booking time being cancelled (HH:MM)' },
           details: { type: 'string', description: 'Reason for cancellation or additional notes' }
         },
-        required: ['customer_name']
+        required: ['booking_id']
       }
     },
     {
@@ -939,58 +952,93 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
         }
       }
 
+      case 'lookup_my_bookings': {
+        const phone = callerContext.phone;
+        if (!phone) {
+          return { found: false, message: 'I don\'t have your phone number on file, so I can\'t look up your bookings. Can you give me the name or date of your booking?' };
+        }
+        const { getConfirmedBookingsByPhone } = require('./booking-manager');
+        const bookings = await getConfirmedBookingsByPhone(phone);
+        console.log(`[${callLogId}] lookup_my_bookings for ${phone}: ${bookings.length} confirmed bookings`);
+
+        if (bookings.length === 0) {
+          return { found: false, count: 0, message: 'No confirmed upcoming bookings found for this phone number. If they believe they have a booking, take their details and create a cancellation/modification request for staff.' };
+        }
+
+        // Format bookings for the AI to read back naturally
+        const formatted = bookings.map(b => {
+          const date = new Date(b.requested_date);
+          const dayName = date.toLocaleDateString('en-US', { weekday: 'long' });
+          const monthDay = date.toLocaleDateString('en-US', { month: 'long', day: 'numeric' });
+          const time = b.requested_time || 'no specific time';
+          return {
+            booking_id: b.id,
+            date: b.requested_date,
+            display_date: `${dayName}, ${monthDay}`,
+            time: time,
+            party_size: b.party_size,
+            name: b.customer_name
+          };
+        });
+
+        let message = `Found ${bookings.length} confirmed upcoming booking${bookings.length > 1 ? 's' : ''}:\n`;
+        formatted.forEach((b, i) => {
+          message += `\n${i + 1}. ${b.display_date} at ${b.time} — ${b.party_size} player${b.party_size !== 1 ? 's' : ''} (booking #${b.booking_id})`;
+        });
+        message += '\n\nRead these back to the caller naturally and ask which booking they want to cancel or change. Use the booking_id when calling cancel_booking or edit_booking.';
+
+        return { found: true, count: bookings.length, bookings: formatted, message };
+      }
+
       case 'edit_booking': {
+        // If booking_id provided, look up the actual booking for accurate details
+        const { getBookingById } = require('./booking-manager');
+        let originalBooking = null;
+        if (args.booking_id) {
+          originalBooking = await getBookingById(args.booking_id);
+        }
+
         const mod = await createModificationRequest({
           customerId: callerContext.customerId,
-          customerName: args.customer_name,
+          customerName: args.customer_name || originalBooking?.customer_name || callerContext.name,
           customerPhone: args.customer_phone || callerContext.phone,
           requestType: 'modify',
-          originalDate: args.original_date,
-          originalTime: args.original_time,
+          originalDate: args.original_date || originalBooking?.requested_date,
+          originalTime: args.original_time || originalBooking?.requested_time,
           newDate: args.new_date,
           newTime: args.new_time,
-          details: args.details,
+          details: args.details + (args.new_party_size ? ` | New party size: ${args.new_party_size}` : '') + (args.booking_id ? ` | Booking #${args.booking_id}` : ''),
           callId: callLogId
         });
         return {
           success: true,
-          message: `Modification request submitted. Staff will process the change and confirm.`,
+          message: `Modification request submitted for ${originalBooking ? originalBooking.requested_date : args.original_date || 'the booking'}. Tell the caller: this change is a REQUEST — it is NOT confirmed yet. They will receive a confirmation TEXT MESSAGE once staff processes it.`,
           requestId: mod.id
         };
       }
 
       case 'cancel_booking': {
-        const phone = args.customer_phone || callerContext.phone;
-
-        // Try to find and directly cancel the actual booking
-        const { findActiveBookingByPhone, updateBookingStatus } = require('./booking-manager');
-        const booking = await findActiveBookingByPhone(phone);
-
-        if (booking) {
-          // Directly cancel the booking — it will show as cancelled on the bookings page
-          // and send the cancellation SMS to the customer
-          await updateBookingStatus(booking.id, 'cancelled', args.details || 'Cancelled by customer via phone call');
-          return {
-            success: true,
-            message: `Booking for ${booking.requested_date} has been cancelled successfully.`,
-            bookingId: booking.id
-          };
+        // If booking_id provided, look up the actual booking
+        const { getBookingById } = require('./booking-manager');
+        let bookingToCancel = null;
+        if (args.booking_id) {
+          bookingToCancel = await getBookingById(args.booking_id);
         }
 
-        // No matching booking found — create a modification request so staff can handle it
+        // Create a cancellation request for staff approval (don't cancel directly)
         const cancel = await createModificationRequest({
           customerId: callerContext.customerId,
-          customerName: args.customer_name,
-          customerPhone: phone,
+          customerName: args.customer_name || bookingToCancel?.customer_name || callerContext.name,
+          customerPhone: args.customer_phone || callerContext.phone,
           requestType: 'cancel',
-          originalDate: args.original_date,
-          originalTime: args.original_time,
-          details: args.details || 'Cancellation requested by caller — no matching booking found',
+          originalDate: args.original_date || bookingToCancel?.requested_date,
+          originalTime: args.original_time || bookingToCancel?.requested_time,
+          details: (args.details || 'Cancellation requested by caller') + (args.booking_id ? ` | Booking #${args.booking_id}` : ''),
           callId: callLogId
         });
         return {
           success: true,
-          message: `Cancellation request submitted. Staff will look into it.`,
+          message: `Cancellation request submitted for ${bookingToCancel ? bookingToCancel.requested_date : args.original_date || 'the booking'}. Tell the caller: this cancellation is a REQUEST — it will be processed by staff. They will receive a confirmation TEXT MESSAGE once it's done.`,
           requestId: cancel.id
         };
       }

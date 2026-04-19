@@ -251,6 +251,27 @@ async function findActiveBookingByPhone(phone) {
   return res.rows[0] || null;
 }
 
+// Get all confirmed upcoming bookings for a phone number
+// Used by the AI to read back bookings when caller wants to cancel/modify
+async function getConfirmedBookingsByPhone(phone) {
+  if (!phone) return [];
+  const res = await query(
+    `SELECT * FROM booking_requests
+     WHERE customer_phone = $1
+       AND status = 'confirmed'
+       AND requested_date >= CURRENT_DATE
+     ORDER BY requested_date ASC, requested_time ASC`,
+    [phone]
+  );
+  return res.rows;
+}
+
+// Get a specific confirmed booking by ID
+async function getBookingById(id) {
+  const res = await query('SELECT * FROM booking_requests WHERE id = $1', [id]);
+  return res.rows[0] || null;
+}
+
 module.exports = {
   createBookingRequest,
   createModificationRequest,
@@ -260,5 +281,7 @@ module.exports = {
   updateModificationStatus,
   getBookingsForDateRange,
   getAllBookings,
-  findActiveBookingByPhone
+  findActiveBookingByPhone,
+  getConfirmedBookingsByPhone,
+  getBookingById
 };

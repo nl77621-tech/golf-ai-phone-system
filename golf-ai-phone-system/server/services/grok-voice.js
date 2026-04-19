@@ -555,6 +555,8 @@ ${callerLine}
 
   grokWs.on('error', (err) => {
     console.error(`[${callSid}] Grok WebSocket error:`, err.message);
+    conversationActive = false;
+    if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
   });
 
   // ---- Twilio WebSocket handlers ----
@@ -887,7 +889,7 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
           console.warn(`[${callLogId}] ⚠️ book_tee_time called with invalid date:`, args.date);
           return { success: false, message: 'I need a date for the booking. What date works for you?' };
         }
-        if (!args.party_size || args.party_size < 1 || args.party_size > 20) {
+        if (!args.party_size || args.party_size < 1 || args.party_size > 8) {
           console.warn(`[${callLogId}] ⚠️ book_tee_time called with invalid party_size:`, args.party_size);
           return { success: false, message: 'How many players will be in your group?' };
         }

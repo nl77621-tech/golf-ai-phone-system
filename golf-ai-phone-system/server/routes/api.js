@@ -209,6 +209,9 @@ router.put('/modifications/:id/status', async (req, res) => {
   try {
     const { id } = req.params;
     const { status, staff_notes } = req.body;
+    if (!['processed', 'rejected', 'pending'].includes(status)) {
+      return res.status(400).json({ error: 'Invalid status. Must be processed, rejected, or pending.' });
+    }
     const mod = await updateModificationStatus(parseInt(id), status, staff_notes);
     if (!mod) {
       return res.status(404).json({ error: 'Modification request not found' });
@@ -241,7 +244,15 @@ router.get('/customers', async (req, res) => {
     }
 
     const result = await query(sql, params);
-    const countResult = await query('SELECT COUNT(*) FROM customers');
+    let countSql, countParams;
+    if (search) {
+      countSql = `SELECT COUNT(*) FROM customers WHERE LOWER(name) LIKE LOWER($1) OR phone LIKE $1 OR LOWER(email) LIKE LOWER($1)`;
+      countParams = [`%${search}%`];
+    } else {
+      countSql = 'SELECT COUNT(*) FROM customers';
+      countParams = [];
+    }
+    const countResult = await query(countSql, countParams);
 
     res.json({
       customers: result.rows,
@@ -335,6 +346,7 @@ router.put('/customers/:id', async (req, res) => {
       `UPDATE customers SET ${fields.join(', ')} WHERE id = $${p} RETURNING *`,
       values
     );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Customer not found' });
     res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: 'Failed to update customer' });

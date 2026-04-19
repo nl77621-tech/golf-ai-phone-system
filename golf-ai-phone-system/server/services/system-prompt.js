@@ -325,13 +325,17 @@ When a caller wants to cancel or change a booking:
 function buildDateReference() {
   // Build a reference of upcoming dates so the AI can convert
   // "today", "tomorrow", "Sunday", "next Saturday" etc. to YYYY-MM-DD
-  const now = new Date();
+  // Use Eastern time (course timezone) for "today" calculation
+  const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Toronto' }); // YYYY-MM-DD
+  const [y, m, d] = todayStr.split('-').map(Number);
+  const easternToday = new Date(y, m - 1, d); // midnight local = Eastern today
+
   const lines = [];
   for (let i = 0; i <= 13; i++) {
-    const d = new Date(now);
-    d.setDate(d.getDate() + i);
-    const dateKey = d.toLocaleDateString('en-CA', { timeZone: 'America/Toronto' }); // YYYY-MM-DD
-    const dayLabel = d.toLocaleDateString('en-US', { timeZone: 'America/Toronto', weekday: 'long', month: 'short', day: 'numeric' });
+    const dt = new Date(easternToday);
+    dt.setDate(dt.getDate() + i);
+    const dateKey = dt.toLocaleDateString('en-CA'); // YYYY-MM-DD
+    const dayLabel = dt.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' });
     const prefix = i === 0 ? ' (TODAY)' : i === 1 ? ' (tomorrow)' : '';
     lines.push(`- ${dayLabel}${prefix} = ${dateKey}`);
   }

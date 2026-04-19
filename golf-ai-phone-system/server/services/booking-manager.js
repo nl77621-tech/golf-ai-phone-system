@@ -92,6 +92,12 @@ async function createModificationRequest({
   customerId, customerName, customerPhone, requestType,
   originalDate, originalTime, newDate, newTime, details, callId
 }) {
+  if (!requestType || !['modify', 'cancel'].includes(requestType)) {
+    throw new Error('requestType must be "modify" or "cancel"');
+  }
+  if (!customerName && !customerPhone) {
+    throw new Error('At least customerName or customerPhone is required');
+  }
   const res = await query(
     `INSERT INTO modification_requests
      (customer_id, customer_name, customer_phone, request_type,
@@ -254,15 +260,15 @@ async function findActiveBookingByPhone(phone) {
   return res.rows[0] || null;
 }
 
-// Get all confirmed upcoming bookings for a phone number
-// Used by the AI to read back bookings when caller wants to cancel/modify
+// Get all active upcoming bookings for a phone number (confirmed + pending)
+// Used by the AI to read back bookings when caller wants to cancel/modify or check their tee time
 // Uses Eastern time (course timezone) to determine "today" since Railway runs UTC
 async function getConfirmedBookingsByPhone(phone) {
   if (!phone) return [];
   const res = await query(
     `SELECT * FROM booking_requests
      WHERE customer_phone = $1
-       AND status = 'confirmed'
+       AND status IN ('confirmed', 'pending')
        AND requested_date >= (NOW() AT TIME ZONE 'America/Toronto')::date
      ORDER BY requested_date ASC, requested_time ASC`,
     [phone]

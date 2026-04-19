@@ -258,7 +258,7 @@ function formatBookingDateTime(dateStr, timeStr) {
 function BookingsPage() {
   const [bookings, setBookings] = useState([]);
   const [modifications, setModifications] = useState([]);
-  const [filter, setFilter] = useState('pending');
+  const [filter, setFilter] = useState('all');
   const [loading, setLoading] = useState(true);
   const [replyOpenId, setReplyOpenId] = useState(null);
   const [replyText, setReplyText] = useState('');
@@ -267,7 +267,7 @@ function BookingsPage() {
   const loadData = useCallback(async () => {
     try {
       const [b, m] = await Promise.all([
-        api(`/api/bookings?status=${filter}`),
+        api(`/api/bookings${filter !== 'all' ? '?status=' + filter : ''}`),
         api('/api/modifications')
       ]);
       setBookings(b.bookings || []);
@@ -349,7 +349,7 @@ function BookingsPage() {
 
     // Filter tabs
     React.createElement('div', { className: 'flex gap-2 mb-4' },
-      ['pending', 'confirmed', 'rejected', 'cancelled'].map(s =>
+      ['all', 'pending', 'confirmed', 'rejected', 'cancelled'].map(s =>
         React.createElement('button', {
           key: s, onClick: () => setFilter(s),
           className: `px-4 py-2 rounded-lg text-sm font-medium transition-colors ${filter === s ? 'bg-golf-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`
@@ -362,7 +362,7 @@ function BookingsPage() {
       loading
         ? React.createElement('p', { className: 'p-8 text-gray-400 text-center' }, 'Loading...')
         : bookings.length === 0
-          ? React.createElement('p', { className: 'p-8 text-gray-400 text-center' }, `No ${filter} bookings`)
+          ? React.createElement('p', { className: 'p-8 text-gray-400 text-center' }, filter === 'all' ? 'No bookings yet' : `No ${filter} bookings`)
           : React.createElement('div', { className: 'divide-y' },
               bookings.map(b =>
                 React.createElement('div', { key: b.id, className: 'border-b last:border-0' },

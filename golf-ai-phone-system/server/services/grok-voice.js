@@ -279,11 +279,13 @@ ${callerLine}
 
 ## BOOKING RULES
 - CRITICAL: When the caller says "today", "tomorrow", "Sunday", "next Saturday", etc. — YOU figure out the YYYY-MM-DD date. NEVER ask the caller for a date in YYYY-MM-DD format. They are on the phone — speak naturally like a real person.
-- When a caller wants to book, FIRST use check_tee_times to see what's available on their date
+- ⚠️ ALWAYS call check_tee_times with BOTH date AND party_size before saying anything about availability. NEVER say "fully booked" or "no times" without checking first. The tee sheet changes constantly.
+- Each tee time holds MAX 4 golfers. Some already have players, so the system filters by your party size automatically.
 - Tell them the available times naturally: "I've got 9 AM, 10:30, and 11 AM open on Saturday — any of those work?"
 - Once they pick a time, ONLY ask for their name and phone number — nothing else
 - AFTER collecting their name, ALWAYS use save_customer_info to save it so we remember them next time they call
 - ⚠️ CRITICAL: You MUST call the book_tee_time tool to create the booking. The booking DOES NOT EXIST until you call this tool. NEVER say "I've got you down" or "request submitted" WITHOUT actually calling book_tee_time first. If you skip the tool call, the booking will not be created and the customer will never get a confirmation text.
+- After booking succeeds: tell them it's a REQUEST only — NOT confirmed. They'll get a confirmation TEXT MESSAGE once staff approves it.
 - Flow: collect info → call book_tee_time → wait for result → THEN confirm to caller
 - Do NOT ask for email. Do NOT ask multiple questions at once. Keep it fast and friendly.
 
@@ -644,14 +646,14 @@ function buildToolDefinitions() {
     {
       type: 'function',
       name: 'check_tee_times',
-      description: 'Check live available tee times on the Tee-On tee sheet for a specific date. Use this BEFORE booking so you can tell the caller what times are open. Results show 18-hole slots (start hole 1, full course) and 9-hole slots (start hole 10, back nine only) separately. If no 18-hole morning times, suggest 9-hole back nine as alternative.',
+      description: 'Check live available tee times on the Tee-On tee sheet for a specific date. You MUST provide the party_size so the system can filter out times that are already partially booked and cannot fit the group. Results show 18-hole slots (start hole 1, full course) and 9-hole slots (start hole 10, back nine only) separately. If no 18-hole morning times, suggest 9-hole back nine as alternative. ALWAYS call this tool — NEVER guess or assume availability.',
       parameters: {
         type: 'object',
         properties: {
           date: { type: 'string', description: 'Date to check in YYYY-MM-DD format' },
-          party_size: { type: 'integer', description: 'Number of players (1-4)' }
+          party_size: { type: 'integer', description: 'Number of players in the group — REQUIRED so we only show times with enough open spots' }
         },
-        required: ['date']
+        required: ['date', 'party_size']
       }
     },
     {

@@ -680,7 +680,7 @@ function buildToolDefinitions() {
     {
       type: 'function',
       name: 'lookup_my_bookings',
-      description: 'Look up the caller\'s confirmed upcoming bookings. ALWAYS call this FIRST when a caller wants to cancel or modify a booking — read their bookings back to them so they can confirm which one. Only returns confirmed bookings (not pending or cancelled).',
+      description: 'Look up the caller\'s confirmed upcoming bookings. Call this when: (1) a caller wants to cancel or modify — read bookings back so they can pick which one, (2) a caller forgot their tee time or wants to know when they\'re booked — read their bookings back to them. Only returns confirmed upcoming bookings.',
       parameters: {
         type: 'object',
         properties: {},

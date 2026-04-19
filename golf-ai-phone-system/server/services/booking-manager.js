@@ -8,7 +8,8 @@ const {
   sendModificationNotification,
   sendBookingConfirmationToCustomer,
   sendBookingConfirmedToCustomer,
-  sendBookingCancelledToCustomer
+  sendBookingCancelledToCustomer,
+  sendBookingRejectedToCustomer
 } = require('./notification');
 
 // Create a new booking request
@@ -148,6 +149,8 @@ async function updateBookingStatus(id, status, staffNotes) {
         await sendBookingConfirmedToCustomer(booking);
       } else if (status === 'cancelled') {
         await sendBookingCancelledToCustomer(booking);
+      } else if (status === 'rejected') {
+        await sendBookingRejectedToCustomer(booking, staffNotes);
       }
     } catch (err) {
       console.error('Failed to send status-change SMS to customer:', err.message);

@@ -252,6 +252,24 @@ async function sendBookingCancelledToCustomer(booking) {
   }
 }
 
+// Send a rejection SMS with the reason
+async function sendBookingRejectedToCustomer(booking, reason) {
+  try {
+    const settings = await getSetting('notifications');
+    if (!settings?.customer_sms_enabled) return null;
+    if (!booking?.customer_phone) return null;
+
+    const when = formatShortDateTime(booking.requested_date, booking.requested_time);
+    const reasonText = reason ? ` Reason: ${reason}` : '';
+    const msg = `Valleymede Golf: Unfortunately your tee time request for ${when} could not be accommodated.${reasonText} Please call us at 905 655 6300 to find an alternative time. Thank you!`;
+
+    return await sendSMS(booking.customer_phone, msg);
+  } catch (err) {
+    console.error('Customer rejection SMS failed:', err.message);
+    return null;
+  }
+}
+
 module.exports = {
   sendEmail,
   sendSMS,
@@ -260,5 +278,6 @@ module.exports = {
   sendBookingConfirmationToCustomer,
   sendBookingConfirmedToCustomer,
   sendBookingCancelledToCustomer,
+  sendBookingRejectedToCustomer,
   formatShortDateTime
 };

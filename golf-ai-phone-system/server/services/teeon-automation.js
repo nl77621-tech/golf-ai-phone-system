@@ -158,9 +158,14 @@ function parseTimesFromHTML(html) {
         : 'Course';
     const priceMatch = context.match(/class="price"[^>]*>\s*\$?([\d.]+)/i);
     const price = priceMatch ? '$' + priceMatch[1] : null;
-    const playersMatch = context.match(/([\d]+)\s*-\s*([\d]+)\s*Players/i);
-    const minPlayers = playersMatch ? parseInt(playersMatch[1]) : 1;
-    const maxPlayers = playersMatch ? parseInt(playersMatch[2]) : 4;
+    // Parse available player spots — critical for filtering by party size
+    // Formats: "2 - 4 Players" (range), "1 Player" (single spot), "1 - 2 Players"
+    const playersRangeMatch = context.match(/([\d]+)\s*-\s*([\d]+)\s*Players/i);
+    const playersSingleMatch = !playersRangeMatch && context.match(/(\d+)\s*Player(?:s)?/i);
+    const minPlayers = playersRangeMatch ? parseInt(playersRangeMatch[1]) :
+                       playersSingleMatch ? parseInt(playersSingleMatch[1]) : 1;
+    const maxPlayers = playersRangeMatch ? parseInt(playersRangeMatch[2]) :
+                       playersSingleMatch ? parseInt(playersSingleMatch[1]) : 4;
 
     slots.push({
       time: timeNum + ' ' + ampm,

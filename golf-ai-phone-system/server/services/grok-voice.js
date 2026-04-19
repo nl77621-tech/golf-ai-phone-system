@@ -468,7 +468,7 @@ ${callerLine}
 
         case 'response.function_call_arguments.done': {
           // Grok wants to call a tool
-          console.log(`[${callSid}] Tool call: ${event.name}`);
+          console.log(`[${callSid}] Tool call: ${event.name} | raw args: ${event.arguments}`);
           let parsedArgs;
           try {
             parsedArgs = JSON.parse(event.arguments || '{}');
@@ -488,6 +488,8 @@ ${callerLine}
           }
           const result = await executeToolCall(event.name, parsedArgs, callerContext, callLogId);
           callState.actions.push({ tool: event.name, args: event.arguments });
+          const resultStr = JSON.stringify(result);
+          console.log(`[${callSid}] Tool result for ${event.name} (${resultStr.length} chars): ${resultStr.substring(0, 500)}`);
 
           // Send tool result back to Grok
           grokWs.send(JSON.stringify({

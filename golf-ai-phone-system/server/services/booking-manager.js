@@ -246,7 +246,7 @@ async function findActiveBookingByPhone(phone) {
     `SELECT * FROM booking_requests
      WHERE customer_phone = $1
        AND status IN ('pending', 'confirmed')
-       AND requested_date >= CURRENT_DATE
+       AND requested_date >= (NOW() AT TIME ZONE 'America/Toronto')::date
      ORDER BY requested_date ASC, requested_time ASC
      LIMIT 1`,
     [phone]
@@ -256,13 +256,14 @@ async function findActiveBookingByPhone(phone) {
 
 // Get all confirmed upcoming bookings for a phone number
 // Used by the AI to read back bookings when caller wants to cancel/modify
+// Uses Eastern time (course timezone) to determine "today" since Railway runs UTC
 async function getConfirmedBookingsByPhone(phone) {
   if (!phone) return [];
   const res = await query(
     `SELECT * FROM booking_requests
      WHERE customer_phone = $1
        AND status = 'confirmed'
-       AND requested_date >= CURRENT_DATE
+       AND requested_date >= (NOW() AT TIME ZONE 'America/Toronto')::date
      ORDER BY requested_date ASC, requested_time ASC`,
     [phone]
   );

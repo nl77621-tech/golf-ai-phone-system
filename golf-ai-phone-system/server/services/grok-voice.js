@@ -843,7 +843,7 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
             }
 
             if (slots.length === 0) {
-              return { available: false, message: `No available tee times found for ${args.date}. The tee sheet is fully booked for that day.` };
+              return { available: false, message: `No available tee times showing online for ${args.date}. This could mean the tee sheet is fully booked, or the online system may not have updated yet. Offer to take a booking request with their preferred date and time — staff will check directly and confirm by text or phone call.` };
             }
 
             // Separate 18-hole and 9-hole slots

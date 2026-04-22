@@ -60,6 +60,91 @@ app.get('/health', async (req, res) => {
 // Diagnostic: test tee time scraper directly from production
 // Usage: GET /test-tee-times?date=2026-04-19&party_size=4
 const teeon = require('./services/teeon-automation');
+
+// Diagnostic: show raw HTML from Tee-On to debug production issues
+app.get('/test-tee-times-raw', async (req, res) => {
+  const https = require('https');
+  const date = req.query.date || new Date().toISOString().split('T')[0];
+  const baseUrl = 'https://www.tee-on.com/PubGolf/servlet/com.teeon.teesheet.servlets.golfersection.WebBookingAllTimesLanding';
+
+  try {
+    // Step 1: GET landing to get session cookie
+    const landing = await new Promise((resolve, reject) => {
+      https.get(`${baseUrl}?CourseCode=COLU&CourseGroupID=12&Referrer=`, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36' }
+      }, (resp) => {
+        const chunks = [];
+        resp.on('data', c => chunks.push(c));
+        resp.on('end', () => resolve({
+          status: resp.statusCode,
+          cookies: (resp.headers['set-cookie'] || []).map(c => c.split(';')[0]).join('; '),
+          body: Buffer.concat(chunks).toString('utf8'),
+          headers: resp.headers
+        }));
+      }).on('error', reject);
+    });
+
+    // Step 2: POST with date
+    const postBody = `Date=${encodeURIComponent(date)}&CourseCode=COLU&CourseGroupID=12`;
+    const postResult = await new Promise((resolve, reject) => {
+      const postReq = https.request({
+        hostname: 'www.tee-on.com',
+        path: `/PubGolf/servlet/com.teeon.teesheet.servlets.golfersection.WebBookingAllTimesLanding?CourseCode=COLU&Referrer=`,
+        method: 'POST',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Content-Length': Buffer.byteLength(postBody),
+          'Cookie': landing.cookies || '',
+          'Referer': `${baseUrl}?CourseCode=COLU&CourseGroupID=12&Referrer=`
+        }
+      }, (resp) => {
+        const chunks = [];
+        resp.on('data', c => chunks.push(c));
+        resp.on('end', () => resolve({
+          status: resp.statusCode,
+          body: Buffer.concat(chunks).toString('utf8'),
+          headers: resp.headers
+        }));
+      });
+      postReq.on('error', reject);
+      postReq.write(postBody);
+      postReq.end();
+    });
+
+    const hasTimeClass = /class="time"/.test(postResult.body);
+    const hasSlotBox = /search-results-tee-times-box/.test(postResult.body);
+    const hasLogin = /signin|sign in|username|password/i.test(postResult.body);
+    const hasNoTimes = /no-times-available|no times/i.test(postResult.body);
+
+    res.json({
+      date,
+      landingStatus: landing.status,
+      landingBodyLength: landing.body.length,
+      landingHasTimeClass: /class="time"/.test(landing.body),
+      landingCookies: landing.cookies ? 'yes' : 'none',
+      postStatus: postResult.status,
+      postBodyLength: postResult.body.length,
+      postHasTimeClass: hasTimeClass,
+      postHasSlotBox: hasSlotBox,
+      postHasLogin: hasLogin,
+      postHasNoTimes: hasNoTimes,
+      // Show snippets around key elements
+      firstTimeSnippet: (() => {
+        const m = postResult.body.match(/class="time"[^>]*>[\s\S]{0,100}/);
+        return m ? m[0] : 'NO TIME CLASS FOUND';
+      })(),
+      bodyFirst500: postResult.body.substring(0, 500),
+      bodySnippetAroundSlots: (() => {
+        const idx = postResult.body.indexOf('search-results-tee-times-box');
+        return idx >= 0 ? postResult.body.substring(idx, idx + 300) : 'NO SLOT BOX FOUND';
+      })()
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/test-tee-times', async (req, res) => {
   const date = req.query.date || new Date().toISOString().split('T')[0];
   const partySize = parseInt(req.query.party_size) || 4;

@@ -197,34 +197,96 @@ function parseTimesFromHTML(html) {
   return slots;
 }
 
+// ─── Tee time cache ──────────────────────────────────────────────────────────
+// Tee-On rate-limits repeated requests (returns content-length:0 after too many).
+// Cache results per date to avoid hammering their server.
+const teeTimeCache = new Map(); // key: 'YYYY-MM-DD', value: { slots, timestamp }
+const CACHE_TTL = 10 * 60 * 1000; // 10 min cache — tee times don't change that fast
+const MIN_REQUEST_INTERVAL = 3000; // At least 3s between requests to Tee-On
+let lastRequestTime = 0;
+
+function getCachedSlots(date) {
+  const cached = teeTimeCache.get(date);
+  if (cached && (Date.now() - cached.timestamp < CACHE_TTL)) {
+    console.log(`[TeeOn-Cache] HIT for ${date} (${Math.round((Date.now() - cached.timestamp) / 1000)}s old, ${cached.slots.length} slots)`);
+    return cached.slots;
+  }
+  return null;
+}
+
+function setCachedSlots(date, slots) {
+  // Only cache if we got actual results (don't cache empty rate-limited responses)
+  if (slots.length > 0) {
+    teeTimeCache.set(date, { slots, timestamp: Date.now() });
+    console.log(`[TeeOn-Cache] STORED ${slots.length} slots for ${date}`);
+  }
+  // Clean old entries
+  for (const [key, val] of teeTimeCache) {
+    if (Date.now() - val.timestamp > CACHE_TTL * 3) teeTimeCache.delete(key);
+  }
+}
+
+async function throttledWait() {
+  const elapsed = Date.now() - lastRequestTime;
+  if (elapsed < MIN_REQUEST_INTERVAL) {
+    const wait = MIN_REQUEST_INTERVAL - elapsed;
+    console.log(`[TeeOn] Throttling ${wait}ms to avoid rate limit`);
+    await new Promise(r => setTimeout(r, wait));
+  }
+  lastRequestTime = Date.now();
+}
+
 // ─── HTTP-based availability check ───────────────────────────────────────────
 
 let httpSession = null;
 let httpSessionTime = 0;
-const HTTP_SESSION_TTL = 5 * 60 * 1000; // Refresh session every 5 min for fresh tee sheet data
+const HTTP_SESSION_TTL = 10 * 60 * 1000; // Reuse session for 10 min (was 5 — reduce requests)
 
 async function checkAvailabilityHTTP(date, partySize = 1, retryCount = 0) {
   console.log(`[TeeOn-HTTP] Checking availability for ${date} (party of ${partySize})${retryCount > 0 ? ' [RETRY ' + retryCount + ']' : ''}`);
 
   try {
-    // Step 1: Always get a fresh session for each check to ensure live data
-    // (sessions can go stale quickly on Tee-On)
+    // Step 1: Get or reuse session
     const sessionExpired = !httpSession || (Date.now() - httpSessionTime > HTTP_SESSION_TTL);
     if (sessionExpired || retryCount > 0) {
+      await throttledWait();
       console.log('[TeeOn-HTTP] Getting fresh session...');
       const landing = await httpsGet(
         `${PUBLIC_SHEET_BASE}?CourseCode=${COURSE_CODE}&CourseGroupID=${COURSE_GROUP_ID}&Referrer=`
       );
       httpSession = landing.cookies;
       httpSessionTime = Date.now();
-      const pt = detectPageType(landing.body);
-      console.log(`[TeeOn-HTTP] Session established | Type: ${pt} | Cookies: ${httpSession ? 'yes' : 'none'}`);
+
+      // The landing page shows TODAY's tee times — parse and cache them
+      if (landing.body && landing.body.length > 1000) {
+        const pt = detectPageType(landing.body);
+        console.log(`[TeeOn-HTTP] Session established | Type: ${pt} | Cookies: ${httpSession ? 'yes' : 'none'} | Body: ${landing.body.length} chars`);
+        const todayStr = new Date().toISOString().split('T')[0];
+        const landingSlots = parseTimesFromHTML(landing.body);
+        if (landingSlots.length > 0) {
+          setCachedSlots(todayStr, landingSlots);
+          // If the requested date is today, we already have the answer
+          if (date === todayStr) {
+            console.log(`[TeeOn-HTTP] Landing page had today's times — using directly (${landingSlots.length} slots)`);
+            return landingSlots;
+          }
+        }
+      } else {
+        console.log(`[TeeOn-HTTP] Session response was empty/short (${landing.body?.length || 0} chars) — possible rate limit`);
+        // If we got rate-limited on the session request, return cached or empty
+        if (landing.body?.length === 0) {
+          const cached = getCachedSlots(date);
+          if (cached) return cached;
+          throw new Error('Tee-On returned empty response (rate limited). Try again in a few minutes.');
+        }
+      }
     }
 
     const cookieHeader = httpSession ? { Cookie: httpSession } : {};
     const referer = `${PUBLIC_SHEET_BASE}?CourseCode=${COURSE_CODE}&CourseGroupID=${COURSE_GROUP_ID}&Referrer=`;
 
     // Step 2: POST with Date=YYYY-MM-DD (exactly what changeDate() does on the page)
+    await throttledWait();
     console.log(`[TeeOn-HTTP] POST with Date=${date}...`);
     const postResult = await httpsPost(
       `${PUBLIC_SHEET_BASE}?CourseCode=${COURSE_CODE}&Referrer=`,
@@ -241,6 +303,17 @@ async function checkAvailabilityHTTP(date, partySize = 1, retryCount = 0) {
       httpSession = [httpSession, postResult.cookies].filter(Boolean).join('; ');
     }
 
+    // Detect empty/rate-limited response
+    if (!postResult.body || postResult.body.length < 500) {
+      console.log(`[TeeOn-HTTP] POST returned short/empty response (${postResult.body?.length || 0} chars) — likely rate-limited`);
+      const cached = getCachedSlots(date);
+      if (cached) return cached;
+      // Reset session so next try gets fresh one
+      httpSession = null;
+      httpSessionTime = 0;
+      return [];
+    }
+
     const pageType = detectPageType(postResult.body);
     const hasTimeClass = /class="time"/.test(postResult.body);
     const hasSlotBox = /search-results-tee-times-box/.test(postResult.body);
@@ -251,6 +324,7 @@ async function checkAvailabilityHTTP(date, partySize = 1, retryCount = 0) {
     // If POST returned a login page or unknown, try GET as fallback
     if (slots.length === 0 && pageType !== 'SHEET') {
       console.log(`[TeeOn-HTTP] POST had no slots (${pageType}), trying GET...`);
+      await throttledWait();
       const getResult = await httpsGet(
         `${PUBLIC_SHEET_BASE}?CourseCode=${COURSE_CODE}&CourseGroupID=${COURSE_GROUP_ID}&Date=${encodeURIComponent(date)}&Referrer=`,
         { ...cookieHeader, Referer: referer }
@@ -268,12 +342,22 @@ async function checkAvailabilityHTTP(date, partySize = 1, retryCount = 0) {
       }
     }
 
+    // Cache successful results
+    if (slots.length > 0) {
+      setCachedSlots(date, slots);
+    }
+
     console.log(`[TeeOn-HTTP] Found ${slots.length} slots for ${date}`);
     return slots;
 
   } catch (err) {
     console.error('[TeeOn-HTTP] Error:', err.message);
-    // On error, reset session so next call gets fresh state
+    // On error, check cache before giving up
+    const cached = getCachedSlots(date);
+    if (cached) {
+      console.log(`[TeeOn-HTTP] Error occurred but returning cached data (${cached.length} slots)`);
+      return cached;
+    }
     httpSession = null;
     httpSessionTime = 0;
     throw err;
@@ -372,6 +456,12 @@ async function checkAvailabilityPuppeteer(date, partySize = 1) {
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 async function checkAvailability(date, partySize = 1) {
+  // Check cache FIRST — avoid hitting Tee-On if we have recent data
+  const cached = getCachedSlots(date);
+  if (cached) {
+    return cached;
+  }
+
   // HTTP-first: it's faster, lighter (no browser), and our HTML parser is battle-tested.
   // Puppeteer is a fallback only — in case Tee-On blocks raw HTTP or requires JS rendering.
   try {
@@ -389,7 +479,11 @@ async function checkAvailability(date, partySize = 1) {
   if (puppeteer) {
     try {
       console.log('[TeeOn] Trying Puppeteer fallback...');
-      return await checkAvailabilityPuppeteer(date, partySize);
+      const puppeteerSlots = await checkAvailabilityPuppeteer(date, partySize);
+      if (puppeteerSlots.length > 0) {
+        setCachedSlots(date, puppeteerSlots);
+      }
+      return puppeteerSlots;
     } catch (err) {
       console.warn('[TeeOn] Puppeteer also failed:', err.message);
       if (browser) { try { await browser.close(); } catch (e) {} browser = null; }

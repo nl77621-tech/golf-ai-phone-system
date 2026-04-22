@@ -106,6 +106,7 @@ async function sendBookingNotification(booking) {
         <tr><td style="padding:4px 12px; font-weight:bold;">Time:</td><td style="padding:4px 12px;">${booking.requested_time || 'Flexible'}</td></tr>
         <tr><td style="padding:4px 12px; font-weight:bold;">Players:</td><td style="padding:4px 12px;">${booking.party_size}</td></tr>
         <tr><td style="padding:4px 12px; font-weight:bold;">Carts:</td><td style="padding:4px 12px;">${booking.num_carts || 0}</td></tr>
+        ${booking.card_last_four ? `<tr><td style="padding:4px 12px; font-weight:bold;">Card:</td><td style="padding:4px 12px;">****${booking.card_last_four}</td></tr>` : ''}
         ${booking.special_requests ? `<tr><td style="padding:4px 12px; font-weight:bold;">Notes:</td><td style="padding:4px 12px;">${booking.special_requests}</td></tr>` : ''}
       </table>
       <p style="margin-top:16px; color:#666;">Log in to the Command Center to confirm or modify this booking.</p>
@@ -114,7 +115,8 @@ async function sendBookingNotification(booking) {
   }
 
   if (smsEnabled && settings.sms_to) {
-    const sms = `New tee time request: ${booking.customer_name || 'Unknown'}, ${dateStr} ${booking.requested_time || ''}, ${booking.party_size} players. Check Command Center to confirm.`;
+    const ccNote = booking.card_last_four ? ` Card: ****${booking.card_last_four}.` : '';
+    const sms = `New tee time request: ${booking.customer_name || 'Unknown'}, ${dateStr} ${booking.requested_time || ''}, ${booking.party_size} players.${ccNote} Check Command Center to confirm.`;
     await sendSMS(settings.sms_to, sms);
   }
 }
@@ -196,20 +198,51 @@ function formatShortDateTime(dateStr, timeStr) {
   }
 }
 
+/**
+ * Get the best SMS-capable number for a customer.
+ * If they called from a landline and provided an alternate mobile number, use that.
+ * Otherwise fall back to their primary phone.
+ */
+async function getSmsPhoneForCustomer(booking) {
+  if (!booking?.customer_phone) return null;
+  try {
+    const { query: dbQuery } = require('../config/database');
+    const res = await dbQuery(
+      'SELECT line_type, alternate_phone FROM customers WHERE phone = $1',
+      [booking.customer_phone]
+    );
+    const customer = res.rows[0];
+    if (customer?.line_type === 'landline' && customer?.alternate_phone) {
+      console.log(`[Notification] Customer ${booking.customer_phone} is landline — using alternate: ${customer.alternate_phone}`);
+      return customer.alternate_phone;
+    }
+    if (customer?.line_type === 'landline' && !customer?.alternate_phone) {
+      console.log(`[Notification] Customer ${booking.customer_phone} is landline with no alternate — skipping SMS`);
+      return null;
+    }
+  } catch (err) {
+    // If lookup fails, fall back to primary phone
+    console.warn('[Notification] Could not check line type:', err.message);
+  }
+  return booking.customer_phone;
+}
+
 // Send booking confirmation SMS to the CUSTOMER (not staff)
 // Controlled by settings.customer_sms_enabled toggle
 async function sendBookingConfirmationToCustomer(booking) {
   try {
     const settings = await getSetting('notifications');
     if (!settings?.customer_sms_enabled) return null;
-    if (!booking?.customer_phone) return null;
+
+    const smsPhone = await getSmsPhoneForCustomer(booking);
+    if (!smsPhone) return null;
 
     const when = formatShortDateTime(booking.requested_date, booking.requested_time);
     const players = booking.party_size || 1;
     const playerWord = players === 1 ? 'player' : 'players';
     const msg = `Valleymede Golf: Tee time request for ${when}, ${players} ${playerWord}. Your booking is not confirmed until you receive a confirmation text!! If plans change please call us back at 905 655 6300.`;
 
-    return await sendSMS(booking.customer_phone, msg);
+    return await sendSMS(smsPhone, msg);
   } catch (err) {
     console.error('Customer confirmation SMS failed:', err.message);
     return null;
@@ -221,14 +254,16 @@ async function sendBookingConfirmedToCustomer(booking) {
   try {
     const settings = await getSetting('notifications');
     if (!settings?.customer_sms_enabled) return null;
-    if (!booking?.customer_phone) return null;
+
+    const smsPhone = await getSmsPhoneForCustomer(booking);
+    if (!smsPhone) return null;
 
     const when = formatShortDateTime(booking.requested_date, booking.requested_time);
     const players = booking.party_size || 1;
     const playerWord = players === 1 ? 'player' : 'players';
     const msg = `Valleymede Golf: Tee time CONFIRMED for ${when}, ${players} ${playerWord}. See you then! If plans change please call us back at 905 655 6300.`;
 
-    return await sendSMS(booking.customer_phone, msg);
+    return await sendSMS(smsPhone, msg);
   } catch (err) {
     console.error('Customer confirmed SMS failed:', err.message);
     return null;
@@ -240,12 +275,14 @@ async function sendBookingCancelledToCustomer(booking) {
   try {
     const settings = await getSetting('notifications');
     if (!settings?.customer_sms_enabled) return null;
-    if (!booking?.customer_phone) return null;
+
+    const smsPhone = await getSmsPhoneForCustomer(booking);
+    if (!smsPhone) return null;
 
     const when = formatShortDateTime(booking.requested_date, booking.requested_time);
     const msg = `Valleymede Golf: Your tee time for ${when} has been cancelled. Call us back anytime to rebook. Thank you!`;
 
-    return await sendSMS(booking.customer_phone, msg);
+    return await sendSMS(smsPhone, msg);
   } catch (err) {
     console.error('Customer cancellation SMS failed:', err.message);
     return null;
@@ -257,13 +294,15 @@ async function sendBookingRejectedToCustomer(booking, reason) {
   try {
     const settings = await getSetting('notifications');
     if (!settings?.customer_sms_enabled) return null;
-    if (!booking?.customer_phone) return null;
+
+    const smsPhone = await getSmsPhoneForCustomer(booking);
+    if (!smsPhone) return null;
 
     const when = formatShortDateTime(booking.requested_date, booking.requested_time);
     const reasonText = reason ? ` Reason: ${reason}` : '';
     const msg = `Valleymede Golf: Unfortunately your tee time request for ${when} could not be accommodated.${reasonText} Please call us at 905 655 6300 to find an alternative time. Thank you!`;
 
-    return await sendSMS(booking.customer_phone, msg);
+    return await sendSMS(smsPhone, msg);
   } catch (err) {
     console.error('Customer rejection SMS failed:', err.message);
     return null;

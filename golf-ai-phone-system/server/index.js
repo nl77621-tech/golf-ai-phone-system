@@ -200,6 +200,15 @@ async function initializeDatabaseIfNeeded() {
           AND custom_greeting != ''
           AND (custom_greetings IS NULL OR custom_greetings = '[]'::jsonb)
       `);
+      // Phone type detection + credit card fields
+      await client.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS line_type VARCHAR(20)`);
+      await client.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS alternate_phone VARCHAR(20)`);
+      await client.query(`ALTER TABLE booking_requests ADD COLUMN IF NOT EXISTS card_last_four VARCHAR(4)`);
+      await client.query(`
+        INSERT INTO settings (key, value, description)
+        VALUES ('booking_settings', '{"require_credit_card": false}', 'Booking behavior settings (credit card requirement, etc.)')
+        ON CONFLICT (key) DO NOTHING
+      `);
       console.log('✅ Migrations applied');
     } catch (migErr) {
       console.warn('⚠️  Migration warning:', migErr.message);

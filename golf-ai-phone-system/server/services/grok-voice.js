@@ -12,6 +12,7 @@ const WebSocket = require('ws');
 const { buildSystemPrompt } = require('./system-prompt');
 const { lookupByPhone, registerCall, updateCustomer } = require('./caller-lookup');
 const { createBookingRequest, createModificationRequest } = require('./booking-manager');
+const { getLineType, isSmsCapable } = require('./phone-lookup');
 const { getCurrentWeather, getForecast } = require('./weather');
 const { query, getSetting } = require('../config/database');
 const teeon = require('./teeon-automation');
@@ -136,6 +137,16 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid, appU
     console.error('Failed to register call (DB unavailable, continuing):', err.message);
   }
 
+  // Look up line type (mobile vs landline) — cached on customer record
+  let lineType = null;
+  if (!isAnonymous && callerPhone) {
+    try {
+      lineType = await getLineType(callerPhone, customer?.id);
+    } catch (err) {
+      console.warn('Phone lookup failed (continuing):', err.message);
+    }
+  }
+
   const callerContext = {
     phone: isAnonymous ? null : callerPhone,
     isAnonymous,
@@ -144,7 +155,10 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid, appU
     email: customer?.email,
     callCount: customer?.call_count,
     customerId: customer?.id,
-    customerKnowledge: customer?.customer_knowledge || null
+    customerKnowledge: customer?.customer_knowledge || null,
+    lineType: lineType,
+    isLandline: lineType === 'landline',
+    alternatePhone: customer?.alternate_phone || null
   };
 
   // Update call log with customer ID
@@ -674,9 +688,22 @@ function buildToolDefinitions() {
           time: { type: 'string', description: 'Requested time in HH:MM format (24h)' },
           party_size: { type: 'integer', description: 'Number of players (1-8)' },
           num_carts: { type: 'integer', description: 'Number of golf carts requested' },
-          special_requests: { type: 'string', description: 'Any special requests or notes' }
+          special_requests: { type: 'string', description: 'Any special requests or notes' },
+          card_last_four: { type: 'string', description: 'Last 4 digits of the credit card provided by the caller (only when credit card is required)' }
         },
         required: ['customer_name', 'date', 'party_size']
+      }
+    },
+    {
+      type: 'function',
+      name: 'save_alternate_phone',
+      description: 'Save a mobile/cell phone number for a caller who is calling from a landline. This allows us to send them text message confirmations. Call this when a landline caller provides their cell number.',
+      parameters: {
+        type: 'object',
+        properties: {
+          mobile_number: { type: 'string', description: 'The mobile/cell phone number provided by the caller' }
+        },
+        required: ['mobile_number']
       }
     },
     {
@@ -914,6 +941,7 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
             partySize: args.party_size,
             numCarts: args.num_carts || 0,
             specialRequests: args.special_requests,
+            cardLastFour: args.card_last_four || null,
             callId: callLogId
           });
 
@@ -933,9 +961,16 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
             }
           }
 
+          // Adjust confirmation message based on whether caller can receive SMS
+          const smsNote = callerContext.isLandline && !callerContext.alternatePhone
+            ? 'Since they called from a home phone and did not provide a cell number, let them know staff will call them back to confirm instead of texting.'
+            : callerContext.isLandline && callerContext.alternatePhone
+            ? `They WILL receive a confirmation TEXT MESSAGE at their cell number (${callerContext.alternatePhone}) once staff approves it.`
+            : 'They WILL receive a confirmation TEXT MESSAGE once staff approves it. The tee time is NOT guaranteed until they get that text. Make sure they understand to watch for the text.';
+
           return {
             success: true,
-            message: `Booking REQUEST submitted for ${args.customer_name}, ${args.date} at ${args.time || 'flexible time'}, ${args.party_size} players. IMPORTANT: Tell the caller this is a REQUEST only — it is NOT confirmed yet. They WILL receive a confirmation TEXT MESSAGE once staff approves it. The tee time is NOT guaranteed until they get that text. Make sure they understand to watch for the text.`,
+            message: `Booking REQUEST submitted for ${args.customer_name}, ${args.date} at ${args.time || 'flexible time'}, ${args.party_size} players. IMPORTANT: Tell the caller this is a REQUEST only — it is NOT confirmed yet. ${smsNote}`,
             bookingId: booking.id
           };
         } catch (dbErr) {
@@ -1124,6 +1159,22 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
           console.warn(`[${callLogId}] save_customer_info: No customerId available`);
           return { success: false, message: 'I had trouble saving your info, but we can still complete your booking.' };
         }
+      }
+
+      case 'save_alternate_phone': {
+        console.log(`[${callLogId}] save_alternate_phone called | customerId: ${callerContext.customerId} | mobile: ${args.mobile_number}`);
+        if (callerContext.customerId && args.mobile_number) {
+          try {
+            await query('UPDATE customers SET alternate_phone = $1 WHERE id = $2', [args.mobile_number, callerContext.customerId]);
+            callerContext.alternatePhone = args.mobile_number;
+            console.log(`[${callLogId}] Saved alternate phone ${args.mobile_number} for customer ${callerContext.customerId}`);
+            return { success: true, message: `Got it! I'll send text confirmations to ${args.mobile_number} instead.` };
+          } catch (err) {
+            console.error(`[${callLogId}] Failed to save alternate phone:`, err.message);
+            return { success: false, message: 'I had trouble saving that number, but no worries — staff will follow up with you.' };
+          }
+        }
+        return { success: false, message: 'I had trouble saving that number, but no worries — staff will follow up with you.' };
       }
 
       default:

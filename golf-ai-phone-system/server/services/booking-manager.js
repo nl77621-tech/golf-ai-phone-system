@@ -15,7 +15,7 @@ const {
 // Create a new booking request
 async function createBookingRequest({
   customerId, customerName, customerPhone, customerEmail,
-  requestedDate, requestedTime, partySize, numCarts, specialRequests, callId
+  requestedDate, requestedTime, partySize, numCarts, specialRequests, cardLastFour, callId
 }) {
   // Validate required fields
   if (!customerName || typeof customerName !== 'string') {
@@ -39,14 +39,17 @@ async function createBookingRequest({
   const carts = parseInt(numCarts) || 0;
 
   try {
+    // Validate card_last_four if provided (must be exactly 4 digits)
+    const cardDigits = cardLastFour ? String(cardLastFour).replace(/\D/g, '').slice(-4) : null;
+
     const res = await query(
       `INSERT INTO booking_requests
        (customer_id, customer_name, customer_phone, customer_email,
-        requested_date, requested_time, party_size, num_carts, special_requests, call_id, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending')
+        requested_date, requested_time, party_size, num_carts, special_requests, card_last_four, call_id, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending')
        RETURNING *`,
       [customerId || null, customerName.trim(), customerPhone || null, customerEmail || null,
-       normalizedDate, requestedTime || null, size, carts, specialRequests || null, callId || null]
+       normalizedDate, requestedTime || null, size, carts, specialRequests || null, cardDigits, callId || null]
     );
 
     const booking = res.rows[0];

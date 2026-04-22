@@ -19,7 +19,8 @@ async function buildSystemPrompt(callerContext = {}) {
     dailyInstructions,
     generalKnowledge,
     faq,
-    seasonalNotes
+    seasonalNotes,
+    bookingSettings
   ] = await Promise.all([
     getSetting('course_info'),
     getSetting('pricing'),
@@ -33,8 +34,11 @@ async function buildSystemPrompt(callerContext = {}) {
     getSetting('daily_instructions'),
     getSetting('general_knowledge'),
     getSetting('faq'),
-    getSetting('seasonal_notes')
+    getSetting('seasonal_notes'),
+    getSetting('booking_settings')
   ]);
+
+  const requireCreditCard = bookingSettings?.require_credit_card ?? false;
 
   // Determine current day/time context
   const now = new Date();
@@ -78,6 +82,27 @@ This is a NEW caller. We have their phone number (${callerContext.phone}) but no
 Early in the conversation, casually ask for their name: "Can I get your name?" — natural and brief.
 Use save_customer_info to save their name so we remember them next time.
 `;
+  }
+
+  // Add landline warning to caller context
+  if (callerContext.isLandline) {
+    if (callerContext.alternatePhone) {
+      callerSection += `
+### LANDLINE CALLER — MOBILE ON FILE
+This caller is calling from a HOME/LANDLINE phone. They have a cell number on file (${callerContext.alternatePhone}) that we'll use for text confirmations.
+- You do NOT need to ask for their cell number again.
+- When mentioning text confirmations, say "we'll send the confirmation text to your cell number on file."
+`;
+    } else {
+      callerSection += `
+### ⚠️ LANDLINE CALLER — NO MOBILE ON FILE
+This caller is calling from a HOME/LANDLINE phone. They CANNOT receive text messages at this number.
+- IMPORTANT: During the booking, naturally ask: "I notice you're calling from a home phone — do you have a cell number I can send the confirmation text to?"
+- If they give you a cell number, call save_alternate_phone with that number immediately.
+- If they don't have or don't want to give a cell number, that's okay — let them know staff will call them back to confirm instead of texting.
+- Do NOT promise text confirmations to a landline number.
+`;
+    }
   }
 
   // Build daily instructions section — keyed by YYYY-MM-DD date
@@ -251,7 +276,7 @@ ${!isOpen ? personality?.after_hours_message || 'Staff are not available right n
 - The tee sheet changes constantly — spots open and close all day. ALWAYS check live.
 - Each tee time has a MAX of 4 golfers. Some times already have players booked, so fewer spots are available. The system automatically filters by party size — only times with enough open spots are returned.
 - After calling check_tee_times, tell the caller naturally: "I've got 9 AM and 10:30 open — which works?"
-- Once they pick a time, ONLY ask for: name and phone number. That's it — no email, no extra questions.
+- Once they pick a time, ask for: name and phone number.${requireCreditCard ? ' Then ask for a credit card number to hold the booking (see CREDIT CARD section below).' : ''} No email, no extra questions.
 - For NEW callers: After they give their name, ALWAYS use save_customer_info to save it so we remember them for next time
 - For RETURNING callers: you already have their info, just confirm the booking details
 
@@ -272,7 +297,15 @@ ${!isOpen ? personality?.after_hours_message || 'Staff are not available right n
 - NEVER skip the confirmation-text reminder. The caller MUST know to wait for the text.
 - If the caller says "so I'm booked?" or "so it's confirmed?" — correct them: "Not quite yet — it's a request right now. Once you get the confirmation text, you're good to go."
 
-## TOOLS AVAILABLE
+${requireCreditCard ? `## 💳 CREDIT CARD REQUIRED FOR BOOKINGS
+A credit card is REQUIRED to hold all tee time bookings. You must collect this before calling book_tee_time.
+- After getting their name and confirming the tee time, say something like: "And to hold the booking, can I get a credit card number?"
+- Collect the FULL card number the caller reads out. We only store the LAST 4 DIGITS for security — the rest is not saved anywhere.
+- Pass the last 4 digits to book_tee_time using the card_last_four field.
+- If the caller refuses to provide a card, politely let them know it's required to hold the booking: "I understand, but we do need a card on file to hold the tee time. It's just to guarantee the spot."
+- If they still refuse, you CANNOT complete the booking. Say: "No problem — if you change your mind, just give us a call back and we'll get you set up."
+- NEVER read back the full card number. If confirming, only say the last 4 digits: "Got it — card ending in 1234."
+` : ''}## TOOLS AVAILABLE
 You have access to these tools (functions) — you MUST use them to perform actions:
 - book_tee_time: REQUIRED to create a booking. Booking does NOT exist until you call this.
 - check_tee_times: Check available times for a date
@@ -283,6 +316,7 @@ You have access to these tools (functions) — you MUST use them to perform acti
 - transfer_call: Transfer the call to a human staff member
 - lookup_customer: Look up a customer by phone number or name
 - save_customer_info: Save customer name/phone/email
+- save_alternate_phone: Save a mobile number for a landline caller so they can receive text confirmations
 
 ### BOOKING LOOKUP — "When is my tee time?"
 If a caller forgot their tee time or wants to check their bookings, call lookup_my_bookings and read them back:

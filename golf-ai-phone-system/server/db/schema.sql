@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS customers (
     call_count INTEGER DEFAULT 0,
     first_call_at TIMESTAMP DEFAULT NOW(),
     last_call_at TIMESTAMP DEFAULT NOW(),
+    line_type VARCHAR(20),
+    alternate_phone VARCHAR(20),
     created_at TIMESTAMP DEFAULT NOW(),
     UNIQUE(phone)
 );
@@ -38,6 +40,7 @@ CREATE TABLE IF NOT EXISTS booking_requests (
     num_carts INTEGER DEFAULT 0,
     special_requests TEXT,
     status VARCHAR(20) DEFAULT 'pending',  -- pending, confirmed, rejected, cancelled
+    card_last_four VARCHAR(4),
     staff_notes TEXT,
     call_id INTEGER,
     created_at TIMESTAMP DEFAULT NOW(),

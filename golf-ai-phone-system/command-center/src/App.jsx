@@ -379,8 +379,12 @@ function BookingsPage() {
                       React.createElement('div', { className: 'text-sm text-gray-500 mt-1' },
                         `${b.party_size} player${b.party_size > 1 ? 's' : ''} \u2022 ${b.num_carts || 0} cart${b.num_carts !== 1 ? 's' : ''}`
                       ),
-                      React.createElement('div', { className: 'text-sm text-gray-400' },
-                        `${b.customer_phone || ''} ${b.customer_email ? '\u2022 ' + b.customer_email : ''}`
+                      React.createElement('div', { className: 'text-sm text-gray-400 flex items-center gap-2' },
+                        `${b.customer_phone || ''} ${b.customer_email ? '\u2022 ' + b.customer_email : ''}`,
+                        b.card_last_four && React.createElement('span', {
+                          className: 'inline-flex items-center px-1.5 py-0.5 rounded text-xs bg-blue-100 text-blue-700',
+                          title: `Card on file ending in ${b.card_last_four}`
+                        }, `\uD83D\uDCB3 ****${b.card_last_four}`)
                       ),
                       b.special_requests && React.createElement('div', { className: 'text-sm text-gray-600 mt-1 italic' }, b.special_requests)
                     ),
@@ -1370,7 +1374,29 @@ function SettingsPage() {
           onSave: v => saveSetting('ai_personality', { ...val('ai_personality'), weather_behavior: v }), saving: saving === 'ai_personality' }),
         React.createElement(SettingField, { label: 'After-Hours Message', description: 'What the AI says when callers ask for a human after hours',
           value: val('ai_personality')?.after_hours_message || '',
-          onSave: v => saveSetting('ai_personality', { ...val('ai_personality'), after_hours_message: v }), saving: saving === 'ai_personality' })
+          onSave: v => saveSetting('ai_personality', { ...val('ai_personality'), after_hours_message: v }), saving: saving === 'ai_personality' }),
+
+        // Credit Card Requirement
+        React.createElement('div', { className: 'border-t pt-4 mt-4' },
+          React.createElement('label', { className: 'flex items-center gap-2 font-medium' },
+            React.createElement('input', { type: 'checkbox', checked: val('booking_settings')?.require_credit_card ?? false,
+              onChange: e => saveSetting('booking_settings', { ...val('booking_settings'), require_credit_card: e.target.checked })
+            }), '\uD83D\uDCB3 Require credit card for bookings'
+          ),
+          React.createElement('p', { className: 'text-xs text-gray-500 mt-1 ml-6' },
+            'When enabled, the AI will ask callers for a credit card number to hold their tee time. Only the last 4 digits are stored — the full number is never saved.'
+          )
+        ),
+
+        // Landline Detection Info
+        React.createElement('div', { className: 'border-t pt-4 mt-4' },
+          React.createElement('div', { className: 'flex items-center gap-2 font-medium text-gray-700' },
+            '\uD83D\uDCDE Landline Detection'
+          ),
+          React.createElement('p', { className: 'text-xs text-gray-500 mt-1' },
+            'The system automatically detects when callers are calling from a home/landline phone. For landline callers, the AI will ask for a cell number to send text confirmations. If no cell number is provided, staff will need to call back to confirm. This uses Twilio Lookup (~$0.03/call, cached per customer).'
+          )
+        )
       ),
 
       // TEST MODE TAB

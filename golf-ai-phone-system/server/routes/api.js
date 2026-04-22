@@ -190,6 +190,120 @@ router.post('/bookings/:id/sms', async (req, res) => {
   }
 });
 
+// PUT /api/bookings/:id/no-show — Mark a booking as no-show
+router.put('/bookings/:id/no-show', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { no_show } = req.body;
+    const isNoShow = no_show !== false; // default to true
+
+    // Mark the booking
+    const result = await query(
+      'UPDATE booking_requests SET no_show = $1 WHERE id = $2 RETURNING *',
+      [isNoShow, parseInt(id)]
+    );
+    const booking = result.rows[0];
+    if (!booking) return res.status(404).json({ error: 'Booking not found' });
+
+    // Update the customer's no-show count
+    if (booking.customer_phone) {
+      if (isNoShow) {
+        await query(
+          'UPDATE customers SET no_show_count = COALESCE(no_show_count, 0) + 1 WHERE phone = $1',
+          [booking.customer_phone]
+        );
+      } else {
+        // Undoing a no-show — decrement (don't go below 0)
+        await query(
+          'UPDATE customers SET no_show_count = GREATEST(COALESCE(no_show_count, 0) - 1, 0) WHERE phone = $1',
+          [booking.customer_phone]
+        );
+      }
+    }
+
+    res.json(booking);
+  } catch (err) {
+    console.error('No-show update failed:', err.message);
+    res.status(500).json({ error: 'Failed to update no-show status' });
+  }
+});
+
+// POST /api/reminders/send — Manually trigger day-before reminders
+router.post('/reminders/send', async (req, res) => {
+  try {
+    const { sendDayBeforeReminders } = require('../services/scheduled-tasks');
+    const result = await sendDayBeforeReminders();
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to send reminders: ' + err.message });
+  }
+});
+
+// ============================================
+// ANALYTICS
+// ============================================
+
+// GET /api/analytics — Dashboard analytics data
+router.get('/analytics', async (req, res) => {
+  try {
+    // Calls per day (last 14 days)
+    const callsPerDay = await query(`
+      SELECT DATE(started_at AT TIME ZONE 'America/Toronto') as day,
+             COUNT(*) as calls
+      FROM call_logs
+      WHERE started_at >= NOW() - INTERVAL '14 days'
+      GROUP BY day ORDER BY day
+    `);
+
+    // Busiest hours (all time)
+    const busiestHours = await query(`
+      SELECT EXTRACT(HOUR FROM started_at AT TIME ZONE 'America/Toronto')::int as hour,
+             COUNT(*) as calls
+      FROM call_logs
+      GROUP BY hour ORDER BY hour
+    `);
+
+    // Booking conversion: calls with a booking vs total calls (last 30 days)
+    const totalCalls30d = await query(`
+      SELECT COUNT(*) as total FROM call_logs
+      WHERE started_at >= NOW() - INTERVAL '30 days'
+    `);
+    const callsWithBooking30d = await query(`
+      SELECT COUNT(DISTINCT cl.id) as total
+      FROM call_logs cl
+      INNER JOIN booking_requests br ON br.call_id = cl.id
+      WHERE cl.started_at >= NOW() - INTERVAL '30 days'
+    `);
+
+    // Average call duration (last 30 days, only completed calls)
+    const avgDuration = await query(`
+      SELECT ROUND(AVG(duration_seconds)) as avg_seconds
+      FROM call_logs
+      WHERE duration_seconds > 0
+        AND started_at >= NOW() - INTERVAL '30 days'
+    `);
+
+    // Total stats
+    const totalBookings = await query(`SELECT COUNT(*) as total FROM booking_requests`);
+    const confirmedBookings = await query(`SELECT COUNT(*) as total FROM booking_requests WHERE status = 'confirmed'`);
+    const noShows = await query(`SELECT COUNT(*) as total FROM booking_requests WHERE no_show = TRUE`);
+
+    res.json({
+      callsPerDay: callsPerDay.rows,
+      busiestHours: busiestHours.rows,
+      totalCalls30d: parseInt(totalCalls30d.rows[0]?.total || 0),
+      callsWithBooking30d: parseInt(callsWithBooking30d.rows[0]?.total || 0),
+      avgDurationSeconds: parseInt(avgDuration.rows[0]?.avg_seconds || 0),
+      totalBookings: parseInt(totalBookings.rows[0]?.total || 0),
+      confirmedBookings: parseInt(confirmedBookings.rows[0]?.total || 0),
+      totalNoShows: parseInt(noShows.rows[0]?.total || 0)
+    });
+  } catch (err) {
+    console.error('Analytics query failed:', err.message);
+    res.status(500).json({ error: 'Failed to load analytics' });
+  }
+});
+
 // ============================================
 // MODIFICATIONS
 // ============================================

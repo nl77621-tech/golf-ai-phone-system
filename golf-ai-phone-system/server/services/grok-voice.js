@@ -158,7 +158,8 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid, appU
     customerKnowledge: customer?.customer_knowledge || null,
     lineType: lineType,
     isLandline: lineType === 'landline',
-    alternatePhone: customer?.alternate_phone || null
+    alternatePhone: customer?.alternate_phone || null,
+    noShowCount: customer?.no_show_count || 0
   };
 
   // Update call log with customer ID

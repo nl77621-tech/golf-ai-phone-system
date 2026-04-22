@@ -62,6 +62,7 @@ This is a RETURNING caller. Their information:
 - Total calls: ${callerContext.callCount || 0}
 - They are already in our system. Do NOT ask for their name or number again.
 - IMPORTANT: Start the conversation by greeting them by name immediately. They're a returning customer — make them feel recognized and welcome right away.
+${callerContext.noShowCount > 0 ? `- ⚠️ NO-SHOW HISTORY: This caller has ${callerContext.noShowCount} previous no-show${callerContext.noShowCount > 1 ? 's' : ''}. ${callerContext.noShowCount >= 2 ? 'A credit card is REQUIRED to hold their booking, regardless of the global setting. Tell them: "Since we have some past no-shows on file, we do need a credit card to hold the tee time."' : 'Note this internally but do not mention it to the caller unless credit card is required.'}` : ''}
 ${callerContext.customerKnowledge ? `
 ### WHAT WE KNOW ABOUT THIS CALLER (use naturally, don't read it all out):
 ${callerContext.customerKnowledge}

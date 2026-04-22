@@ -209,6 +209,10 @@ async function initializeDatabaseIfNeeded() {
         VALUES ('booking_settings', '{"require_credit_card": false}', 'Booking behavior settings (credit card requirement, etc.)')
         ON CONFLICT (key) DO NOTHING
       `);
+      // Day-before reminders + no-show tracking
+      await client.query(`ALTER TABLE booking_requests ADD COLUMN IF NOT EXISTS reminder_sent BOOLEAN DEFAULT FALSE`);
+      await client.query(`ALTER TABLE booking_requests ADD COLUMN IF NOT EXISTS no_show BOOLEAN DEFAULT FALSE`);
+      await client.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS no_show_count INTEGER DEFAULT 0`);
       console.log('✅ Migrations applied');
     } catch (migErr) {
       console.warn('⚠️  Migration warning:', migErr.message);
@@ -241,8 +245,13 @@ async function startServer() {
     console.log(`🔌 WebSocket: /twilio/media-stream`);
     console.log(`🎛️  Command Center: http://localhost:${PORT}`);
     console.log(`📡 API: /api/*`);
+    console.log(`⏰ Reminder scheduler: active (6 PM ET daily)`);
     console.log('============================================');
     console.log('');
+
+    // Start the day-before reminder scheduler
+    const { startReminderScheduler } = require('./services/scheduled-tasks');
+    startReminderScheduler();
   });
 }
 

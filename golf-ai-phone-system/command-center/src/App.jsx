@@ -140,12 +140,19 @@ function Sidebar({ currentPage, onNavigate, onLogout }) {
 // ============================================
 function DashboardPage() {
   const [data, setData] = useState(null);
+  const [analytics, setAnalytics] = useState(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    api('/api/dashboard').then(setData).catch(console.error).finally(() => setLoading(false));
+    Promise.all([
+      api('/api/dashboard'),
+      api('/api/analytics').catch(() => null)
+    ]).then(([d, a]) => { setData(d); setAnalytics(a); })
+      .catch(console.error)
+      .finally(() => setLoading(false));
     const interval = setInterval(() => {
       api('/api/dashboard').then(setData).catch(console.error);
+      api('/api/analytics').then(setAnalytics).catch(() => {});
     }, 30000);
     return () => clearInterval(interval);
   }, []);
@@ -159,6 +166,47 @@ function DashboardPage() {
     { label: 'Total Customers', value: data?.totalCustomers || 0, color: 'bg-green-50 text-green-700' }
   ];
 
+  // Analytics helper: format hour as 12h
+  const formatHour = (h) => {
+    if (h === 0) return '12 AM';
+    if (h < 12) return `${h} AM`;
+    if (h === 12) return '12 PM';
+    return `${h - 12} PM`;
+  };
+
+  // Analytics helper: format date label
+  const formatDay = (dateStr) => {
+    const d = new Date(dateStr + 'T12:00:00');
+    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  };
+
+  // Bar chart helper (CSS-based)
+  const barChart = (items, labelFn, valueFn, color) => {
+    const maxVal = Math.max(...items.map(valueFn), 1);
+    return React.createElement('div', { className: 'space-y-1' },
+      items.map((item, i) =>
+        React.createElement('div', { key: i, className: 'flex items-center gap-2 text-xs' },
+          React.createElement('div', { className: 'w-16 text-right text-gray-500 flex-shrink-0' }, labelFn(item)),
+          React.createElement('div', { className: 'flex-1 bg-gray-100 rounded-full h-5 overflow-hidden' },
+            React.createElement('div', {
+              className: `${color} h-full rounded-full flex items-center justify-end pr-2 text-white font-medium`,
+              style: { width: `${Math.max((valueFn(item) / maxVal) * 100, valueFn(item) > 0 ? 8 : 0)}%`, minWidth: valueFn(item) > 0 ? '28px' : '0' }
+            }, valueFn(item) > 0 ? valueFn(item) : '')
+          )
+        )
+      )
+    );
+  };
+
+  // Conversion rate
+  const conversionRate = analytics && analytics.totalCalls30d > 0
+    ? Math.round((analytics.callsWithBooking30d / analytics.totalCalls30d) * 100)
+    : 0;
+
+  // Average duration formatted
+  const avgDur = analytics?.avgDurationSeconds || 0;
+  const avgDurFormatted = avgDur > 0 ? `${Math.floor(avgDur / 60)}:${String(avgDur % 60).padStart(2, '0')}` : '--';
+
   return React.createElement('div', null,
     React.createElement('h1', { className: 'text-2xl font-bold text-gray-800 mb-6' }, 'Dashboard'),
     React.createElement('div', { className: 'grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-8' },
@@ -169,6 +217,80 @@ function DashboardPage() {
         )
       )
     ),
+
+    // Call Analytics Section
+    analytics && React.createElement('div', { className: 'grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8' },
+
+      // Calls per Day (14-day trend)
+      React.createElement('div', { className: 'bg-white rounded-xl shadow-sm border p-6' },
+        React.createElement('h2', { className: 'text-lg font-semibold text-gray-800 mb-4' }, '\uD83D\uDCC8 Calls Per Day'),
+        (analytics.callsPerDay || []).length > 0
+          ? barChart(analytics.callsPerDay, r => formatDay(r.day), r => parseInt(r.calls), 'bg-blue-500')
+          : React.createElement('p', { className: 'text-gray-400 text-sm' }, 'No call data yet')
+      ),
+
+      // Busiest Hours
+      React.createElement('div', { className: 'bg-white rounded-xl shadow-sm border p-6' },
+        React.createElement('h2', { className: 'text-lg font-semibold text-gray-800 mb-4' }, '\u23F0 Busiest Hours'),
+        (analytics.busiestHours || []).length > 0
+          ? barChart(
+              analytics.busiestHours.filter(r => parseInt(r.calls) > 0),
+              r => formatHour(parseInt(r.hour)),
+              r => parseInt(r.calls),
+              'bg-purple-500'
+            )
+          : React.createElement('p', { className: 'text-gray-400 text-sm' }, 'No call data yet')
+      ),
+
+      // Booking Stats
+      React.createElement('div', { className: 'bg-white rounded-xl shadow-sm border p-6' },
+        React.createElement('h2', { className: 'text-lg font-semibold text-gray-800 mb-4' }, '\uD83D\uDCCB Booking Stats'),
+        React.createElement('div', { className: 'grid grid-cols-2 gap-4' },
+          React.createElement('div', { className: 'bg-blue-50 rounded-lg p-4 text-center' },
+            React.createElement('div', { className: 'text-2xl font-bold text-blue-700' }, analytics.totalBookings || 0),
+            React.createElement('div', { className: 'text-xs text-blue-600 mt-1' }, 'Total Bookings')
+          ),
+          React.createElement('div', { className: 'bg-green-50 rounded-lg p-4 text-center' },
+            React.createElement('div', { className: 'text-2xl font-bold text-green-700' }, analytics.confirmedBookings || 0),
+            React.createElement('div', { className: 'text-xs text-green-600 mt-1' }, 'Confirmed')
+          ),
+          React.createElement('div', { className: 'bg-red-50 rounded-lg p-4 text-center' },
+            React.createElement('div', { className: 'text-2xl font-bold text-red-700' }, analytics.totalNoShows || 0),
+            React.createElement('div', { className: 'text-xs text-red-600 mt-1' }, 'No-Shows')
+          ),
+          React.createElement('div', { className: 'bg-indigo-50 rounded-lg p-4 text-center' },
+            React.createElement('div', { className: 'text-2xl font-bold text-indigo-700' }, `${conversionRate}%`),
+            React.createElement('div', { className: 'text-xs text-indigo-600 mt-1' }, 'Conversion Rate')
+          )
+        )
+      ),
+
+      // Call Performance
+      React.createElement('div', { className: 'bg-white rounded-xl shadow-sm border p-6' },
+        React.createElement('h2', { className: 'text-lg font-semibold text-gray-800 mb-4' }, '\uD83D\uDCDE Call Performance'),
+        React.createElement('div', { className: 'grid grid-cols-2 gap-4' },
+          React.createElement('div', { className: 'bg-gray-50 rounded-lg p-4 text-center' },
+            React.createElement('div', { className: 'text-2xl font-bold text-gray-700' }, analytics.totalCalls30d || 0),
+            React.createElement('div', { className: 'text-xs text-gray-500 mt-1' }, 'Calls (30 days)')
+          ),
+          React.createElement('div', { className: 'bg-gray-50 rounded-lg p-4 text-center' },
+            React.createElement('div', { className: 'text-2xl font-bold text-gray-700' }, avgDurFormatted),
+            React.createElement('div', { className: 'text-xs text-gray-500 mt-1' }, 'Avg Duration')
+          ),
+          React.createElement('div', { className: 'bg-gray-50 rounded-lg p-4 text-center' },
+            React.createElement('div', { className: 'text-2xl font-bold text-gray-700' }, analytics.callsWithBooking30d || 0),
+            React.createElement('div', { className: 'text-xs text-gray-500 mt-1' }, 'Resulted in Booking')
+          ),
+          React.createElement('div', { className: 'bg-gray-50 rounded-lg p-4 text-center' },
+            React.createElement('div', { className: 'text-2xl font-bold text-gray-700' },
+              analytics.totalCalls30d > 0 ? Math.round(analytics.totalCalls30d / 30) : 0
+            ),
+            React.createElement('div', { className: 'text-xs text-gray-500 mt-1' }, 'Avg Calls/Day')
+          )
+        )
+      )
+    ),
+
     React.createElement('div', { className: 'bg-white rounded-xl shadow-sm border p-6' },
       React.createElement('h2', { className: 'text-lg font-semibold text-gray-800 mb-4' }, 'Recent Calls'),
       React.createElement('div', { className: 'overflow-x-auto' },
@@ -313,6 +435,13 @@ function BookingsPage() {
     } catch (err) { alert('Failed: ' + err.message); }
   };
 
+  const markNoShow = async (id, noShow) => {
+    try {
+      await api(`/api/bookings/${id}/no-show`, { method: 'PUT', body: JSON.stringify({ no_show: noShow }) });
+      loadData();
+    } catch (err) { alert('Failed: ' + err.message); }
+  };
+
   const statusColors = { pending: 'bg-yellow-100 text-yellow-800', confirmed: 'bg-green-100 text-green-800', rejected: 'bg-red-100 text-red-800', cancelled: 'bg-gray-100 text-gray-800' };
 
   return React.createElement('div', null,
@@ -371,7 +500,8 @@ function BookingsPage() {
                     React.createElement('div', { className: 'flex-1' },
                       React.createElement('div', { className: 'flex items-center gap-3' },
                         React.createElement('span', { className: 'font-semibold' }, b.customer_name || 'Unknown'),
-                        React.createElement('span', { className: `px-2 py-0.5 rounded-full text-xs ${statusColors[b.status] || ''}` }, b.status)
+                        React.createElement('span', { className: `px-2 py-0.5 rounded-full text-xs ${statusColors[b.status] || ''}` }, b.status),
+                        b.no_show && React.createElement('span', { className: 'px-2 py-0.5 rounded-full text-xs bg-red-100 text-red-800 font-medium' }, 'NO-SHOW')
                       ),
                       React.createElement('div', { className: 'text-sm text-gray-600 font-medium mt-1' },
                         formatBookingDateTime(b.requested_date, b.requested_time)
@@ -401,6 +531,17 @@ function BookingsPage() {
                         onClick: () => replyOpenId === b.id ? setReplyOpenId(null) : openReply(b),
                         className: 'bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-medium'
                       }, '\uD83D\uDCAC Reply')
+                    ),
+                    b.status === 'confirmed' && React.createElement('div', { className: 'flex gap-2 ml-4' },
+                      !b.no_show
+                        ? React.createElement('button', {
+                            onClick: () => { if (confirm(`Mark ${b.customer_name} as no-show?`)) markNoShow(b.id, true); },
+                            className: 'bg-orange-500 hover:bg-orange-600 text-white px-3 py-1.5 rounded-lg text-sm font-medium'
+                          }, 'No-Show')
+                        : React.createElement('button', {
+                            onClick: () => markNoShow(b.id, false),
+                            className: 'bg-gray-400 hover:bg-gray-500 text-white px-3 py-1.5 rounded-lg text-sm font-medium'
+                          }, 'Undo No-Show')
                     )
                   ),
                   // Inline reply panel — expands when Reply is clicked
@@ -1359,6 +1500,16 @@ function SettingsPage() {
             ),
             React.createElement('p', { className: 'text-xs text-gray-500 mt-1 ml-6' },
               'Text callers when their tee time is booked, confirmed, or cancelled. Customers are told to call back at 905 655 6300 if plans change. ~$0.01 per booking.'
+            )
+          ),
+          React.createElement('div', { className: 'border-t pt-3 mt-2' },
+            React.createElement('label', { className: 'flex items-center gap-2 font-medium' },
+              React.createElement('input', { type: 'checkbox', checked: val('notifications')?.reminder_sms_enabled ?? false,
+                onChange: e => saveSetting('notifications', { ...val('notifications'), reminder_sms_enabled: e.target.checked })
+              }), '\u23F0 Send day-before reminder texts'
+            ),
+            React.createElement('p', { className: 'text-xs text-gray-500 mt-1 ml-6' },
+              'Automatically text customers at 6 PM the evening before their tee time with a friendly reminder. Helps reduce no-shows.'
             )
           )
         )

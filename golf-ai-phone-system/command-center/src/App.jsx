@@ -176,8 +176,14 @@ function DashboardPage() {
 
   // Analytics helper: format date label
   const formatDay = (dateStr) => {
-    const d = new Date(dateStr + 'T12:00:00');
-    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    if (!dateStr) return '?';
+    // PostgreSQL returns dates as ISO timestamps (e.g. "2026-04-22T04:00:00.000Z")
+    // or as "YYYY-MM-DD". Extract just the date part either way.
+    const dateOnly = String(dateStr).split('T')[0];
+    const parts = dateOnly.split('-');
+    if (parts.length !== 3) return String(dateStr).slice(0, 10);
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    return `${months[parseInt(parts[1], 10) - 1]} ${parseInt(parts[2], 10)}`;
   };
 
   // Bar chart helper (CSS-based)

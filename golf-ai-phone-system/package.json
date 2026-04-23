@@ -5,6 +5,7 @@
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",
+    "prestart": "node server/db/init.js",
     "dev": "node --watch server/index.js",
     "db:init": "node server/db/init.js",
     "db:seed": "node server/db/seed.js",

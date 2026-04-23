@@ -79,8 +79,40 @@ async function applyMigrations(client) {
   }
 }
 
+/**
+ * Acquire a pool client with retry/backoff.
+ *
+ * On Railway (and any container platform) the app process can boot
+ * before Postgres is accepting connections. A single failed connect
+ * would crash `npm prestart`, fail the deploy, and (thanks to Railway's
+ * atomic deploys) keep the previous version active — safe, but noisy.
+ * To avoid spurious failed deploys on cold starts we retry for ~30s.
+ */
+async function connectWithRetry(maxAttempts = 15, delayMs = 2000) {
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const client = await pool.connect();
+      if (attempt > 1) {
+        console.log(`✅ Postgres reachable on attempt ${attempt}`);
+      }
+      return client;
+    } catch (err) {
+      lastErr = err;
+      console.warn(
+        `⏳ Postgres not ready (attempt ${attempt}/${maxAttempts}): ${err.message}`
+      );
+      if (attempt < maxAttempts) {
+        await new Promise(r => setTimeout(r, delayMs));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 async function init() {
-  const client = await pool.connect();
+  console.log('🚀 Running database initialization (prestart hook)...');
+  const client = await connectWithRetry();
   try {
     await applySchema(client);
     await applyMigrations(client);

@@ -29,6 +29,19 @@ const { pool } = require('./config/database');
 const app = express();
 const server = http.createServer(app);
 
+// Railway terminates TLS at its edge proxy and forwards to the container over
+// plain HTTP, which means `req.protocol` reads as 'http' unless we teach
+// Express to honour X-Forwarded-Proto. twilio.webhook({ validate: true }) in
+// routes/twilio.js rebuilds the request URL as
+//   `${req.protocol}://${req.get('host')}${req.originalUrl}`
+// to verify the X-Twilio-Signature header. Without trust-proxy, that URL is
+// `http://...` while Twilio signed `https://...`, every inbound webhook gets
+// a 403, and Twilio plays "we are sorry, an application error has occurred"
+// to the caller. Trusting the single Railway hop makes req.protocol return
+// 'https' and restores webhook auth. See incident 2026-04-23 (rollback of
+// d185de8) and CLAUDE.md §3.3.
+app.set('trust proxy', 1);
+
 // ============================================
 // Middleware
 // ============================================

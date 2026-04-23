@@ -333,7 +333,7 @@ BEGIN
             JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
             WHERE c.conname = pk_name
             GROUP BY c.conname
-            HAVING array_agg(a.attname ORDER BY a.attname) = ARRAY['key']
+            HAVING array_agg(a.attname::text ORDER BY a.attname::text) = ARRAY['key']
         ) THEN
             EXECUTE format('ALTER TABLE settings DROP CONSTRAINT %I', pk_name);
         END IF;
@@ -360,7 +360,7 @@ BEGIN
         WHERE c.conrelid = 'customers'::regclass
           AND c.contype = 'u'
         GROUP BY c.conname
-        HAVING array_agg(a.attname ORDER BY a.attname) = ARRAY['phone']
+        HAVING array_agg(a.attname::text ORDER BY a.attname::text) = ARRAY['phone']
     LOOP
         EXECUTE format('ALTER TABLE customers DROP CONSTRAINT %I', cons_name);
     END LOOP;

@@ -175,6 +175,30 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_user_invites_unique_open
     WHERE accepted_at IS NULL;
 
 -- ============================================
+-- Self-heal legacy DBs (ADD COLUMN IF NOT EXISTS business_id)
+-- ============================================
+-- On a legacy (single-tenant Valleymede) database the tables below
+-- already exist WITHOUT a business_id column. Their CREATE TABLE IF
+-- NOT EXISTS statements later in this file are no-ops on those rows,
+-- but the CREATE INDEX ... ON t(business_id, ...) statements that
+-- follow would fail with `column "business_id" does not exist`.
+--
+-- Migration 001_multi_tenant.sql ALSO adds these columns — but
+-- schema.sql runs BEFORE migrations (see server/db/init.js order).
+-- So we pre-emptively add the column here as a nullable INTEGER.
+-- Migration 001 then backfills to 1 and enforces NOT NULL + FK.
+--
+-- On a fresh DB these ALTERs are no-ops: the tables don't exist yet
+-- (IF EXISTS guards), and once the CREATE TABLE below runs it
+-- produces a NOT NULL business_id column with the proper FK.
+ALTER TABLE IF EXISTS settings              ADD COLUMN IF NOT EXISTS business_id INTEGER;
+ALTER TABLE IF EXISTS customers             ADD COLUMN IF NOT EXISTS business_id INTEGER;
+ALTER TABLE IF EXISTS booking_requests      ADD COLUMN IF NOT EXISTS business_id INTEGER;
+ALTER TABLE IF EXISTS modification_requests ADD COLUMN IF NOT EXISTS business_id INTEGER;
+ALTER TABLE IF EXISTS call_logs             ADD COLUMN IF NOT EXISTS business_id INTEGER;
+ALTER TABLE IF EXISTS greetings             ADD COLUMN IF NOT EXISTS business_id INTEGER;
+
+-- ============================================
 -- Settings (key/value per tenant)
 -- ============================================
 CREATE TABLE IF NOT EXISTS settings (

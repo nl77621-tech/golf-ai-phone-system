@@ -1,10 +1,55 @@
-# Valleymede Columbus Golf Course — AI Phone Answering System
+# Golf AI Phone System — Multi-Tenant Platform
 
-## Architecture Document v1.0
+## Architecture Document v2.0 (post Phase 6)
+
+> v1.0 of this document described a single-tenant system for Valleymede Columbus Golf Course. Phases 1–6 turned that into a multi-tenant SaaS platform where Valleymede is simply the first tenant (`business_id = 1`). The original single-tenant sections below remain accurate for a given tenant; the platform-level sections added in §1a–§1c describe how many tenants share the same install.
 
 ---
 
 ## 1. System Overview
+
+An AI-powered phone answering **platform** that any small business (golf courses first, then other verticals) can onboard in under five minutes. Each tenant gets its own Twilio number(s), settings, greetings, bookings, customers, users, and analytics. The first tenant on the platform is Valleymede Columbus Golf Course; additional tenants are provisioned via the Super Admin onboarding wizard (Phases 3–4).
+
+The system answers inbound calls using xAI's Grok voice model, handles bookings, provides business-specific information (pricing, hours, policies, tournaments, amenities), and falls back to human staff only as a last resort.
+
+### 1a. Tenancy model
+
+- **Business** (`businesses` table) — one row per tenant. Holds `slug`, `name`, `twilio_phone_number` (legacy denormalized primary DID), `transfer_number`, `timezone`, branding (`primary_color`, `logo_url`), `plan`, `status` (`trial | active | inactive`), and `setup_complete`.
+- **Business phone numbers** (`business_phone_numbers` table, Phase 5) — authoritative routing table. Each tenant can own multiple DIDs with `is_primary` / `status` flags. Inbound routing resolves `To` → row in this table → tenant. The `businesses.twilio_phone_number` column is kept as a denormalized copy of the primary row for backwards compatibility; see "Inbound routing" below.
+- **Users** — two disjoint tables:
+  - `super_admins` — platform operators. No `business_id`. Provisioned via `/auth/register-super-admin` (bootstrap, one-shot) or invite from another super admin.
+  - `business_users` — tenant users. Every row carries `business_id`; roles are `business_admin` or `staff` (legacy `owner` role is normalized to `business_admin` by the auth middleware).
+- **Invites** (`user_invites` table) — magic-link signup. Each invite binds `(business_id, email, role)` with a single-use token and an `expires_at`. Accepted invites create the user and mark the invite consumed.
+- **Settings / greetings / customers / call_logs / booking_requests / audit_log** — every tenant-scoped table carries `business_id`. Uniqueness that was global (customer phone, setting key) becomes composite `(business_id, …)`.
+
+### 1b. Two audiences
+
+- **Super Admin**: onboards new tenants, manages billing (Phase 7), monitors the fleet, and can impersonate any tenant for support. Routes under `/api/super/*` + `requireSuperAdmin` middleware.
+- **Business user**: logs in, sees only their own tenant's bookings, calls, customers, and settings. Routes under `/api/*` + `attachTenantFromAuth` + per-route `business_id` scoping.
+
+Super admin impersonation is explicit: a super admin token on `/api/*` must include an `X-Business-Id` header to pick a tenant — no ambient tenant means a 400 rather than accidental cross-tenant access.
+
+### 1c. Inbound call routing
+
+1. Twilio POSTs the webhook with `To = +1…` (the tenant's DID).
+2. `middleware/tenant.js` looks up the number in this order:
+   1. `business_phone_numbers` (the primary source of truth for every tenant that has been migrated).
+   2. `businesses.twilio_phone_number` (legacy denorm column — kept so a tenant created before Phase 5 that hasn't been backfilled still routes).
+   3. Single-tenant bootstrap → Valleymede (business_id = 1). This exists only so the first tenant's DID still routes during the cutover; every production log line tagged `PHONE_ROUTE source=single_tenant_bootstrap` is a hint that an explicit `business_phone_numbers` row is still needed.
+3. The resolved `business` is attached to the request with a non-enumerable `_phoneSource` marker (`business_phone_numbers | legacy_denorm | single_tenant_bootstrap`) for audit traceability.
+4. If no row matches, the call is rejected with a generic message. There is no implicit fallback to Valleymede for unknown numbers.
+
+### 1d. Audit log (Phase 6)
+
+Every meaningful mutation flows through `server/services/audit-log.js → logEvent`:
+
+- Super admin: `business.created`, `business.updated`, `invite.created`, `phone.added`, `phone.updated`, `phone.deleted`.
+- Tenant-side: `setting.updated`, `greeting.created`, `greeting.deleted`, `phone.added`, `phone.updated`, `phone.deleted`.
+- Auth: `user.login`, `invite.created`, `invite.accepted`.
+
+Rows carry `business_id` (nullable for platform events), polymorphic `user_id` + `user_type` discriminator, denormalized `actor_email`, polymorphic `target_id` (stringified), JSONB `meta` capped at 16 KB, `ip` + `user_agent`, and `created_at`. Reader endpoint is `GET /api/super/audit-log` with `business_id` / `action` / keyset pagination. Analytics endpoint is `GET /api/super/analytics`.
+
+### 1e. Original single-tenant overview (Valleymede, preserved)
 
 An AI-powered phone answering system for Valleymede Columbus Golf Course that handles inbound calls using xAI's Grok voice model. The system answers on the course's existing Bell Canada phone number, handles bookings, provides course information, and falls back to human staff only as a last resort.
 

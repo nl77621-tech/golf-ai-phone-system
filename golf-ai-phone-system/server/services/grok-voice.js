@@ -1,32 +1,41 @@
 /**
- * Grok Voice API Bridge
- * Connects Twilio media streams to xAI Grok Real-time Voice API
+ * Grok Voice API Bridge — tenant-scoped.
+ *
+ * Every live call is owned by exactly one tenant (resolved from the called
+ * DID in the Twilio webhook middleware). That `businessId` is threaded
+ * through this file so every DB write, settings lookup, and tool call is
+ * scoped to that tenant:
+ *
+ *   handleMediaStream(twilioWs, businessId, callerPhone, callSid, streamSid, appUrl)
  *
  * Architecture:
  *   Twilio <--WebSocket (audio)--> This Bridge <--WebSocket--> Grok Voice API
  *
- * Audio format: Twilio sends/receives mulaw 8kHz mono
- * Grok accepts pcm16/24kHz — we handle conversion
+ * Audio format: Twilio sends/receives mulaw 8kHz mono. Grok accepts pcm16/24kHz.
  */
 const WebSocket = require('ws');
 const { buildSystemPrompt } = require('./system-prompt');
-const { lookupByPhone, registerCall, updateCustomer } = require('./caller-lookup');
-const { createBookingRequest, createModificationRequest } = require('./booking-manager');
-const { getLineType, isSmsCapable } = require('./phone-lookup');
+const { lookupByPhone, lookupByName, registerCall, updateCustomer } = require('./caller-lookup');
+const {
+  createBookingRequest,
+  createModificationRequest,
+  getConfirmedBookingsByPhone,
+  getBookingById
+} = require('./booking-manager');
+const { getLineType } = require('./phone-lookup');
 const { getCurrentWeather, getForecast } = require('./weather');
-const { query, getSetting } = require('../config/database');
+const { query, getSetting, getBusinessById } = require('../config/database');
+const { requireBusinessId } = require('../context/tenant-context');
 const teeon = require('./teeon-automation');
 require('dotenv').config();
 
 const GROK_REALTIME_URL = 'wss://api.x.ai/v1/realtime';
-const GROK_MODEL = 'grok-4.20-latest';  // Latest Grok 4.20 (April 2026 release)
+const GROK_MODEL = 'grok-4.20-latest';
 
-/**
- * Convert linear 16-bit PCM sample to G.711 μ-law byte (ITU-T G.711 standard)
- * Handles full 16-bit range (-32768 to +32767)
- */
+// ─── Audio conversion ────────────────────────────────────────────────────────
+
 function linearToMulaw(sample) {
-  const MULAW_BIAS = 0x84; // 132
+  const MULAW_BIAS = 0x84;
   const MULAW_CLIP = 32635;
 
   let sign = 0;
@@ -37,7 +46,6 @@ function linearToMulaw(sample) {
   if (sample > MULAW_CLIP) sample = MULAW_CLIP;
   sample += MULAW_BIAS;
 
-  // Find exponent (highest set bit position above bit 6)
   let exponent = 7;
   let expMask = 0x4000;
   for (; exponent > 0; exponent--) {
@@ -48,9 +56,6 @@ function linearToMulaw(sample) {
   return (~(sign | (exponent << 4) | mantissa)) & 0xFF;
 }
 
-/**
- * Convert G.711 μ-law byte to linear 16-bit PCM sample
- */
 function mulawToLinear(byte) {
   byte = ~byte & 0xFF;
   const sign = byte & 0x80;
@@ -61,16 +66,11 @@ function mulawToLinear(byte) {
   return sign ? -sample : sample;
 }
 
-/**
- * Convert PCM16 24kHz buffer → G.711 μ-law 8kHz buffer
- * Uses 3-sample averaging (box filter) to reduce aliasing before downsampling
- */
 function pcm16ToMulaw8k(inputBuf) {
   const numSamples = Math.floor(inputBuf.length / 2);
   const outputSamples = Math.floor(numSamples / 3);
   const output = Buffer.alloc(outputSamples);
   for (let i = 0; i < outputSamples; i++) {
-    // Average 3 consecutive samples (simple low-pass) before encoding
     let sum = 0;
     let count = 0;
     for (let j = 0; j < 3; j++) {
@@ -85,16 +85,11 @@ function pcm16ToMulaw8k(inputBuf) {
   return output;
 }
 
-/**
- * Convert G.711 μ-law 8kHz buffer → PCM16 24kHz buffer
- * Uses linear interpolation for smooth upsampling (3x)
- */
 function mulaw8kToPcm16(inputBuf) {
   const output = Buffer.alloc(inputBuf.length * 3 * 2);
   for (let i = 0; i < inputBuf.length; i++) {
     const s0 = mulawToLinear(inputBuf[i]);
     const s1 = (i + 1 < inputBuf.length) ? mulawToLinear(inputBuf[i + 1]) : s0;
-    // Linearly interpolate 3 sub-samples between s0 and s1
     for (let j = 0; j < 3; j++) {
       const interp = Math.round(s0 + (j / 3) * (s1 - s0));
       output.writeInt16LE(interp, (i * 3 + j) * 2);
@@ -103,47 +98,87 @@ function mulaw8kToPcm16(inputBuf) {
   return output;
 }
 
-/**
- * Handle an incoming Twilio media stream WebSocket connection
- */
-async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid, appUrl) {
-  console.log(`[${callSid}] New call from ${callerPhone}`);
+// ─── Per-tenant Tee-On config resolver ───────────────────────────────────────
 
-  // Create call log entry
+/**
+ * Pull the tenant's Tee-On course configuration from either:
+ *   - a `teeon` setting JSON blob { course_code, course_group_id }
+ *   - columns on the `businesses` row (teeon_course_code, teeon_course_group_id)
+ * Returns null to let teeon-automation fall back to Valleymede defaults.
+ */
+async function getTeeOnConfigForBusiness(businessId) {
+  try {
+    const fromSetting = await getSetting(businessId, 'teeon').catch(() => null);
+    if (fromSetting?.course_code) {
+      return {
+        courseCode: fromSetting.course_code,
+        courseGroupId: fromSetting.course_group_id
+      };
+    }
+    const business = await getBusinessById(businessId).catch(() => null);
+    if (business?.teeon_course_code) {
+      return {
+        courseCode: business.teeon_course_code,
+        courseGroupId: business.teeon_course_group_id
+      };
+    }
+  } catch (err) {
+    console.warn(`[tenant:${businessId}] getTeeOnConfigForBusiness error:`, err.message);
+  }
+  return null;
+}
+
+// ─── Media stream handler ────────────────────────────────────────────────────
+
+/**
+ * Handle an incoming Twilio media stream WebSocket connection.
+ *
+ * @param {WebSocket} twilioWs
+ * @param {number}    businessId  — tenant id (required)
+ * @param {string}    callerPhone
+ * @param {string}    callSid
+ * @param {string}    streamSid
+ * @param {string}    appUrl
+ */
+async function handleMediaStream(twilioWs, businessId, callerPhone, callSid, streamSid, appUrl) {
+  requireBusinessId(businessId, 'handleMediaStream');
+  console.log(`[tenant:${businessId}][${callSid}] New call from ${callerPhone}`);
+
+  // Create call log entry (business-scoped)
   let callLogId = null;
   try {
     const res = await query(
-      `INSERT INTO call_logs (twilio_call_sid, caller_phone, started_at)
-       VALUES ($1, $2, NOW()) RETURNING id`,
-      [callSid, callerPhone]
+      `INSERT INTO call_logs (business_id, twilio_call_sid, caller_phone, started_at)
+       VALUES ($1, $2, $3, NOW()) RETURNING id`,
+      [businessId, callSid, callerPhone]
     );
     callLogId = res.rows[0].id;
   } catch (err) {
-    console.error('Failed to create call log:', err.message);
+    console.error(`[tenant:${businessId}][${callSid}] Failed to create call log:`, err.message);
   }
 
   // Detect anonymous/blocked caller ID
   const ANONYMOUS_NUMBERS = ['anonymous', 'blocked', 'unknown', '+266696687', '+86282452253'];
   const isAnonymous = !callerPhone || ANONYMOUS_NUMBERS.some(a => callerPhone.toLowerCase().includes(a));
 
-  // Look up caller (graceful fallback if DB unavailable)
+  // Look up/register caller scoped to this tenant
   let customer = null;
   let isNew = true;
   try {
-    const result = await registerCall(isAnonymous ? null : callerPhone);
+    const result = await registerCall(businessId, isAnonymous ? null : callerPhone);
     customer = result.customer;
     isNew = result.isNew;
   } catch (err) {
-    console.error('Failed to register call (DB unavailable, continuing):', err.message);
+    console.error(`[tenant:${businessId}][${callSid}] Failed to register call (DB unavailable, continuing):`, err.message);
   }
 
-  // Look up line type (mobile vs landline) — cached on customer record
+  // Look up line type — cache lives on the tenant's customer row
   let lineType = null;
   if (!isAnonymous && callerPhone) {
     try {
-      lineType = await getLineType(callerPhone, customer?.id);
+      lineType = await getLineType(businessId, callerPhone, customer?.id);
     } catch (err) {
-      console.warn('Phone lookup failed (continuing):', err.message);
+      console.warn(`[tenant:${businessId}][${callSid}] Phone lookup failed (continuing):`, err.message);
     }
   }
 
@@ -156,168 +191,83 @@ async function handleMediaStream(twilioWs, callerPhone, callSid, streamSid, appU
     callCount: customer?.call_count,
     customerId: customer?.id,
     customerKnowledge: customer?.customer_knowledge || null,
-    lineType: lineType,
+    lineType,
     isLandline: lineType === 'landline',
     alternatePhone: customer?.alternate_phone || null,
     noShowCount: customer?.no_show_count || 0
   };
 
-  // Update call log with customer ID
+  // Update call log with customer ID (business-scoped)
   if (callLogId && customer?.id) {
-    query('UPDATE call_logs SET customer_id = $1 WHERE id = $2', [customer.id, callLogId]).catch(() => {});
+    query(
+      'UPDATE call_logs SET customer_id = $1 WHERE id = $2 AND business_id = $3',
+      [customer.id, callLogId, businessId]
+    ).catch(() => {});
   }
 
-  // Get greeting — use per-customer custom greetings (random pick) if set, otherwise random from DB
-  let greeting = 'Thanks for calling Valleymede Columbus Golf Course! How can I help you today?';
+  // Load the business row — used for greeting + transfer copy fallback
+  const business = await getBusinessById(businessId).catch(() => null);
+  const businessName = business?.name || 'the Golf Course';
+
+  // Greeting — per-customer > tenant-DB > generic fallback
+  let greeting = `Thanks for calling ${businessName}! How can I help you today?`;
   try {
-    // Check for multiple custom greetings first (new system), then fall back to single custom_greeting (legacy)
     const greetings = customer?.custom_greetings;
     const hasCustomGreetings = Array.isArray(greetings) && greetings.filter(g => g && g.trim()).length > 0;
 
     if (hasCustomGreetings && callerContext.known) {
-      // Pick a random greeting from the customer's personalized list
       const validGreetings = greetings.filter(g => g && g.trim());
       const picked = validGreetings[Math.floor(Math.random() * validGreetings.length)];
       greeting = picked.replace(/{name}/g, callerContext.name || '');
-      console.log(`[${callLogId}] Using custom greeting ${validGreetings.indexOf(picked) + 1}/${validGreetings.length} for ${callerContext.name}`);
+      console.log(`[tenant:${businessId}][${callLogId}] Using custom greeting ${validGreetings.indexOf(picked) + 1}/${validGreetings.length} for ${callerContext.name}`);
     } else if (customer?.custom_greeting && callerContext.known) {
-      // Legacy: single custom greeting
       greeting = customer.custom_greeting.replace(/{name}/g, callerContext.name || '');
-      console.log(`[${callLogId}] Using legacy custom greeting for ${callerContext.name}`);
+      console.log(`[tenant:${businessId}][${callLogId}] Using legacy custom greeting for ${callerContext.name}`);
     } else {
-      greeting = await getRandomGreeting(callerContext.known, callerContext.name);
+      greeting = await getRandomGreeting(businessId, callerContext.known, callerContext.name, businessName);
     }
   } catch (err) {
-    console.error('Failed to get greeting (using default):', err.message);
+    console.error(`[tenant:${businessId}][${callLogId}] Failed to get greeting (using default):`, err.message);
   }
 
-  // Build the system prompt (with full fallback if DB unavailable)
+  // System prompt — tenant-scoped
   let systemPrompt = null;
   try {
-    systemPrompt = await buildSystemPrompt(callerContext);
+    systemPrompt = await buildSystemPrompt(businessId, callerContext);
   } catch (err) {
-    console.error('Failed to build system prompt (using hardcoded fallback):', err.message);
+    console.error(`[tenant:${businessId}][${callLogId}] Failed to build system prompt (using minimal fallback):`, err.message);
   }
   if (!systemPrompt) {
+    // Minimal fallback: no Valleymede-specific hardcodes, just enough to take
+    // a booking request. This fires only when the DB is unreachable.
     const now = new Date();
-    const dateStr = now.toLocaleDateString('en-US', { timeZone: 'America/Toronto', weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
-    const timeStr = now.toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', hour12: true });
+    const tz = business?.timezone || 'America/Toronto';
+    const dateStr = now.toLocaleDateString('en-US', { timeZone: tz, weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+    const timeStr = now.toLocaleTimeString('en-US', { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: true });
     const callerLine = callerContext.known && callerContext.name
       ? `This is a RETURNING caller named ${callerContext.name} (phone: ${callerContext.phone}). You do NOT need to collect their info again.`
       : callerContext.isAnonymous
-        ? `This caller has NO caller ID — their number is hidden. Early in the call, naturally ask for their name AND phone number so we can add them to our system. Say something like "Can I grab your name and best callback number?"`
-        : `This is a NEW caller (we have their phone: ${callerContext.phone} but not their name). Early in the conversation, naturally ask for their name. Say something like "Can I get your name?" — keep it casual.`;
+        ? `This caller has NO caller ID. Early in the call, naturally ask for their name AND phone number.`
+        : `This is a NEW caller (we have their phone: ${callerContext.phone} but not their name). Early in the conversation, naturally ask for their name.`;
 
-    systemPrompt = `IMPORTANT: Today's date is ${dateStr}. The current time is ${timeStr} Eastern Time. Use THIS date and year (2026) for everything — do NOT reference any other dates or years from your training data.
+    systemPrompt = `You are a friendly staff member answering the phone at ${businessName}. Today is ${dateStr}, current time ${timeStr} (${tz}).
 
-You are a friendly staff member answering the phone at Valleymede Columbus Golf Course. You love golf and genuinely enjoy helping people. You are a real person — never mention AI.
-
-## HOW TO SPEAK (this is critical — read carefully)
-You are on a PHONE CALL. Speak exactly like a real person would:
-
-- Use contractions always: "we're" not "we are", "it's" not "it is", "don't" not "do not"
-- Keep answers SHORT. One or two sentences, then pause for them to respond.
-- Never list things out loud unless specifically asked — say "we've got a few options, what works best for you?" instead of reading a whole list
-- Use natural fillers: "yeah", "sure", "absolutely", "oh great", "sounds good"
-- React naturally: if they say something nice, say "oh that's awesome!" — if they seem unsure, say "no worries, take your time"
-- Vary your responses — don't start every sentence the same way
-- Never say "Certainly!", "Of course!", "Great question!" — these sound robotic
-- Don't repeat what they just said back to them word for word
-- If quoting a price, just say it simply: "it's forty-eight bucks for 18 holes on the weekend, plus tax"
-- Speak in plain language — no formal or corporate-sounding phrases
-- When you need info from them, ask ONE question at a time, not three at once
-- Natural transitions: "so", "and", "okay so", "right", "got it"
-- NEVER say dates in numeric format like "2026-04-19". Say "Sunday, April nineteenth" or "tomorrow". Use YYYY-MM-DD ONLY inside tool calls, never out loud.
-
-## CURRENT DATE & TIME
-Today is ${dateStr}, current time: ${timeStr} Eastern.
-
-## COURSE INFORMATION
-- Name: Valleymede Columbus Golf Course
-- Address: 3622 Simcoe Street North, Oshawa, ON L1H 0R5
-- Phone: (905) 655-6300 | Toll-free: 1-866-717-0990
-- Email: info@valleymedecolumbusgolf.com
-- Website: valleymedecolumbusgolf.com
-- Online booking: https://www.tee-on.com/PubGolf/servlet/com.teeon.teesheet.servlets.golfersection.ComboLanding?CourseCode=COLU&FromCourseWebsite=true (click "Public Enter Here")
-- 18-hole British Links-style course on 150 acres, approximately 6,200 yards
-- Beautiful open meadows, mature trees, and long natural grass mounds. Ideal for all skill levels.
-- Directions: About 15 minutes north of Highway 401, near Highway 407, on Simcoe Street North in Oshawa
-- Signature holes: Hole 3 has a stunning island green; Hole 17 is an elevated 200-yard par 3 tee surrounded by water and bunkers
-
-## BUSINESS HOURS
-- Monday–Thursday: 7:00 AM – 7:00 PM
-- Friday: 6:30 AM – 7:30 PM
-- Saturday–Sunday: 6:00 AM – 7:30 PM
-
-## GREEN FEES (all prices + HST)
-Weekday (Mon–Thu):
-- Daytime (Open – 12:59 PM): $47.79 for 18 holes
-- Pre-Twilight (1:00–2:59 PM): $44.25 for 18 holes
-- Twilight (3:00 PM – Close): $39.82 for 18 holes, $30.97 for 9 holes
-
-Weekend/Holidays (Fri–Sun):
-- Daytime (Open – 2:59 PM): $57.52 for 18 holes
-- Twilight (3:00 PM – Close): $48.67 for 18 or 9 holes
-
-Cart Fees (per person):
-- 18 holes: $21.24 | Twilight: $12.39 | Pull cart: $5.31 | Single rider surcharge: $10.00
-
-## POLICIES
-- Minimum age: 10 years old
-- Max booking: 8 players (2 foursomes)
-- Max players per group: 4
-- Walk-ins: Limited availability, pre-booking strongly recommended
-- Cart drivers must have valid G2 license or higher, and sign a waiver
-- No outside alcoholic beverages — all alcohol purchased through clubhouse or beverage cart
-- Pull carts and club rentals: Limited, first-come first-served
-
-## MEMBERSHIPS
-- 2026 memberships are SOLD OUT
-- Waitlist available — email info@valleymedecolumbusgolf.com to join
-- Full Membership: $2,900 with HST | Senior Full Membership: $2,700 with HST
-- Benefits: Golf access 7 days/week. Power carts NOT included.
-
-## AMENITIES
-- Professional clubhouse, pro-shop, patio area
-- Chipping and putting greens
-- Fleet of new golf carts (2026)
-- Beverage cart service
-
-## TOURNAMENTS & GROUP OUTINGS
-- Capacity: 24 to 144 golfers
-- Services include: power carts, chipping/putting greens, registration table, licensed beverage cart, contest markers, patio seating
-- To inquire: provide contact name, phone, number of participants, preferred date, start time
-- Packages quoted individually
+## HOW TO SPEAK
+- Use contractions. Keep answers short. One or two sentences, then pause.
+- Never list things out loud unless asked. Ask one question at a time.
+- NEVER say dates in numeric format like "2026-04-19". Say "Sunday, April nineteenth" or "tomorrow". Use YYYY-MM-DD ONLY inside tool calls.
 
 ## CALLER CONTEXT
 ${callerLine}
 
 ## BOOKING RULES
-- CRITICAL: When the caller says "today", "tomorrow", "Sunday", "next Saturday", etc. — YOU figure out the YYYY-MM-DD date. NEVER ask the caller for a date in YYYY-MM-DD format. They are on the phone — speak naturally like a real person.
-- ⚠️ ALWAYS call check_tee_times with BOTH date AND party_size before saying anything about availability. NEVER say "fully booked" or "no times" without checking first. The tee sheet changes constantly.
-- Each tee time holds MAX 4 golfers. Some already have players, so the system filters by your party size automatically.
-- Tell them the available times naturally: "I've got 9 AM, 10:30, and 11 AM open on Saturday — any of those work?"
-- Once they pick a time, ONLY ask for their name and phone number — nothing else
-- AFTER collecting their name, ALWAYS use save_customer_info to save it so we remember them next time they call
-- ⚠️ CRITICAL: You MUST call the book_tee_time tool to create the booking. The booking DOES NOT EXIST until you call this tool. NEVER say "I've got you down" or "request submitted" WITHOUT actually calling book_tee_time first. If you skip the tool call, the booking will not be created and the customer will never get a confirmation text.
-- After booking succeeds: tell them it's a REQUEST only — NOT confirmed. They'll get a confirmation TEXT MESSAGE once staff approves it.
-- Flow: collect info → call book_tee_time → wait for result → THEN confirm to caller
-- Do NOT ask for email. Do NOT ask multiple questions at once. Keep it fast and friendly.
-
-## CONTACT COLLECTION (important)
-- Always get the caller's name before the call ends — use save_customer_info to save it
-- If caller has no caller ID, also ask for their phone number
-- Do this naturally: "Before I let you go, can I grab your name so we have it on file?"
-- Don't make it feel like a form — keep it friendly and brief
-
-## IMPORTANT
-- Be CONCISE on the phone. Don't read long lists unless asked.
-- When quoting prices, mention HST is extra.
-- NEVER make up information. If unsure, offer to take a message.
+- CRITICAL: Convert "today", "tomorrow", etc. yourself to YYYY-MM-DD before calling tools.
+- ALWAYS call check_tee_times with date AND party_size before saying anything about availability.
+- You MUST call the book_tee_time tool to create a booking — the booking does NOT exist until you call it.
+- After booking: tell them it's a REQUEST — staff will confirm by text.
 `;
   }
 
-  // Define tools for Grok
   const tools = buildToolDefinitions();
 
   // Connect to Grok Real-time Voice API
@@ -328,55 +278,46 @@ ${callerLine}
     }
   });
 
-  // Grok connection timeout — if not connected within 5s, close everything
   const grokConnectTimeout = setTimeout(() => {
     if (grokWs.readyState !== WebSocket.OPEN) {
-      console.error(`[${callSid}] Grok connection timeout — closing call`);
+      console.error(`[tenant:${businessId}][${callSid}] Grok connection timeout — closing call`);
       grokWs.close();
       if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
     }
   }, 5000);
 
-  // streamSid is passed in from index.js — it's known from the 'start' event
-  // We also update it if Twilio sends another 'start' event
   let conversationActive = true;
 
-  // Track state for call summary
   const callState = {
     startTime: Date.now(),
     transcriptParts: [],
     actions: []
   };
 
-  // ---- Grok WebSocket handlers ----
-  // Keepalive interval reference (set in grokWs 'open', cleared on close)
   let keepAlive = null;
 
   grokWs.on('open', () => {
-    console.log(`[${callSid}] Connected to Grok`);
+    console.log(`[tenant:${businessId}][${callSid}] Connected to Grok`);
     clearTimeout(grokConnectTimeout);
 
-    // Send a ping every 25s to prevent intermediate proxies from dropping the connection
     keepAlive = setInterval(() => {
       if (grokWs.readyState === WebSocket.OPEN) grokWs.ping();
     }, 25000);
 
-    // Send session configuration
-    // pcm16 — xAI doesn't honour g711_ulaw, always sends PCM. We convert.
     grokWs.send(JSON.stringify({
       type: 'session.update',
       session: {
         modalities: ['text', 'audio'],
         instructions: systemPrompt,
         voice: 'eve',
-        speed: 1.15,                 // slightly faster than normal — natural phone pace
+        speed: 1.15,
         input_audio_format: 'pcm16',
         output_audio_format: 'pcm16',
         turn_detection: {
           type: 'server_vad',
-          threshold: 0.30,            // slightly more sensitive — catches speech sooner for faster barge-in
-          prefix_padding_ms: 50,      // reduced from 100 — fires barge-in faster when caller speaks
-          silence_duration_ms: 300    // slightly longer — avoids cutting off callers mid-sentence
+          threshold: 0.30,
+          prefix_padding_ms: 50,
+          silence_duration_ms: 300
         },
         tools: tools,
         tool_choice: 'auto',
@@ -384,7 +325,6 @@ ${callerLine}
       }
     }));
 
-    // Send initial greeting as a conversation item
     const greetingInstruction = callerContext.known && callerContext.name
       ? `[System: A returning caller named ${callerContext.name} just called. Greet them IMMEDIATELY by name — start with their name right away, warm and personal like you recognize them. Use this greeting but make it sound natural and unscripted: "${greeting}". Do NOT sound like you are reading from a script. Do NOT ask for their name.]`
       : `[System: Someone just called. Answer the phone naturally like a real person would — warm, casual, friendly. Use this greeting but make it sound natural and unscripted: "${greeting}". Do NOT sound like you are reading from a script.]`;
@@ -400,7 +340,6 @@ ${callerLine}
       }
     }));
 
-    // Trigger response
     grokWs.send(JSON.stringify({ type: 'response.create' }));
   });
 
@@ -408,49 +347,39 @@ ${callerLine}
     try {
       const event = JSON.parse(data.toString());
 
-      // Log all Grok events for debugging
       if (event.type === 'response.output_audio.delta') {
         if (!callState._audioLogged) {
           callState._audioLogged = true;
           const d = event.delta || '';
-          console.log(`[${callSid}] Audio flowing - length: ${d.length}, first50: ${d.slice(0, 50)}, last10: ${d.slice(-10)}`);
+          console.log(`[tenant:${businessId}][${callSid}] Audio flowing - length: ${d.length}, first50: ${d.slice(0, 50)}, last10: ${d.slice(-10)}`);
         }
       } else if (event.type === 'response.audio.delta') {
-        // Log if OpenAI-style event is ALSO being sent (would cause double audio = static)
-        console.log(`[${callSid}] WARNING: Got response.audio.delta too - possible double send!`);
+        console.log(`[tenant:${businessId}][${callSid}] WARNING: Got response.audio.delta too - possible double send!`);
       } else if (event.type === 'session.updated') {
-        // Log full session to see confirmed audio format
         const s = event.session || {};
-        console.log(`[${callSid}] Session confirmed - input_fmt: ${s.input_audio_format}, output_fmt: ${s.output_audio_format}, voice: ${s.voice}`);
+        console.log(`[tenant:${businessId}][${callSid}] Session confirmed - input_fmt: ${s.input_audio_format}, output_fmt: ${s.output_audio_format}, voice: ${s.voice}`);
       } else {
-        console.log(`[${callSid}] Grok event: ${event.type}`, JSON.stringify(event).slice(0, 200));
+        console.log(`[tenant:${businessId}][${callSid}] Grok event: ${event.type}`, JSON.stringify(event).slice(0, 200));
       }
 
       switch (event.type) {
-        // User started speaking — barge-in: cancel AI and clear Twilio playback buffer
         case 'input_audio_buffer.speech_started':
-          console.log(`[${callSid}] Barge-in detected — cancelling AI response`);
-          // Stop Grok generating (do NOT clear the input buffer — that would erase the caller's speech)
+          console.log(`[tenant:${businessId}][${callSid}] Barge-in detected — cancelling AI response`);
           if (grokWs.readyState === WebSocket.OPEN) {
             grokWs.send(JSON.stringify({ type: 'response.cancel' }));
           }
-          // Tell Twilio to stop playing buffered AI audio immediately
           if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
             twilioWs.send(JSON.stringify({ event: 'clear', streamSid: streamSid }));
           }
           break;
 
-        // xAI sends audio via 'response.output_audio.delta'
         case 'response.output_audio.delta':
-          // Send audio back to Twilio
-          if (!streamSid) console.warn(`[${callSid}] Audio delta received but streamSid is null!`);
+          if (!streamSid) console.warn(`[tenant:${businessId}][${callSid}] Audio delta received but streamSid is null!`);
           if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
             const audioPayload = event.delta || event.audio;
             if (audioPayload) {
-              // xAI sends PCM16 at 24kHz — downsample to 8kHz and encode as g711_ulaw for Twilio
               const rawBuf = Buffer.from(audioPayload, 'base64');
               const mulawBuf = pcm16ToMulaw8k(rawBuf);
-              // Chunk raw buffer before encoding (480 bytes = 60ms at 8kHz g711)
               const CHUNK_BYTES = 480;
               for (let i = 0; i < mulawBuf.length; i += CHUNK_BYTES) {
                 const chunk = mulawBuf.slice(i, i + CHUNK_BYTES);
@@ -467,29 +396,25 @@ ${callerLine}
           break;
 
         case 'response.output_audio_transcript.delta':
-          // AI is speaking — log transcript
           if (event.delta) {
             callState.transcriptParts.push({ role: 'assistant', text: event.delta });
           }
           break;
 
         case 'conversation.item.input_audio_transcription.completed':
-          // Caller said something — log it
           if (event.transcript) {
             callState.transcriptParts.push({ role: 'caller', text: event.transcript });
-            console.log(`[${callSid}] Caller: ${event.transcript}`);
+            console.log(`[tenant:${businessId}][${callSid}] Caller: ${event.transcript}`);
           }
           break;
 
         case 'response.function_call_arguments.done': {
-          // Grok wants to call a tool
-          console.log(`[${callSid}] Tool call: ${event.name} | raw args: ${event.arguments}`);
+          console.log(`[tenant:${businessId}][${callSid}] Tool call: ${event.name} | raw args: ${event.arguments}`);
           let parsedArgs;
           try {
             parsedArgs = JSON.parse(event.arguments || '{}');
           } catch (parseErr) {
-            console.error(`[${callSid}] Failed to parse tool call arguments for ${event.name}:`, parseErr.message);
-            // Send error result back to Grok so it can recover
+            console.error(`[tenant:${businessId}][${callSid}] Failed to parse tool call arguments for ${event.name}:`, parseErr.message);
             grokWs.send(JSON.stringify({
               type: 'conversation.item.create',
               item: {
@@ -501,12 +426,15 @@ ${callerLine}
             grokWs.send(JSON.stringify({ type: 'response.create' }));
             break;
           }
-          const result = await executeToolCall(event.name, parsedArgs, callerContext, callLogId);
+          const result = await executeToolCall(event.name, parsedArgs, {
+            businessId,
+            callerContext,
+            callLogId
+          });
           callState.actions.push({ tool: event.name, args: event.arguments });
           const resultStr = JSON.stringify(result);
-          console.log(`[${callSid}] Tool result for ${event.name} (${resultStr.length} chars): ${resultStr.substring(0, 500)}`);
+          console.log(`[tenant:${businessId}][${callSid}] Tool result for ${event.name} (${resultStr.length} chars): ${resultStr.substring(0, 500)}`);
 
-          // Send tool result back to Grok
           grokWs.send(JSON.stringify({
             type: 'conversation.item.create',
             item: {
@@ -516,18 +444,15 @@ ${callerLine}
             }
           }));
 
-          // Trigger Grok to respond with the tool result
           grokWs.send(JSON.stringify({ type: 'response.create' }));
 
-          // If this was a transfer_call and it succeeded, redirect the live Twilio call
-          // after a short delay so the AI can say "connecting you now"
           if (event.name === 'transfer_call' && result.success) {
-            const transferDelay = 3000; // let the AI say goodbye first
+            const transferDelay = 3000;
             const transferUrl = appUrl || process.env.APP_URL || '';
-            console.log(`[${callSid}] 📞 Transfer requested — will redirect in ${transferDelay}ms to ${transferUrl}/twilio/transfer`);
+            console.log(`[tenant:${businessId}][${callSid}] 📞 Transfer requested — will redirect in ${transferDelay}ms to ${transferUrl}/twilio/transfer`);
 
             if (!transferUrl) {
-              console.error(`[${callSid}] ❌ No APP_URL available — cannot transfer call`);
+              console.error(`[tenant:${businessId}][${callSid}] ❌ No APP_URL available — cannot transfer call`);
             } else {
               setTimeout(async () => {
                 try {
@@ -536,9 +461,9 @@ ${callerLine}
                     url: `${transferUrl}/twilio/transfer`,
                     method: 'POST'
                   });
-                  console.log(`[${callSid}] ✓ Call redirected to ${transferUrl}/twilio/transfer`);
+                  console.log(`[tenant:${businessId}][${callSid}] ✓ Call redirected to ${transferUrl}/twilio/transfer`);
                 } catch (transferErr) {
-                  console.error(`[${callSid}] ❌ Transfer redirect failed:`, transferErr.message);
+                  console.error(`[tenant:${businessId}][${callSid}] ❌ Transfer redirect failed:`, transferErr.message);
                 }
               }, transferDelay);
             }
@@ -548,20 +473,19 @@ ${callerLine}
         }
 
         case 'error':
-          console.error(`[${callSid}] Grok error:`, event.error);
+          console.error(`[tenant:${businessId}][${callSid}] Grok error:`, event.error);
           break;
       }
     } catch (err) {
-      console.error(`[${callSid}] Error processing Grok message:`, err.message);
+      console.error(`[tenant:${businessId}][${callSid}] Error processing Grok message:`, err.message);
     }
   });
 
   grokWs.on('close', () => {
-    console.log(`[${callSid}] Grok connection closed`);
+    console.log(`[tenant:${businessId}][${callSid}] Grok connection closed`);
     clearInterval(keepAlive);
-    // If conversation was still active, Grok dropped unexpectedly — close Twilio side cleanly
     if (conversationActive) {
-      console.warn(`[${callSid}] Grok disconnected unexpectedly while call was active — closing Twilio connection`);
+      console.warn(`[tenant:${businessId}][${callSid}] Grok disconnected unexpectedly while call was active — closing Twilio connection`);
       conversationActive = false;
       if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
     }
@@ -569,24 +493,22 @@ ${callerLine}
   });
 
   grokWs.on('error', (err) => {
-    console.error(`[${callSid}] Grok WebSocket error:`, err.message);
+    console.error(`[tenant:${businessId}][${callSid}] Grok WebSocket error:`, err.message);
     conversationActive = false;
     if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
   });
 
-  // ---- Twilio WebSocket handlers ----
   twilioWs.on('message', (data) => {
     try {
       const msg = JSON.parse(data.toString());
 
       switch (msg.event) {
         case 'start':
-          streamSid = msg.start.streamSid; // update if re-sent
-          console.log(`[${callSid}] Twilio stream start event: ${streamSid}`);
+          streamSid = msg.start.streamSid;
+          console.log(`[tenant:${businessId}][${callSid}] Twilio stream start event: ${streamSid}`);
           break;
 
         case 'media':
-          // Forward caller audio to Grok — upsample g711_ulaw 8kHz → PCM16 24kHz
           if (grokWs.readyState === WebSocket.OPEN) {
             const inBuf = Buffer.from(msg.media.payload, 'base64');
             const pcmBuf = mulaw8kToPcm16(inBuf);
@@ -598,25 +520,23 @@ ${callerLine}
           break;
 
         case 'stop':
-          console.log(`[${callSid}] Twilio stream stopped`);
+          console.log(`[tenant:${businessId}][${callSid}] Twilio stream stopped`);
           conversationActive = false;
           break;
       }
     } catch (err) {
-      console.error(`[${callSid}] Error processing Twilio message:`, err.message);
+      console.error(`[tenant:${businessId}][${callSid}] Error processing Twilio message:`, err.message);
     }
   });
 
   twilioWs.on('close', async () => {
-    console.log(`[${callSid}] Call ended`);
+    console.log(`[tenant:${businessId}][${callSid}] Call ended`);
     conversationActive = false;
 
-    // Close Grok connection
     if (grokWs.readyState === WebSocket.OPEN) {
       grokWs.close();
     }
 
-    // Update call log
     const duration = Math.round((Date.now() - callState.startTime) / 1000);
     const transcript = callState.transcriptParts.map(p => `${p.role}: ${p.text}`).join('\n');
     const summary = callState.actions.length > 0
@@ -626,23 +546,25 @@ ${callerLine}
     try {
       await query(
         `UPDATE call_logs SET status = 'completed', duration_seconds = $1, transcript = $2, summary = $3, ended_at = NOW()
-         WHERE id = $4`,
-        [duration, transcript, summary, callLogId]
+         WHERE id = $4 AND business_id = $5`,
+        [duration, transcript, summary, callLogId, businessId]
       );
     } catch (err) {
-      console.error('Failed to update call log:', err.message);
+      console.error(`[tenant:${businessId}] Failed to update call log:`, err.message);
     }
   });
 }
 
 /**
- * Get a random greeting from the database
+ * Get a random greeting from the tenant's greetings table rows.
  */
-async function getRandomGreeting(isKnown, callerName) {
+async function getRandomGreeting(businessId, isKnown, callerName, businessName) {
   try {
     const res = await query(
-      'SELECT message FROM greetings WHERE for_known_caller = $1 AND active = true ORDER BY RANDOM() LIMIT 1',
-      [isKnown && callerName ? true : false]
+      `SELECT message FROM greetings
+        WHERE business_id = $1 AND for_known_caller = $2 AND active = true
+        ORDER BY RANDOM() LIMIT 1`,
+      [businessId, isKnown && callerName ? true : false]
     );
     if (res.rows.length > 0) {
       let greeting = res.rows[0].message;
@@ -652,13 +574,13 @@ async function getRandomGreeting(isKnown, callerName) {
       return greeting;
     }
   } catch (err) {
-    console.error('Failed to get greeting:', err.message);
+    console.error(`[tenant:${businessId}] Failed to get greeting:`, err.message);
   }
-  return 'Thanks for calling Valleymede Columbus Golf Course! How can I help you?';
+  return `Thanks for calling ${businessName || 'the Golf Course'}! How can I help you?`;
 }
 
 /**
- * Define the tools (functions) available to Grok
+ * Define the tools (functions) available to Grok.
  */
 function buildToolDefinitions() {
   return [
@@ -757,7 +679,7 @@ function buildToolDefinitions() {
     {
       type: 'function',
       name: 'check_weather',
-      description: 'Get current weather and forecast for the golf course in Oshawa, Ontario.',
+      description: 'Get current weather and forecast for the golf course location.',
       parameters: {
         type: 'object',
         properties: {
@@ -812,117 +734,105 @@ function buildToolDefinitions() {
 }
 
 /**
- * Execute a tool call from Grok and return the result
+ * Execute a tool call from Grok and return the result.
+ * Every branch is scoped to the caller's tenant via `ctx.businessId`.
  */
-async function executeToolCall(toolName, args, callerContext, callLogId) {
+async function executeToolCall(toolName, args, ctx) {
+  const { businessId, callerContext, callLogId } = ctx;
+  requireBusinessId(businessId, `executeToolCall/${toolName}`);
+
   try {
     switch (toolName) {
       case 'check_tee_times': {
-        if (teeon.isAvailable()) {
-          try {
-            const partySize = args.party_size || 1;
-            console.log(`[${callLogId}] check_tee_times called | date: ${args.date} | party_size: ${partySize} | raw args:`, JSON.stringify(args));
-            const allSlots = await teeon.checkAvailability(args.date, partySize);
-
-            // CRITICAL: Filter slots by party size!
-            // maxPlayers = number of AVAILABLE spots in that time slot.
-            // If maxPlayers is 2, a foursome CANNOT book that slot — 2 spots are already taken.
-            // A tee time holds max 4 golfers total. The "X - Y Players" on Tee-On means
-            // X to Y spots are open for booking.
-            const slots = allSlots.filter(s => s.maxPlayers >= partySize);
-
-            console.log(`[${callLogId}] Tee times for ${args.date}: ${allSlots.length} total slots, ${slots.length} fit party of ${partySize}`);
-
-            if (slots.length === 0 && allSlots.length > 0) {
-              // There ARE times but none can fit this party size
-              const maxAvail = Math.max(...allSlots.map(s => s.maxPlayers));
-              return {
-                available: false,
-                message: `No tee times available for a group of ${partySize} on ${args.date}. The open time slots only have room for ${maxAvail} or fewer players. Each tee time holds a maximum of 4 golfers, and some spots are already booked. You could suggest the caller split into smaller groups or try a different date.`
-              };
-            }
-
-            if (slots.length === 0) {
-              return { available: false, message: `No available tee times showing online for ${args.date}. This could mean the tee sheet is fully booked, or the online system may not have updated yet. Offer to take a booking request with their preferred date and time — staff will check directly and confirm by text or phone call.` };
-            }
-
-            // Separate 18-hole and 9-hole slots
-            const full18 = slots.filter(s => s.holes === 18);
-            const back9 = slots.filter(s => s.holes === 9);
-            const morning18 = full18.filter(s => s.time.includes('AM'));
-            const afternoon18 = full18.filter(s => s.time.includes('PM'));
-            const morningBack9 = back9.filter(s => s.time.includes('AM'));
-
-            // Build a CONCISE response — don't dump all 30+ slots, just the key times
-            let message = `AVAILABLE tee times for ${args.date} (${partySize} players):\n`;
-
-            if (morning18.length > 0) {
-              message += `\nMorning 18-hole times: ${morning18.map(s => s.time).join(', ')}`;
-              message += ` (${morning18[0].price} each)`;
-            }
-
-            if (afternoon18.length > 0) {
-              const earlyPM = afternoon18.slice(0, 6);
-              const latePM = afternoon18.filter(s => {
-                const h = parseInt(s.time.split(':')[0]);
-                const isPM = s.time.includes('PM');
-                return isPM && h >= 3 && h < 6;
-              });
-              message += `\nAfternoon 18-hole times: ${earlyPM.map(s => s.time).join(', ')}`;
-              if (afternoon18.length > 6) message += ` and ${afternoon18.length - 6} more`;
-              if (latePM.length > 0 && latePM[0].price !== morning18?.[0]?.price) {
-                message += ` (twilight rate ${latePM[0].price} starts around 3 PM)`;
-              }
-            }
-
-            if (morningBack9.length > 0) {
-              message += `\nMorning 9-hole only (back nine, starts hole 10): ${morningBack9.map(s => s.time).join(', ')} (${morningBack9[0].price} each)`;
-            }
-
-            // Smart suggestions
-            if (morning18.length === 0 && morningBack9.length > 0) {
-              message += '\nNOTE: No morning 18-hole times for this group size, but morning 9-hole back nine is available.';
-            }
-            if (full18.length === 0 && back9.length > 0) {
-              message += '\nNOTE: No 18-hole times for this group size today. Only 9-hole back nine available.';
-            }
-
-            message += '\n\nRULES: 18 holes = start hole 1, full course. 9 holes = start hole 10, back nine only. ONLY offer times from this list.';
-
-            console.log(`[${callLogId}] Tee times for ${args.date}: ${full18.length} x 18-hole, ${back9.length} x 9-hole (party of ${partySize})`);
-            return { available: true, date: args.date, partySize, total: slots.length, message };
-          } catch (err) {
-            console.error('[TeeOn] checkAvailability error:', err.message);
-            return { available: null, message: 'Unable to check live availability right now. You can check online at valleymedecolumbusgolf.com or I can take a booking request.' };
-          }
-        } else {
+        if (!teeon.isAvailable()) {
           return { available: null, message: 'Live tee sheet not connected. I can take your preferred date and time and staff will confirm availability.' };
+        }
+        try {
+          const partySize = args.party_size || 1;
+          const teeOnCfg = await getTeeOnConfigForBusiness(businessId);
+          console.log(`[tenant:${businessId}][${callLogId}] check_tee_times | date: ${args.date} | party_size: ${partySize} | raw args:`, JSON.stringify(args));
+          const allSlots = await teeon.checkAvailability(args.date, partySize, teeOnCfg);
+
+          const slots = allSlots.filter(s => s.maxPlayers >= partySize);
+
+          console.log(`[tenant:${businessId}][${callLogId}] Tee times for ${args.date}: ${allSlots.length} total slots, ${slots.length} fit party of ${partySize}`);
+
+          if (slots.length === 0 && allSlots.length > 0) {
+            const maxAvail = Math.max(...allSlots.map(s => s.maxPlayers));
+            return {
+              available: false,
+              message: `No tee times available for a group of ${partySize} on ${args.date}. The open time slots only have room for ${maxAvail} or fewer players. Each tee time holds a maximum of 4 golfers, and some spots are already booked. You could suggest the caller split into smaller groups or try a different date.`
+            };
+          }
+
+          if (slots.length === 0) {
+            return { available: false, message: `No available tee times showing online for ${args.date}. This could mean the tee sheet is fully booked, or the online system may not have updated yet. Offer to take a booking request with their preferred date and time — staff will check directly and confirm by text or phone call.` };
+          }
+
+          const full18 = slots.filter(s => s.holes === 18);
+          const back9 = slots.filter(s => s.holes === 9);
+          const morning18 = full18.filter(s => s.time.includes('AM'));
+          const afternoon18 = full18.filter(s => s.time.includes('PM'));
+          const morningBack9 = back9.filter(s => s.time.includes('AM'));
+
+          let message = `AVAILABLE tee times for ${args.date} (${partySize} players):\n`;
+
+          if (morning18.length > 0) {
+            message += `\nMorning 18-hole times: ${morning18.map(s => s.time).join(', ')}`;
+            if (morning18[0].price) message += ` (${morning18[0].price} each)`;
+          }
+
+          if (afternoon18.length > 0) {
+            const earlyPM = afternoon18.slice(0, 6);
+            const latePM = afternoon18.filter(s => {
+              const h = parseInt(s.time.split(':')[0]);
+              const isPM = s.time.includes('PM');
+              return isPM && h >= 3 && h < 6;
+            });
+            message += `\nAfternoon 18-hole times: ${earlyPM.map(s => s.time).join(', ')}`;
+            if (afternoon18.length > 6) message += ` and ${afternoon18.length - 6} more`;
+            if (latePM.length > 0 && latePM[0].price && latePM[0].price !== morning18?.[0]?.price) {
+              message += ` (twilight rate ${latePM[0].price} starts around 3 PM)`;
+            }
+          }
+
+          if (morningBack9.length > 0) {
+            message += `\nMorning 9-hole only (back nine, starts hole 10): ${morningBack9.map(s => s.time).join(', ')}`;
+            if (morningBack9[0].price) message += ` (${morningBack9[0].price} each)`;
+          }
+
+          if (morning18.length === 0 && morningBack9.length > 0) {
+            message += '\nNOTE: No morning 18-hole times for this group size, but morning 9-hole back nine is available.';
+          }
+          if (full18.length === 0 && back9.length > 0) {
+            message += '\nNOTE: No 18-hole times for this group size today. Only 9-hole back nine available.';
+          }
+
+          message += '\n\nRULES: 18 holes = start hole 1, full course. 9 holes = start hole 10, back nine only. ONLY offer times from this list.';
+
+          console.log(`[tenant:${businessId}][${callLogId}] Tee times for ${args.date}: ${full18.length} x 18-hole, ${back9.length} x 9-hole (party of ${partySize})`);
+          return { available: true, date: args.date, partySize, total: slots.length, message };
+        } catch (err) {
+          console.error(`[tenant:${businessId}][TeeOn] checkAvailability error:`, err.message);
+          return { available: null, message: 'Unable to check live availability right now. I can take a booking request.' };
         }
       }
 
       case 'book_tee_time': {
-        // Log as a booking request for staff to confirm in Tee-On.
-        // Note: Direct Puppeteer booking is not available because the Tee-On
-        // account (ColumbusG) is an Administrator — Tee-On blocks admins from
-        // completing bookings via the golfer web interface. Bookings are queued
-        // for staff to confirm. To enable live bookings, create a non-admin
-        // golfer account in Tee-On and update TEEON_USERNAME/TEEON_PASSWORD.
-
-        // Validate required arguments
         if (!args.customer_name || typeof args.customer_name !== 'string' || !args.customer_name.trim()) {
-          console.warn(`[${callLogId}] ⚠️ book_tee_time called with invalid customer_name:`, args.customer_name);
+          console.warn(`[tenant:${businessId}][${callLogId}] ⚠️ book_tee_time called with invalid customer_name:`, args.customer_name);
           return { success: false, message: 'I need your name to complete the booking. Can you tell me your name?' };
         }
         if (!args.date || typeof args.date !== 'string') {
-          console.warn(`[${callLogId}] ⚠️ book_tee_time called with invalid date:`, args.date);
+          console.warn(`[tenant:${businessId}][${callLogId}] ⚠️ book_tee_time called with invalid date:`, args.date);
           return { success: false, message: 'I need a date for the booking. What date works for you?' };
         }
         if (!args.party_size || args.party_size < 1 || args.party_size > 8) {
-          console.warn(`[${callLogId}] ⚠️ book_tee_time called with invalid party_size:`, args.party_size);
+          console.warn(`[tenant:${businessId}][${callLogId}] ⚠️ book_tee_time called with invalid party_size:`, args.party_size);
           return { success: false, message: 'How many players will be in your group?' };
         }
 
-        console.log(`[${callLogId}] 📅 Processing booking:`, {
+        console.log(`[tenant:${businessId}][${callLogId}] 📅 Processing booking:`, {
           customer: args.customer_name,
           phone: args.customer_phone || callerContext.phone,
           date: args.date,
@@ -933,6 +843,7 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
 
         try {
           const booking = await createBookingRequest({
+            businessId,
             customerId: callerContext.customerId,
             customerName: args.customer_name,
             customerPhone: args.customer_phone || callerContext.phone,
@@ -946,23 +857,21 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
             callId: callLogId
           });
 
-          // Auto-save caller's name to customer record so it appears in Contacts
+          // Auto-save caller's name into the tenant's customer row
           if (callerContext.customerId && args.customer_name) {
             try {
-              const { updateCustomer } = require('./caller-lookup');
-              await updateCustomer(callerContext.customerId, {
+              await updateCustomer(businessId, callerContext.customerId, {
                 name: args.customer_name,
                 phone: args.customer_phone || undefined,
                 email: args.customer_email || undefined
               });
               callerContext.name = args.customer_name;
-              console.log(`[${callLogId}] Auto-saved customer name from booking: ${args.customer_name}`);
+              console.log(`[tenant:${businessId}][${callLogId}] Auto-saved customer name from booking: ${args.customer_name}`);
             } catch (saveErr) {
-              console.warn(`[${callLogId}] Could not auto-save customer name:`, saveErr.message);
+              console.warn(`[tenant:${businessId}][${callLogId}] Could not auto-save customer name:`, saveErr.message);
             }
           }
 
-          // Adjust confirmation message based on whether caller can receive SMS
           const smsNote = callerContext.isLandline && !callerContext.alternatePhone
             ? 'Since they called from a home phone and did not provide a cell number, let them know staff will call them back to confirm instead of texting.'
             : callerContext.isLandline && callerContext.alternatePhone
@@ -975,16 +884,15 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
             bookingId: booking.id
           };
         } catch (dbErr) {
-          console.error(`[${callLogId}] ❌ BOOKING CREATION FAILED:`, dbErr.message, {
+          console.error(`[tenant:${businessId}][${callLogId}] ❌ BOOKING CREATION FAILED:`, dbErr.message, {
             customer: args.customer_name,
             date: args.date,
             time: args.time,
             partySize: args.party_size
           });
-          // Return error message — do NOT pretend booking succeeded
           return {
             success: false,
-            message: `I had trouble saving your booking request. Please try again or call us back at the number for Valleymede Columbus Golf.`,
+            message: `I had trouble saving your booking request. Please try again or call us back.`,
             error: dbErr.message
           };
         }
@@ -995,15 +903,13 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
         if (!phone) {
           return { found: false, message: 'I don\'t have your phone number on file, so I can\'t look up your bookings. Can you give me the name or date of your booking?' };
         }
-        const { getConfirmedBookingsByPhone } = require('./booking-manager');
-        const bookings = await getConfirmedBookingsByPhone(phone);
-        console.log(`[${callLogId}] lookup_my_bookings for ${phone}: ${bookings.length} confirmed bookings`);
+        const bookings = await getConfirmedBookingsByPhone(businessId, phone);
+        console.log(`[tenant:${businessId}][${callLogId}] lookup_my_bookings for ${phone}: ${bookings.length} confirmed bookings`);
 
         if (bookings.length === 0) {
           return { found: false, count: 0, message: 'No confirmed upcoming bookings found for this phone number. If they believe they have a booking, take their details and create a cancellation/modification request for staff.' };
         }
 
-        // Format bookings for the AI to read back naturally
         const formatted = bookings.map(b => {
           const date = new Date(b.requested_date);
           const dayName = date.toLocaleDateString('en-US', { weekday: 'long' });
@@ -1029,14 +935,13 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
       }
 
       case 'edit_booking': {
-        // If booking_id provided, look up the actual booking for accurate details
-        const { getBookingById } = require('./booking-manager');
         let originalBooking = null;
         if (args.booking_id) {
-          originalBooking = await getBookingById(args.booking_id);
+          originalBooking = await getBookingById(businessId, args.booking_id);
         }
 
         const mod = await createModificationRequest({
+          businessId,
           customerId: callerContext.customerId,
           customerName: args.customer_name || originalBooking?.customer_name || callerContext.name,
           customerPhone: args.customer_phone || callerContext.phone,
@@ -1045,7 +950,7 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
           originalTime: args.original_time || originalBooking?.requested_time,
           newDate: args.new_date,
           newTime: args.new_time,
-          details: args.details + (args.new_party_size ? ` | New party size: ${args.new_party_size}` : '') + (args.booking_id ? ` | Booking #${args.booking_id}` : ''),
+          details: (args.details || '') + (args.new_party_size ? ` | New party size: ${args.new_party_size}` : '') + (args.booking_id ? ` | Booking #${args.booking_id}` : ''),
           callId: callLogId
         });
         return {
@@ -1056,15 +961,13 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
       }
 
       case 'cancel_booking': {
-        // If booking_id provided, look up the actual booking
-        const { getBookingById } = require('./booking-manager');
         let bookingToCancel = null;
         if (args.booking_id) {
-          bookingToCancel = await getBookingById(args.booking_id);
+          bookingToCancel = await getBookingById(businessId, args.booking_id);
         }
 
-        // Create a cancellation request for staff approval (don't cancel directly)
         const cancel = await createModificationRequest({
+          businessId,
           customerId: callerContext.customerId,
           customerName: args.customer_name || bookingToCancel?.customer_name || callerContext.name,
           customerPhone: args.customer_phone || callerContext.phone,
@@ -1083,19 +986,20 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
 
       case 'check_weather': {
         if (args.type === 'forecast') {
-          const forecast = await getForecast(3);
-          return forecast;
-        } else {
-          const weather = await getCurrentWeather();
-          return weather;
+          return await getForecast(businessId, 3);
         }
+        return await getCurrentWeather(businessId);
       }
 
       case 'transfer_call': {
-        // Always attempt the transfer — if nobody picks up, Twilio's fallback
-        // handles it gracefully after 30 seconds ("sorry, nobody was able to pick up")
-        const transferNumber = await getSetting('transfer_number');
-        console.log(`[${callLogId}] 📞 Transfer setting raw value: ${JSON.stringify(transferNumber)} (type: ${typeof transferNumber})`);
+        // Prefer the denormalized business.transfer_number; fall back to the
+        // per-tenant settings row.
+        const business = await getBusinessById(businessId).catch(() => null);
+        let transferNumber = business?.transfer_number || null;
+        if (!transferNumber) {
+          transferNumber = await getSetting(businessId, 'transfer_number').catch(() => null);
+        }
+        console.log(`[tenant:${businessId}][${callLogId}] 📞 Transfer setting: ${JSON.stringify(transferNumber)}`);
         if (!transferNumber) {
           return {
             success: false,
@@ -1103,9 +1007,8 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
           };
         }
 
-        // Normalize to digits for logging
         const normalizedForLog = String(transferNumber).replace(/[^+\d]/g, '');
-        console.log(`[${callLogId}] 📞 Transfer requested — will redirect to ${normalizedForLog}. Reason: ${args.reason}`);
+        console.log(`[tenant:${businessId}][${callLogId}] 📞 Transfer requested — will redirect to ${normalizedForLog}. Reason: ${args.reason}`);
         return {
           success: true,
           transfer_to: transferNumber,
@@ -1114,14 +1017,13 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
       }
 
       case 'lookup_customer': {
-        const { lookupByPhone, lookupByName } = require('./caller-lookup');
         let results = [];
         if (args.phone) {
-          const customer = await lookupByPhone(args.phone);
+          const customer = await lookupByPhone(businessId, args.phone);
           if (customer) results.push(customer);
         }
         if (args.name) {
-          const customers = await lookupByName(args.name);
+          const customers = await lookupByName(businessId, args.name);
           results = results.concat(customers);
         }
         if (results.length === 0) {
@@ -1139,39 +1041,40 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
       }
 
       case 'save_customer_info': {
-        console.log(`[${callLogId}] save_customer_info called | customerId: ${callerContext.customerId} | name: ${args.name} | email: ${args.email}`);
+        console.log(`[tenant:${businessId}][${callLogId}] save_customer_info | customerId: ${callerContext.customerId} | name: ${args.name} | email: ${args.email}`);
         if (callerContext.customerId) {
           try {
-            const updated = await updateCustomer(callerContext.customerId, {
+            const updated = await updateCustomer(businessId, callerContext.customerId, {
               name: args.name,
               email: args.email,
               phone: args.phone
             });
-            console.log(`[${callLogId}] Customer saved: ${updated?.name} (ID: ${updated?.id})`);
-            // Update the context for the rest of the call
+            console.log(`[tenant:${businessId}][${callLogId}] Customer saved: ${updated?.name} (ID: ${updated?.id})`);
             if (args.name) callerContext.name = args.name;
             if (args.email) callerContext.email = args.email;
             return { success: true, message: `Got it! I've saved your info as ${args.name}.` };
           } catch (err) {
-            console.error(`[${callLogId}] Failed to save customer info:`, err.message);
+            console.error(`[tenant:${businessId}][${callLogId}] Failed to save customer info:`, err.message);
             return { success: false, message: 'I had trouble saving your info, but we can still complete your booking.' };
           }
-        } else {
-          console.warn(`[${callLogId}] save_customer_info: No customerId available`);
-          return { success: false, message: 'I had trouble saving your info, but we can still complete your booking.' };
         }
+        console.warn(`[tenant:${businessId}][${callLogId}] save_customer_info: No customerId available`);
+        return { success: false, message: 'I had trouble saving your info, but we can still complete your booking.' };
       }
 
       case 'save_alternate_phone': {
-        console.log(`[${callLogId}] save_alternate_phone called | customerId: ${callerContext.customerId} | mobile: ${args.mobile_number}`);
+        console.log(`[tenant:${businessId}][${callLogId}] save_alternate_phone | customerId: ${callerContext.customerId} | mobile: ${args.mobile_number}`);
         if (callerContext.customerId && args.mobile_number) {
           try {
-            await query('UPDATE customers SET alternate_phone = $1 WHERE id = $2', [args.mobile_number, callerContext.customerId]);
+            await query(
+              'UPDATE customers SET alternate_phone = $1 WHERE id = $2 AND business_id = $3',
+              [args.mobile_number, callerContext.customerId, businessId]
+            );
             callerContext.alternatePhone = args.mobile_number;
-            console.log(`[${callLogId}] Saved alternate phone ${args.mobile_number} for customer ${callerContext.customerId}`);
+            console.log(`[tenant:${businessId}][${callLogId}] Saved alternate phone ${args.mobile_number} for customer ${callerContext.customerId}`);
             return { success: true, message: `Got it! I'll send text confirmations to ${args.mobile_number} instead.` };
           } catch (err) {
-            console.error(`[${callLogId}] Failed to save alternate phone:`, err.message);
+            console.error(`[tenant:${businessId}][${callLogId}] Failed to save alternate phone:`, err.message);
             return { success: false, message: 'I had trouble saving that number, but no worries — staff will follow up with you.' };
           }
         }
@@ -1182,7 +1085,7 @@ async function executeToolCall(toolName, args, callerContext, callLogId) {
         return { error: `Unknown tool: ${toolName}` };
     }
   } catch (err) {
-    console.error(`Tool execution error (${toolName}):`, err.message);
+    console.error(`[tenant:${businessId}] Tool execution error (${toolName}):`, err.message);
     return { error: `Failed to execute ${toolName}: ${err.message}` };
   }
 }

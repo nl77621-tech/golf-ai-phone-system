@@ -396,3 +396,89 @@ Once forwarding is active, **test it thoroughly**:
 4. **Ongoing**: Process booking requests in Command Center and confirm in Tee-on
 
 Need help with any step? Let me know!
+
+---
+
+## PART 7: Multi-Tenant Platform Operations (Phase 6)
+
+This part applies to the **SaaS platform** side of the product — onboarding additional businesses, watching audit logs, and running the Super Admin dashboard. If you only run Valleymede and never onboard another tenant, you can skip this part entirely.
+
+### Step 7.1: Bootstrap the first Super Admin
+
+The very first super admin is created on an empty `super_admins` table via `POST /auth/register-super-admin`. After any row exists, this endpoint 403s — further super admins must come through the invite flow.
+
+Optional: set `SUPER_ADMIN_BOOTSTRAP_TOKEN` in Railway before hitting the endpoint to gate the bootstrap. The token is checked only once (when the table is empty).
+
+```
+POST https://<your-railway-host>/auth/register-super-admin
+Content-Type: application/json
+
+{ "email": "ops@yourcompany.com", "password": "<at least 8 chars>", "name": "Ops", "bootstrap_token": "<optional>" }
+```
+
+Use the returned token to sign in to Command Center; the UI detects the `super_admin` role and routes you to `/api/super/*`.
+
+### Step 7.2: Onboard a new business in under 5 minutes
+
+1. Sign in as super admin → **New Business** button on the Super Admin dashboard.
+2. Six-step wizard:
+   - **Basics** — name, slug, contact email, primary color, logo URL.
+   - **Phone numbers** — primary Twilio DID (E.164) plus any additional lines. Each DID is a row in `business_phone_numbers` with `is_primary` for the tenant's main line.
+   - **Template** — pick a vertical (Golf Course / Driving Range / Restaurant / Other). Templates seed settings + greetings for that vertical.
+   - **Admin invite** — optional; generates a magic-link invite URL that you hand to the tenant's admin.
+   - **Review** → **Create business**.
+3. One `POST /api/super/businesses` call:
+   - Inserts the tenant row (`slug` unique, auto-assigned `id`).
+   - Seeds baseline settings + the chosen template.
+   - Inserts every phone number (primary first).
+   - If `admin_email` was provided, generates a single-use invite token + URL.
+   - Audit rows land immediately: `business.created` and (if applicable) `invite.created`.
+
+### Step 7.3: Point a DID at the tenant
+
+In the Twilio console, set the voice webhook for the new DID to `POST https://<railway-host>/twilio/voice` (same URL as Valleymede — tenant resolution is by `To`, not by URL). Same for SMS: `POST /twilio/sms`.
+
+Sanity check in logs after placing a test call — you should see `PHONE_ROUTE source=business_phone_numbers To=+1… slug=<new-slug>`. If you see `source=legacy_denorm` or `source=single_tenant_bootstrap`, the `business_phone_numbers` row is missing and the call routed via the fallback.
+
+Optional debug endpoint (gated on `DEBUG_PHONE_RESOLVE=1`):
+```
+GET /twilio/_debug/phone-resolve?To=+19051234567
+```
+Returns `{ to, resolved, source, business }` so you can verify routing from the comfort of curl.
+
+### Step 7.4: Watch the audit log
+
+- UI: Super Admin dashboard → **Recent Activity** panel (collapsible, last 10 events).
+- API: `GET /api/super/audit-log` — filters: `business_id=<id>`, `action=<dotted.name>`, `limit=<1..500>`, `before=<id>` (keyset pagination).
+
+Actions recorded: `business.created`, `business.updated`, `phone.added/updated/deleted`, `setting.updated`, `greeting.created/deleted`, `invite.created`, `invite.accepted`, `user.login`.
+
+The audit service never throws into the request — if the DB is unreachable, the mutation still succeeds and the audit failure is logged to stdout as `[audit] FAILED …`. Lost audit rows are a data-visibility bug, not a correctness bug.
+
+### Step 7.5: Platform analytics
+
+`GET /api/super/analytics` returns fleet totals in one query:
+```
+{
+  businesses: { total, active, trial, inactive, setup_complete, created_last_30d },
+  users:      { total, active, business_admins, staff, super_admins },
+  phones:     { total, active, primary },
+  calls:      { today, last_30d, total, active_now, minutes_last_30d },
+  bookings:   { today, last_30d, total, pending },
+  invites:    { open, accepted_last_30d },
+  generated_at: ISO-8601
+}
+```
+The Super Admin dashboard renders the key figures as a two-row strip at the top.
+
+### Step 7.6: Impersonate a tenant (support flow)
+
+From the Super Admin dashboard, click **Act as** on any business card. The session keeps your super admin JWT but sets `X-Business-Id: <biz>` on all `/api/*` requests; the TopBar shows whose data you're viewing. Clicking the "exit" button restores the platform view. Every impersonation is visible in the audit feed by filtering `user_type=super_admin` and watching for tenant-scoped `business_id` rows.
+
+### Step 7.7: Adding additional super admins
+
+```
+POST /api/super/invite  (super-admin auth required)
+{ "business_id": null, "email": "colleague@yourcompany.com", "role": "super_admin" }
+```
+The response includes an `invite_url`; the recipient signs up at `/accept-invite?token=…` and is dropped straight into the platform view.

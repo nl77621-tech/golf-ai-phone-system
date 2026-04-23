@@ -1,17 +1,21 @@
 /**
- * Phone Lookup Service
- * Uses Twilio Lookup v2 API to detect line type (mobile, landline, VoIP)
- * so we know whether SMS will work for a given number.
+ * Phone Lookup Service — tenant-scoped cache.
  *
- * Cost: ~$0.03 per lookup (Twilio Line Type Intelligence)
- * Results are cached in the customers table to avoid repeat lookups.
+ * The live Twilio Lookup call itself is tenant-agnostic (the line type of
+ * +1‑416‑555‑1234 is the same regardless of which business is asking), but
+ * the CACHE lives on a customer row — and customer rows are scoped by
+ * business_id. So any read/write against customers.line_type MUST include
+ * the tenant id.
  */
-const { query, getSetting } = require('../config/database');
+const { query } = require('../config/database');
+const { requireBusinessId } = require('../context/tenant-context');
 require('dotenv').config();
 
 /**
- * Look up line type for a phone number using Twilio Lookup v2
- * Returns: 'mobile', 'landline', 'voip', 'unknown', or null on error
+ * Look up line type for a phone number using Twilio Lookup v2.
+ * Returns 'mobile' | 'landline' | 'voip' | 'fixedVoip' | 'unknown' | null.
+ *
+ * Tenant-agnostic — no businessId needed.
  */
 async function lookupLineType(phone) {
   if (!phone) return null;
@@ -23,14 +27,12 @@ async function lookupLineType(phone) {
   try {
     const twilio = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-    // Normalize phone to E.164
     let normalized = String(phone).replace(/[^+\d]/g, '');
     if (!normalized.startsWith('+')) {
       if (normalized.length === 10) normalized = '+1' + normalized;
       else if (normalized.length === 11 && normalized.startsWith('1')) normalized = '+' + normalized;
     }
 
-    // Twilio Lookup v2 with Line Type Intelligence
     const result = await twilio.lookups.v2.phoneNumbers(normalized)
       .fetch({ fields: 'line_type_intelligence' });
 
@@ -44,34 +46,41 @@ async function lookupLineType(phone) {
 }
 
 /**
- * Get the line type for a customer, using cached value if available.
- * If not cached, performs a live lookup and stores the result.
+ * Get the line type for a customer, using the tenant's cached value if
+ * available. Looks up the `customers` row scoped by (business_id, id) so we
+ * can never read another tenant's cached value.
  */
-async function getLineType(phone, customerId) {
+async function getLineType(businessId, phone, customerId) {
+  requireBusinessId(businessId, 'getLineType');
   if (!phone) return null;
 
-  // Check if we already have a cached line_type for this customer
+  // Check cache first (tenant-scoped)
   if (customerId) {
     try {
-      const cached = await query('SELECT line_type FROM customers WHERE id = $1', [customerId]);
+      const cached = await query(
+        'SELECT line_type FROM customers WHERE id = $1 AND business_id = $2',
+        [customerId, businessId]
+      );
       if (cached.rows[0]?.line_type) {
         return cached.rows[0].line_type;
       }
     } catch (err) {
-      // Column might not exist yet — continue to lookup
+      // Column might not exist yet — continue to live lookup
     }
   }
 
   // Perform live lookup
   const lineType = await lookupLineType(phone);
 
-  // Cache result on customer record
+  // Cache back onto the tenant's customer row
   if (lineType && customerId) {
     try {
-      await query('UPDATE customers SET line_type = $1 WHERE id = $2', [lineType, customerId]);
+      await query(
+        'UPDATE customers SET line_type = $1 WHERE id = $2 AND business_id = $3',
+        [lineType, customerId, businessId]
+      );
     } catch (err) {
-      // Column might not exist yet — not critical
-      console.warn('[PhoneLookup] Could not cache line_type:', err.message);
+      console.warn(`[tenant:${businessId}] Could not cache line_type:`, err.message);
     }
   }
 
@@ -79,11 +88,13 @@ async function getLineType(phone, customerId) {
 }
 
 /**
- * Check if a phone number can receive SMS
+ * Check if a phone number can receive SMS based on a known line type.
+ * Returns true when the line type is unknown — defensive default so we
+ * don't silently drop SMS for customers whose line type wasn't looked up.
  */
 function isSmsCapable(lineType) {
-  if (!lineType) return true; // If we don't know, assume yes
-  return lineType !== 'landline'; // mobile, voip, fixedVoip can usually receive SMS
+  if (!lineType) return true;
+  return lineType !== 'landline';
 }
 
 module.exports = { lookupLineType, getLineType, isSmsCapable };

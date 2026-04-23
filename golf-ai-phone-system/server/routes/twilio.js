@@ -1,36 +1,103 @@
 /**
- * Twilio Webhook Routes
- * Handles incoming calls and media stream connections
+ * Twilio Webhook Routes — tenant-aware.
+ *
+ * Tenant resolution:
+ *   /voice   → `attachTenantFromTwilioTo` (business resolved from req.body.To)
+ *   /sms     → `attachTenantFromTwilioTo` (same)
+ *   /status, /transfer, /transfer-fallback → `attachTenantFromCallSid`
+ *     because these callbacks don't carry a meaningful To; we look the tenant
+ *     up by CallSid in call_logs (and fall back to the single-tenant bootstrap
+ *     rule baked into the middleware).
+ *
+ * After middleware runs, `req.business` is the full businesses row. Handlers
+ * use `req.business.id` to scope every downstream call.
  */
 const express = require('express');
 const router = express.Router();
-const { handleMediaStream } = require('../services/grok-voice');
 const { normalizePhone } = require('../services/caller-lookup');
 const { getSetting } = require('../config/database');
 const { findActiveBookingByPhone, updateBookingStatus } = require('../services/booking-manager');
+const {
+  attachTenantFromTwilioTo,
+  attachTenantFromCallSid,
+  resolveBusinessFromTwilioTo,
+  validateTwilioSignature
+} = require('../middleware/tenant');
 require('dotenv').config();
 
+// Every webhook on this router must carry a valid X-Twilio-Signature.
+// In dev (no TWILIO_AUTH_TOKEN) this short-circuits with a warning; see
+// validateTwilioSignature in middleware/tenant.js.
+router.use(validateTwilioSignature);
+
+// -------- small helpers --------
+
+// Escape text for safe inclusion inside TwiML. Keeps `'` legal in <Say> too.
+function xmlEscape(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// Normalize a phone number to E.164 for Twilio <Dial>.
+function toE164(raw) {
+  let n = String(raw || '').replace(/[^+\d]/g, '');
+  if (!n) return null;
+  if (!n.startsWith('+')) {
+    if (n.length === 10) n = '+1' + n;
+    else if (n.length === 11 && n.startsWith('1')) n = '+' + n;
+    else n = '+' + n;
+  }
+  return n;
+}
+
+// Friendly "call us at X" string for a number, used in SMS replies.
+function spokenTransferNumber(raw) {
+  if (!raw) return null;
+  const digits = String(raw).replace(/\D/g, '');
+  if (digits.length === 11 && digits.startsWith('1')) {
+    return `${digits.slice(1, 4)} ${digits.slice(4, 7)} ${digits.slice(7)}`;
+  }
+  if (digits.length === 10) {
+    return `${digits.slice(0, 3)} ${digits.slice(3, 6)} ${digits.slice(6)}`;
+  }
+  return raw;
+}
+
 /**
- * POST /twilio/voice — Twilio calls this when an inbound call arrives
- * Returns TwiML that tells Twilio to open a WebSocket media stream to our server
+ * POST /twilio/voice — Twilio calls this when an inbound call arrives.
+ * Returns TwiML that opens a WebSocket media stream and passes the
+ * business id, caller phone, and call sid through `<Parameter>` tags.
  */
-router.post('/voice', async (req, res) => {
+router.post('/voice', attachTenantFromTwilioTo, async (req, res) => {
   const callerPhone = req.body.From || 'unknown';
   const callSid = req.body.CallSid;
-  console.log(`Incoming call from ${callerPhone} (SID: ${callSid})`);
+  const business = req.business;
+  const businessId = business.id;
+  const businessName = business.name || 'our course';
+  // Phase 5: resolver tags req.business._phoneSource with one of
+  // 'business_phone_numbers' | 'legacy_denorm' | 'single_tenant_bootstrap'
+  // so we can watch the routing switch over in production logs.
+  const phoneSource = business._phoneSource || 'unknown';
 
-  // Check if test mode — optionally restrict to test phone number
+  console.log(
+    `[tenant:${businessId}] Incoming call from ${callerPhone} to ${req.body.To} ` +
+    `(SID: ${callSid}) — routed via ${phoneSource}`
+  );
+
+  // Optional per-tenant test mode — only let the configured test phone through.
   try {
-    const testMode = await getSetting('test_mode');
+    const testMode = await getSetting(businessId, 'test_mode');
     if (testMode?.enabled && testMode?.test_phone) {
       const normalized = normalizePhone(callerPhone);
       const testNormalized = normalizePhone(testMode.test_phone);
       if (normalized !== testNormalized) {
-        // Not the test phone — play a message and hang up
         res.type('text/xml');
         res.send(`
           <Response>
-            <Say voice="alice">Thank you for calling Valleymede Columbus Golf Course. Our phone system is currently being updated. Please call back shortly or visit our website at valleymede columbus golf dot com.</Say>
+            <Say voice="alice">Thank you for calling ${xmlEscape(businessName)}. Our phone system is currently being updated. Please call back shortly.</Say>
             <Hangup/>
           </Response>
         `);
@@ -38,22 +105,25 @@ router.post('/voice', async (req, res) => {
       }
     }
   } catch (err) {
-    console.error('Test mode check failed:', err.message);
+    console.error(`[tenant:${businessId}] Test mode check failed:`, err.message);
   }
 
   // Get the app URL for WebSocket connection
   const appUrl = process.env.APP_URL || `https://${req.headers.host}`;
   const wsUrl = appUrl.replace('https://', 'wss://').replace('http://', 'ws://');
 
-  // Return TwiML to connect the call to our WebSocket media stream
+  // Return TwiML to connect the call to our WebSocket media stream. The
+  // businessId parameter is what lets `server/index.js` spin the Grok bridge
+  // up under the correct tenant context.
   res.type('text/xml');
   res.send(`
     <Response>
       <Connect>
-        <Stream url="${wsUrl}/twilio/media-stream">
-          <Parameter name="callerPhone" value="${callerPhone}" />
-          <Parameter name="callSid" value="${callSid}" />
-          <Parameter name="appUrl" value="${appUrl}" />
+        <Stream url="${xmlEscape(wsUrl)}/twilio/media-stream">
+          <Parameter name="businessId" value="${businessId}" />
+          <Parameter name="callerPhone" value="${xmlEscape(callerPhone)}" />
+          <Parameter name="callSid" value="${xmlEscape(callSid)}" />
+          <Parameter name="appUrl" value="${xmlEscape(appUrl)}" />
         </Stream>
       </Connect>
     </Response>
@@ -61,8 +131,9 @@ router.post('/voice', async (req, res) => {
 });
 
 /**
- * POST /twilio/status — Call status callback (optional)
- * Twilio calls this when a call status changes
+ * POST /twilio/status — Call status callback (optional).
+ * No tenant resolution required; we just log. Twilio status callbacks don't
+ * need to hit per-tenant settings.
  */
 router.post('/status', (req, res) => {
   const { CallSid, CallStatus, Duration } = req.body;
@@ -71,28 +142,29 @@ router.post('/status', (req, res) => {
 });
 
 /**
- * POST /twilio/transfer — Handle call transfer
- * Called when the AI decides to transfer to a human
+ * POST /twilio/transfer — Handle call transfer.
+ * Called mid-call when the AI decides to hand off to a human. The tenant is
+ * resolved by CallSid from call_logs. Transfer number resolution order:
+ *   1. businesses.transfer_number (tenant column)
+ *   2. getSetting(businessId, 'transfer_number')  (per-tenant setting blob)
  */
-router.post('/transfer', async (req, res) => {
+router.post('/transfer', attachTenantFromCallSid, async (req, res) => {
+  const business = req.business;
+  const businessId = business.id;
   try {
-    const rawSetting = await getSetting('transfer_number');
-    console.log(`📞 Transfer endpoint hit — raw setting value: ${JSON.stringify(rawSetting)} (type: ${typeof rawSetting})`);
-
-    // Normalize the phone number from whatever format it's stored in
-    let transferNumber = String(rawSetting || '').replace(/[^+\d]/g, ''); // strip everything except + and digits
-    // Ensure E.164 format for Twilio
-    if (transferNumber && !transferNumber.startsWith('+')) {
-      if (transferNumber.length === 10) {
-        transferNumber = '+1' + transferNumber; // North American 10-digit
-      } else if (transferNumber.length === 11 && transferNumber.startsWith('1')) {
-        transferNumber = '+' + transferNumber;
-      }
+    let rawNumber = business.transfer_number || null;
+    if (!rawNumber) {
+      const fromSettings = await getSetting(businessId, 'transfer_number').catch(() => null);
+      rawNumber = typeof fromSettings === 'string'
+        ? fromSettings
+        : (fromSettings?.number || fromSettings?.value || null);
     }
-    console.log(`📞 Normalized transfer number: ${transferNumber}`);
+
+    const transferNumber = toE164(rawNumber);
+    console.log(`[tenant:${businessId}] 📞 Transfer endpoint hit — resolved number: ${transferNumber}`);
 
     if (!transferNumber) {
-      console.error('❌ No transfer number configured');
+      console.error(`[tenant:${businessId}] ❌ No transfer number configured`);
       res.type('text/xml');
       res.send(`
         <Response>
@@ -108,12 +180,12 @@ router.post('/transfer', async (req, res) => {
       <Response>
         <Say voice="alice">One moment, I'm connecting you with a staff member.</Say>
         <Dial timeout="30" action="/twilio/transfer-fallback">
-          ${transferNumber}
+          ${xmlEscape(transferNumber)}
         </Dial>
       </Response>
     `);
   } catch (err) {
-    console.error('Transfer error:', err.message);
+    console.error(`[tenant:${businessId}] Transfer error:`, err.message);
     res.type('text/xml');
     res.send(`
       <Response>
@@ -125,18 +197,19 @@ router.post('/transfer', async (req, res) => {
 });
 
 /**
- * POST /twilio/transfer-fallback — If transfer fails (no answer, busy)
+ * POST /twilio/transfer-fallback — If transfer fails (no answer, busy).
  */
-router.post('/transfer-fallback', (req, res) => {
+router.post('/transfer-fallback', attachTenantFromCallSid, (req, res) => {
   const dialStatus = req.body.DialCallStatus;
   const dialSid = req.body.DialCallSid;
-  console.log(`📞 Transfer fallback — DialCallStatus: ${dialStatus}, DialCallSid: ${dialSid}`);
+  const businessId = req.business?.id;
+  console.log(`[tenant:${businessId}] 📞 Transfer fallback — DialCallStatus: ${dialStatus}, DialCallSid: ${dialSid}`);
   res.type('text/xml');
 
   if (dialStatus === 'completed') {
     res.send('<Response><Hangup/></Response>');
   } else {
-    console.log(`📞 Transfer failed (${dialStatus}) — telling caller nobody picked up`);
+    console.log(`[tenant:${businessId}] 📞 Transfer failed (${dialStatus}) — telling caller nobody picked up`);
     res.send(`
       <Response>
         <Say voice="alice">Sorry, nobody was able to pick up. You can try again later, or I can continue helping you. Goodbye!</Say>
@@ -147,20 +220,31 @@ router.post('/transfer-fallback', (req, res) => {
 });
 
 /**
- * POST /twilio/sms — Incoming SMS webhook
- * Handles CANCEL replies from customers who got a booking confirmation text
+ * POST /twilio/sms — Incoming SMS webhook.
+ * Handles CANCEL / HELP / STOP replies to booking confirmation texts.
+ * Scoped to the tenant whose Twilio number received the SMS.
  */
-router.post('/sms', async (req, res) => {
+router.post('/sms', attachTenantFromTwilioTo, async (req, res) => {
+  const business = req.business;
+  const businessId = business.id;
+  const businessName = business.name || 'Golf Course';
+  const transferNumber = business.transfer_number || null;
+  const spokenTransfer = spokenTransferNumber(transferNumber);
+
   const fromPhone = req.body.From;
   const body = (req.body.Body || '').trim();
   const bodyUpper = body.toUpperCase();
 
-  console.log(`📩 Incoming SMS from ${fromPhone}: "${body}"`);
+  const phoneSource = business._phoneSource || 'unknown';
+  console.log(
+    `[tenant:${businessId}] 📩 Incoming SMS from ${fromPhone} to ${req.body.To}: "${body}" ` +
+    `— routed via ${phoneSource}`
+  );
 
-  // Helper to respond with TwiML containing a reply
+  // Respond with TwiML containing a single reply message.
   const twimlReply = (text) => {
     res.type('text/xml');
-    res.send(`<Response><Message>${text}</Message></Response>`);
+    res.send(`<Response><Message>${xmlEscape(text)}</Message></Response>`);
   };
   const twimlSilent = () => {
     res.type('text/xml');
@@ -171,32 +255,99 @@ router.post('/sms', async (req, res) => {
     const normalized = normalizePhone(fromPhone);
     if (!normalized) return twimlSilent();
 
-    // CANCEL keyword → cancel most recent active booking
+    // CANCEL keyword → cancel most recent active booking (this tenant only)
     if (bodyUpper === 'CANCEL' || bodyUpper === 'CANCEL ALL') {
-      const booking = await findActiveBookingByPhone(normalized);
+      const booking = await findActiveBookingByPhone(businessId, normalized);
       if (!booking) {
-        return twimlReply('Valleymede Golf: No upcoming tee time found on file. Call us if you need help.');
+        const fallback = spokenTransfer
+          ? `${businessName}: No upcoming booking found on file. Call us at ${spokenTransfer} if you need help.`
+          : `${businessName}: No upcoming booking found on file. Please call us if you need help.`;
+        return twimlReply(fallback);
       }
-      await updateBookingStatus(booking.id, 'cancelled', 'Cancelled by customer via SMS reply');
-      // Note: updateBookingStatus already sends the cancellation SMS; TwiML reply acts as immediate ack
-      return twimlReply(`Valleymede Golf: Your tee time on ${booking.requested_date} at ${booking.requested_time || ''} is cancelled. Thank you!`);
+      await updateBookingStatus(
+        businessId,
+        booking.id,
+        'cancelled',
+        'Cancelled by customer via SMS reply'
+      );
+      // updateBookingStatus already sends the cancellation SMS; this reply is
+      // just the immediate ack for the Twilio webhook.
+      return twimlReply(
+        `${businessName}: Your booking on ${booking.requested_date} at ${booking.requested_time || ''} is cancelled. Thank you!`
+      );
     }
 
     // HELP keyword
     if (bodyUpper === 'HELP') {
-      return twimlReply('Valleymede Golf: For any changes or cancellations, please call us at 905 655 6300. Msg&data rates may apply.');
+      const helpMsg = spokenTransfer
+        ? `${businessName}: For any changes or cancellations, please call us at ${spokenTransfer}. Msg&data rates may apply.`
+        : `${businessName}: For any changes or cancellations, please call us. Msg&data rates may apply.`;
+      return twimlReply(helpMsg);
     }
 
-    // STOP / UNSUBSCRIBE — Twilio handles opt-out automatically but we acknowledge
+    // STOP / UNSUBSCRIBE — Twilio handles opt-out automatically but we ack
     if (bodyUpper === 'STOP' || bodyUpper === 'UNSUBSCRIBE') {
-      return twimlSilent(); // Twilio auto-responds with opt-out confirmation
+      return twimlSilent();
     }
 
     // Unknown reply — gently guide them to call
-    return twimlReply('Valleymede Golf: For any changes or requests, please call us at 905 655 6300. Thank you!');
+    const guide = spokenTransfer
+      ? `${businessName}: For any changes or requests, please call us at ${spokenTransfer}. Thank you!`
+      : `${businessName}: For any changes or requests, please call us. Thank you!`;
+    return twimlReply(guide);
   } catch (err) {
-    console.error('SMS handler error:', err.message);
+    console.error(`[tenant:${businessId}] SMS handler error:`, err.message);
     return twimlSilent();
+  }
+});
+
+/**
+ * GET /twilio/_debug/phone-resolve?To=+19053334444
+ *
+ * Non-production helper that runs the exact same resolution path as an
+ * inbound /voice webhook and returns `{ to, source, business }` as JSON.
+ * Useful during the Phase 5 cutover to prove "this DID now resolves via
+ * business_phone_numbers, not the legacy denormalized column" without
+ * having to place a real call.
+ *
+ * Gated on `DEBUG_PHONE_RESOLVE=1` so it's never accidentally exposed in
+ * production. The route bypasses `validateTwilioSignature` because no
+ * Twilio request ever hits it — it's for operator curl/Postman use.
+ */
+router.get('/_debug/phone-resolve', async (req, res) => {
+  if (process.env.DEBUG_PHONE_RESOLVE !== '1') {
+    return res.status(404).json({ error: 'Not found' });
+  }
+  const to = String(req.query.To || '').trim();
+  if (!to) {
+    return res.status(400).json({ error: 'Missing ?To=+1... query param' });
+  }
+  try {
+    const business = await resolveBusinessFromTwilioTo(to);
+    if (!business) {
+      return res.status(404).json({
+        to,
+        resolved: false,
+        source: null,
+        reason: 'No business matched via business_phone_numbers, legacy denorm, or single-tenant bootstrap.'
+      });
+    }
+    return res.json({
+      to,
+      resolved: true,
+      source: business._phoneSource || 'unknown',
+      business: {
+        id: business.id,
+        slug: business.slug,
+        name: business.name,
+        twilio_phone_number: business.twilio_phone_number,
+        is_active: business.is_active,
+        status: business.status
+      }
+    });
+  } catch (err) {
+    console.error('[tenant] phone-resolve debug error:', err.message);
+    return res.status(500).json({ error: 'resolve failed', detail: err.message });
   }
 });
 

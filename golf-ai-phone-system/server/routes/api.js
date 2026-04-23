@@ -1,47 +1,138 @@
 /**
- * REST API Routes — Command Center Backend
- * All routes require authentication (JWT)
+ * REST API Routes — Command Center backend (tenant-scoped).
+ *
+ * Every route in this file is mounted under `/api` and gated by:
+ *   1. `requireAuth`           — decodes the JWT into `req.auth`
+ *   2. `attachTenantFromAuth`  — hydrates `req.business` and enforces isolation
+ *
+ * Per CLAUDE.md §3.2, a regular tenant user must NEVER be able to read or
+ * write another business's data. That is enforced here in three ways:
+ *
+ *   - `req.auth.business_id` is pulled from the JWT, never from the URL or
+ *     body. Clients cannot choose which tenant they're operating on.
+ *   - Every SQL statement that touches tenant data includes a
+ *     `business_id = $N` predicate.
+ *   - Every service call that goes through `booking-manager`, `notification`,
+ *     etc. passes `businessId` as its first argument; those services defend
+ *     in depth with `requireBusinessId()`.
+ *
+ * Super-admin cross-tenant flows live under `/api/admin/*` (Phase 3+) with a
+ * separate `requireSuperAdmin` middleware — none of those endpoints live in
+ * this file. If a super-admin token hits this router we 403, because these
+ * routes are not designed for cross-tenant use.
  */
 const express = require('express');
 const router = express.Router();
 const { requireAuth } = require('../middleware/auth');
-const { query, getSetting, updateSetting } = require('../config/database');
+const { attachTenantFromAuth } = require('../middleware/tenant');
+const { SUPER_ADMIN_ROLE } = require('../context/tenant-context');
 const {
-  getAllBookings, updateBookingStatus, createBookingRequest,
-  getPendingModifications, updateModificationStatus
+  query,
+  getSetting,
+  updateSetting,
+  getAllSettings,
+  listBusinessPhoneNumbers,
+  addBusinessPhoneNumber,
+  updateBusinessPhoneNumber,
+  deleteBusinessPhoneNumber
+} = require('../config/database');
+const {
+  getAllBookings,
+  updateBookingStatus,
+  createBookingRequest,
+  getPendingModifications,
+  updateModificationStatus
 } = require('../services/booking-manager');
+const { normalizePhone } = require('../services/caller-lookup');
+const { logEventFromReq } = require('../services/audit-log');
 
-// Apply auth middleware to all API routes
+// Apply auth + tenant hydration to every route in this router.
 router.use(requireAuth);
+router.use(attachTenantFromAuth);
+
+// A valid tenant context is required for every route in this router.
+//
+// - Tenant users (business_admin / staff): always have `req.business`
+//   hydrated from their JWT's business_id.
+// - Super admins: `req.business` is hydrated ONLY if they sent an
+//   `X-Business-Id` header (the business-switcher pathway). Without
+//   the header the super admin must use `/api/super/*` for cross-tenant
+//   work — hitting this router bare is a 403 so a forgotten scope check
+//   in a sub-route can't accidentally become a cross-tenant read.
+router.use((req, res, next) => {
+  if (!req.business || !Number.isInteger(req.business.id)) {
+    if (req.auth?.role === SUPER_ADMIN_ROLE) {
+      return res.status(400).json({
+        error: 'Super admin requests to /api/* must include an X-Business-Id header selecting a tenant.'
+      });
+    }
+    return res.status(403).json({ error: 'Tenant context missing' });
+  }
+  next();
+});
+
+// Convenience getter.
+function tenantId(req) {
+  return req.business.id;
+}
 
 // ============================================
 // DASHBOARD
 // ============================================
 
-// GET /api/dashboard — Dashboard stats
+// GET /api/dashboard — Dashboard stats for this tenant only
 router.get('/dashboard', async (req, res) => {
+  const businessId = tenantId(req);
   try {
-    const today = new Date().toISOString().split('T')[0];
+    // Compute "today" in the tenant's timezone so "calls today" matches what
+    // the staff would see on their clock, not the server's.
+    const tz = req.business.timezone || 'America/Toronto';
 
     const [callsToday, pendingBookings, pendingMods, totalCustomers, recentCalls] = await Promise.all([
-      query(`SELECT COUNT(*) FROM call_logs WHERE started_at::date = $1`, [today]),
-      query(`SELECT COUNT(*) FROM booking_requests WHERE status = 'pending'`),
-      query(`SELECT COUNT(*) FROM modification_requests WHERE status = 'pending'`),
-      query(`SELECT COUNT(*) FROM customers`),
-      query(`SELECT cl.*, c.name as customer_name
-             FROM call_logs cl LEFT JOIN customers c ON cl.customer_id = c.id
-             ORDER BY cl.started_at DESC LIMIT 10`)
+      query(
+        `SELECT COUNT(*)::int AS count
+           FROM call_logs
+          WHERE business_id = $1
+            AND (started_at AT TIME ZONE $2)::date = (NOW() AT TIME ZONE $2)::date`,
+        [businessId, tz]
+      ),
+      query(
+        `SELECT COUNT(*)::int AS count FROM booking_requests
+          WHERE business_id = $1 AND status = 'pending'`,
+        [businessId]
+      ),
+      query(
+        `SELECT COUNT(*)::int AS count FROM modification_requests
+          WHERE business_id = $1 AND status = 'pending'`,
+        [businessId]
+      ),
+      query(
+        `SELECT COUNT(*)::int AS count FROM customers
+          WHERE business_id = $1`,
+        [businessId]
+      ),
+      query(
+        `SELECT cl.*, c.name AS customer_name
+           FROM call_logs cl
+           LEFT JOIN customers c
+             ON cl.customer_id = c.id
+            AND c.business_id = cl.business_id
+          WHERE cl.business_id = $1
+          ORDER BY cl.started_at DESC
+          LIMIT 10`,
+        [businessId]
+      )
     ]);
 
     res.json({
-      callsToday: parseInt(callsToday.rows[0].count),
-      pendingBookings: parseInt(pendingBookings.rows[0].count),
-      pendingModifications: parseInt(pendingMods.rows[0].count),
-      totalCustomers: parseInt(totalCustomers.rows[0].count),
+      callsToday: callsToday.rows[0].count,
+      pendingBookings: pendingBookings.rows[0].count,
+      pendingModifications: pendingMods.rows[0].count,
+      totalCustomers: totalCustomers.rows[0].count,
       recentCalls: recentCalls.rows
     });
   } catch (err) {
-    console.error('Dashboard error:', err.message);
+    console.error(`[tenant:${businessId}] Dashboard error:`, err.message);
     res.status(500).json({ error: 'Failed to load dashboard' });
   }
 });
@@ -50,32 +141,222 @@ router.get('/dashboard', async (req, res) => {
 // SETTINGS
 // ============================================
 
-// GET /api/settings — Get all settings
+// GET /api/settings — Get all settings for this tenant
 router.get('/settings', async (req, res) => {
+  const businessId = tenantId(req);
   try {
-    const result = await query('SELECT key, value, description FROM settings ORDER BY key');
-    const settings = {};
-    for (const row of result.rows) {
-      settings[row.key] = { value: row.value, description: row.description };
-    }
+    // getAllSettings already returns { key: { value, description } }, so we
+    // can forward it straight to the client. (An earlier version iterated
+    // as if it were an array and silently produced an empty response.)
+    const settings = await getAllSettings(businessId);
     res.json(settings);
   } catch (err) {
+    console.error(`[tenant:${businessId}] Settings load error:`, err.message);
     res.status(500).json({ error: 'Failed to load settings' });
   }
 });
 
-// PUT /api/settings/:key — Update a specific setting
+// PUT /api/settings/:key — Update a specific setting for this tenant
 router.put('/settings/:key', async (req, res) => {
+  const businessId = tenantId(req);
   try {
     const { key } = req.params;
-    const { value } = req.body;
+    const { value, description } = req.body;
     if (value === undefined) {
       return res.status(400).json({ error: 'Value is required' });
     }
-    const result = await updateSetting(key, value);
+    const result = await updateSetting(businessId, key, value, description);
+    // Audit — intentionally log only the KEY, not the full value. Settings
+    // can include credentials/PII-adjacent fields (notification targets,
+    // SMS numbers, etc.) and we don't want to duplicate them into audit.
+    // If you need the value, the `settings` row itself is the source of
+    // truth; the audit entry just tells you *who* touched *which key*.
+    await logEventFromReq(req, {
+      businessId,
+      action: 'setting.updated',
+      targetType: 'setting',
+      targetId: key,
+      meta: {
+        key,
+        description_changed: description !== undefined
+      }
+    });
     res.json(result);
   } catch (err) {
+    console.error(`[tenant:${businessId}] Settings update error:`, err.message);
     res.status(500).json({ error: 'Failed to update setting' });
+  }
+});
+
+// ============================================
+// PHONE NUMBERS (Phase 5) — tenant-scoped
+// ============================================
+//
+// Business admins manage DIDs for their OWN tenant here. Staff have
+// read-only access; only business_admin + super_admin may mutate. The
+// routes are a thin wrapper around the same helpers used by /api/super/*,
+// but they never take a businessId from the URL — it always comes from
+// `req.business.id`, which is the JWT tenant (CLAUDE.md §3.2).
+
+// Minimal E.164 validator. The UI validates too, but the backend must
+// defend itself.
+const PHONE_E164_RE = /^\+[1-9]\d{7,14}$/;
+function isValidPhoneE164(s) {
+  return typeof s === 'string' && PHONE_E164_RE.test(s.trim());
+}
+
+function requireBusinessAdmin(req, res, next) {
+  const role = req.auth?.role;
+  if (role === SUPER_ADMIN_ROLE || role === 'business_admin') return next();
+  return res.status(403).json({ error: 'Only business admins can modify phone numbers' });
+}
+
+// GET /api/phone-numbers — List this tenant's DIDs
+router.get('/phone-numbers', async (req, res) => {
+  const businessId = tenantId(req);
+  try {
+    const rows = await listBusinessPhoneNumbers(businessId);
+    res.json({ phone_numbers: rows });
+  } catch (err) {
+    console.error(`[tenant:${businessId}] List phones error:`, err.message);
+    res.status(500).json({ error: 'Failed to load phone numbers' });
+  }
+});
+
+// POST /api/phone-numbers — Add a new DID to this tenant
+router.post('/phone-numbers', requireBusinessAdmin, async (req, res) => {
+  const businessId = tenantId(req);
+  const phone = String(req.body?.phone_number || '').trim();
+  if (!isValidPhoneE164(phone)) {
+    return res.status(400).json({ error: 'phone_number must be E.164 (e.g. +19053334444)' });
+  }
+  const label = typeof req.body?.label === 'string' ? req.body.label.trim().slice(0, 50) : null;
+  const isPrimary = req.body?.is_primary === true;
+  const status = req.body?.status === 'inactive' ? 'inactive' : 'active';
+  if (isPrimary && status !== 'active') {
+    return res.status(400).json({ error: 'Primary numbers must be active' });
+  }
+  try {
+    const row = await addBusinessPhoneNumber(businessId, {
+      phone_number: phone, label, is_primary: isPrimary, status
+    });
+    console.log(`[tenant:${businessId}] Added phone ${phone} (primary=${isPrimary}, status=${status})`);
+    await logEventFromReq(req, {
+      businessId,
+      action: 'phone.added',
+      targetType: 'phone_number',
+      targetId: row.id,
+      meta: {
+        phone_number: row.phone_number,
+        label: row.label,
+        is_primary: row.is_primary,
+        status: row.status
+      }
+    });
+    res.status(201).json({ phone_number: row });
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'That phone number is already registered' });
+    }
+    console.error(`[tenant:${businessId}] Add phone error:`, err.message);
+    res.status(500).json({ error: err.message || 'Failed to add phone number' });
+  }
+});
+
+// PATCH /api/phone-numbers/:phoneId — Update a DID on this tenant
+router.patch('/phone-numbers/:phoneId', requireBusinessAdmin, async (req, res) => {
+  const businessId = tenantId(req);
+  const phoneId = parseInt(req.params.phoneId, 10);
+  if (!Number.isInteger(phoneId) || phoneId <= 0) {
+    return res.status(400).json({ error: 'invalid phone id' });
+  }
+  const patch = {};
+  if (typeof req.body?.phone_number === 'string') {
+    const p = req.body.phone_number.trim();
+    if (!isValidPhoneE164(p)) {
+      return res.status(400).json({ error: 'phone_number must be E.164' });
+    }
+    patch.phone_number = p;
+  }
+  if (typeof req.body?.label === 'string') patch.label = req.body.label;
+  if (req.body?.status === 'active' || req.body?.status === 'inactive') {
+    patch.status = req.body.status;
+  }
+  if (req.body?.is_primary === true || req.body?.is_primary === false) {
+    patch.is_primary = req.body.is_primary;
+  }
+  if (Object.keys(patch).length === 0) {
+    return res.status(400).json({ error: 'no recognised fields to update' });
+  }
+  try {
+    const row = await updateBusinessPhoneNumber(businessId, phoneId, patch);
+    if (!row) return res.status(404).json({ error: 'Phone number not found' });
+    console.log(`[tenant:${businessId}] Patched phone ${phoneId}: ${Object.keys(patch).join(', ')}`);
+    await logEventFromReq(req, {
+      businessId,
+      action: 'phone.updated',
+      targetType: 'phone_number',
+      targetId: row.id,
+      meta: {
+        fields: Object.keys(patch),
+        patch,
+        phone_number: row.phone_number,
+        label: row.label,
+        is_primary: row.is_primary,
+        status: row.status
+      }
+    });
+    res.json({ phone_number: row });
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'That phone number is already registered' });
+    }
+    if (err.code === 'INVALID_STATE') {
+      return res.status(400).json({ error: err.message });
+    }
+    console.error(`[tenant:${businessId}] Patch phone error:`, err.message);
+    res.status(500).json({ error: err.message || 'Failed to update phone number' });
+  }
+});
+
+// DELETE /api/phone-numbers/:phoneId — Remove a DID from this tenant
+router.delete('/phone-numbers/:phoneId', requireBusinessAdmin, async (req, res) => {
+  const businessId = tenantId(req);
+  const phoneId = parseInt(req.params.phoneId, 10);
+  if (!Number.isInteger(phoneId) || phoneId <= 0) {
+    return res.status(400).json({ error: 'invalid phone id' });
+  }
+  try {
+    // Snapshot before delete so we can record the number + primary flag
+    // in the audit row (tenant-scoped on both id + business_id).
+    const snapRes = await query(
+      `SELECT id, phone_number, label, is_primary, status
+         FROM business_phone_numbers
+        WHERE id = $1 AND business_id = $2`,
+      [phoneId, businessId]
+    );
+    const snapshot = snapRes.rows[0] || null;
+    const ok = await deleteBusinessPhoneNumber(businessId, phoneId);
+    if (!ok) return res.status(404).json({ error: 'Phone number not found' });
+    console.log(`[tenant:${businessId}] Deleted phone ${phoneId}`);
+    await logEventFromReq(req, {
+      businessId,
+      action: 'phone.deleted',
+      targetType: 'phone_number',
+      targetId: phoneId,
+      meta: snapshot
+        ? {
+            phone_number: snapshot.phone_number,
+            label: snapshot.label,
+            was_primary: snapshot.is_primary,
+            status_at_delete: snapshot.status
+          }
+        : { note: 'row already gone at read-before-delete; delete succeeded' }
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(`[tenant:${businessId}] Delete phone error:`, err.message);
+    res.status(500).json({ error: err.message || 'Failed to delete phone number' });
   }
 });
 
@@ -83,25 +364,38 @@ router.put('/settings/:key', async (req, res) => {
 // BOOKINGS
 // ============================================
 
-// GET /api/bookings — List all bookings (with optional status filter)
+// GET /api/bookings — List bookings for this tenant
 router.get('/bookings', async (req, res) => {
+  const businessId = tenantId(req);
   try {
     const { page = 1, limit = 50, status } = req.query;
-    const result = await getAllBookings(parseInt(page), parseInt(limit), status || null);
+    const result = await getAllBookings(
+      businessId,
+      parseInt(page),
+      parseInt(limit),
+      status || null
+    );
     res.json(result);
   } catch (err) {
+    console.error(`[tenant:${businessId}] Bookings list error:`, err.message);
     res.status(500).json({ error: 'Failed to load bookings' });
   }
 });
 
 // POST /api/bookings — Create a booking manually from Command Center
 router.post('/bookings', async (req, res) => {
+  const businessId = tenantId(req);
   try {
-    const { customer_name, customer_phone, customer_email, requested_date, requested_time, party_size, num_carts, special_requests } = req.body;
+    const {
+      customer_name, customer_phone, customer_email,
+      requested_date, requested_time,
+      party_size, num_carts, special_requests
+    } = req.body;
     if (!customer_name || !requested_date || !party_size) {
       return res.status(400).json({ error: 'customer_name, requested_date, and party_size are required' });
     }
     const booking = await createBookingRequest({
+      businessId,
       customerName: customer_name,
       customerPhone: customer_phone || null,
       customerEmail: customer_email || null,
@@ -114,16 +408,21 @@ router.post('/bookings', async (req, res) => {
     });
     res.json(booking);
   } catch (err) {
-    console.error('Failed to create booking:', err);
+    console.error(`[tenant:${businessId}] Failed to create booking:`, err.message);
     res.status(500).json({ error: 'Failed to create booking' });
   }
 });
 
 // PUT /api/bookings/:id — Update booking details from Command Center
 router.put('/bookings/:id', async (req, res) => {
+  const businessId = tenantId(req);
   try {
     const { id } = req.params;
-    const { customer_name, customer_phone, customer_email, requested_date, requested_time, party_size, num_carts, special_requests, staff_notes } = req.body;
+    const {
+      customer_name, customer_phone, customer_email,
+      requested_date, requested_time,
+      party_size, num_carts, special_requests, staff_notes
+    } = req.body;
     const result = await query(
       `UPDATE booking_requests SET
         customer_name = COALESCE($1, customer_name),
@@ -136,105 +435,131 @@ router.put('/bookings/:id', async (req, res) => {
         special_requests = COALESCE($8, special_requests),
         staff_notes = COALESCE($9, staff_notes),
         updated_at = NOW()
-       WHERE id = $10 RETURNING *`,
-      [customer_name || null, customer_phone || null, customer_email || null,
-       requested_date || null, requested_time || null,
-       party_size ? parseInt(party_size) : null, num_carts !== undefined ? parseInt(num_carts) : null,
-       special_requests || null, staff_notes || null, parseInt(id)]
+       WHERE id = $10 AND business_id = $11
+       RETURNING *`,
+      [
+        customer_name || null,
+        customer_phone || null,
+        customer_email || null,
+        requested_date || null,
+        requested_time || null,
+        party_size ? parseInt(party_size) : null,
+        num_carts !== undefined ? parseInt(num_carts) : null,
+        special_requests || null,
+        staff_notes || null,
+        parseInt(id),
+        businessId
+      ]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Booking not found' });
     res.json(result.rows[0]);
   } catch (err) {
-    console.error('Failed to update booking:', err);
+    console.error(`[tenant:${businessId}] Failed to update booking:`, err.message);
     res.status(500).json({ error: 'Failed to update booking' });
   }
 });
 
-// PUT /api/bookings/:id/status — Update booking status
+// PUT /api/bookings/:id/status — Update booking status (fires tenant SMS on change)
 router.put('/bookings/:id/status', async (req, res) => {
+  const businessId = tenantId(req);
   try {
     const { id } = req.params;
     const { status, staff_notes } = req.body;
     if (!['pending', 'confirmed', 'rejected', 'cancelled'].includes(status)) {
       return res.status(400).json({ error: 'Invalid status' });
     }
-    const booking = await updateBookingStatus(parseInt(id), status, staff_notes);
+    const booking = await updateBookingStatus(businessId, parseInt(id), status, staff_notes);
     if (!booking) {
       return res.status(404).json({ error: 'Booking not found' });
     }
     res.json(booking);
   } catch (err) {
+    console.error(`[tenant:${businessId}] Booking status error:`, err.message);
     res.status(500).json({ error: 'Failed to update booking' });
   }
 });
 
 // POST /api/bookings/:id/sms — Send a custom SMS to the customer for this booking
 router.post('/bookings/:id/sms', async (req, res) => {
+  const businessId = tenantId(req);
   try {
     const { id } = req.params;
     const { message } = req.body;
     if (!message || !message.trim()) {
       return res.status(400).json({ error: 'Message is required' });
     }
-    const result = await query('SELECT * FROM booking_requests WHERE id = $1', [parseInt(id)]);
+    const result = await query(
+      'SELECT * FROM booking_requests WHERE id = $1 AND business_id = $2',
+      [parseInt(id), businessId]
+    );
     const booking = result.rows[0];
     if (!booking) return res.status(404).json({ error: 'Booking not found' });
     if (!booking.customer_phone) return res.status(400).json({ error: 'No phone number on this booking' });
 
     const { sendSMS } = require('../services/notification');
-    await sendSMS(booking.customer_phone, message.trim());
+    await sendSMS(businessId, booking.customer_phone, message.trim());
     res.json({ ok: true, to: booking.customer_phone });
   } catch (err) {
-    console.error('Custom SMS error:', err.message);
+    console.error(`[tenant:${businessId}] Custom SMS error:`, err.message);
     res.status(500).json({ error: 'Failed to send SMS: ' + err.message });
   }
 });
 
 // PUT /api/bookings/:id/no-show — Mark a booking as no-show
 router.put('/bookings/:id/no-show', async (req, res) => {
+  const businessId = tenantId(req);
   try {
     const { id } = req.params;
     const { no_show } = req.body;
     const isNoShow = no_show !== false; // default to true
 
-    // Mark the booking
+    // Mark the booking (scoped to this tenant)
     const result = await query(
-      'UPDATE booking_requests SET no_show = $1 WHERE id = $2 RETURNING *',
-      [isNoShow, parseInt(id)]
+      `UPDATE booking_requests
+          SET no_show = $1
+        WHERE id = $2 AND business_id = $3
+        RETURNING *`,
+      [isNoShow, parseInt(id), businessId]
     );
     const booking = result.rows[0];
     if (!booking) return res.status(404).json({ error: 'Booking not found' });
 
-    // Update the customer's no-show count
+    // Update the tenant's customer row. Customer rows are scoped by
+    // (business_id, phone) so this can never bump another tenant's counter.
     if (booking.customer_phone) {
       if (isNoShow) {
         await query(
-          'UPDATE customers SET no_show_count = COALESCE(no_show_count, 0) + 1 WHERE phone = $1',
-          [booking.customer_phone]
+          `UPDATE customers
+              SET no_show_count = COALESCE(no_show_count, 0) + 1
+            WHERE business_id = $1 AND phone = $2`,
+          [businessId, booking.customer_phone]
         );
       } else {
-        // Undoing a no-show — decrement (don't go below 0)
         await query(
-          'UPDATE customers SET no_show_count = GREATEST(COALESCE(no_show_count, 0) - 1, 0) WHERE phone = $1',
-          [booking.customer_phone]
+          `UPDATE customers
+              SET no_show_count = GREATEST(COALESCE(no_show_count, 0) - 1, 0)
+            WHERE business_id = $1 AND phone = $2`,
+          [businessId, booking.customer_phone]
         );
       }
     }
 
     res.json(booking);
   } catch (err) {
-    console.error('No-show update failed:', err.message);
+    console.error(`[tenant:${businessId}] No-show update failed:`, err.message);
     res.status(500).json({ error: 'Failed to update no-show status' });
   }
 });
 
-// POST /api/reminders/send — Manually trigger day-before reminders
+// POST /api/reminders/send — Manually trigger day-before reminders for this tenant
 router.post('/reminders/send', async (req, res) => {
+  const businessId = tenantId(req);
   try {
     const { sendDayBeforeReminders } = require('../services/scheduled-tasks');
-    const result = await sendDayBeforeReminders();
+    const result = await sendDayBeforeReminders({ businessId, force: true });
     res.json(result);
   } catch (err) {
+    console.error(`[tenant:${businessId}] Reminders error:`, err.message);
     res.status(500).json({ error: 'Failed to send reminders: ' + err.message });
   }
 });
@@ -243,63 +568,89 @@ router.post('/reminders/send', async (req, res) => {
 // ANALYTICS
 // ============================================
 
-// GET /api/analytics — Dashboard analytics data
+// GET /api/analytics — Dashboard analytics data (scoped to this tenant)
 router.get('/analytics', async (req, res) => {
+  const businessId = tenantId(req);
+  const tz = req.business.timezone || 'America/Toronto';
   try {
-    // Calls per day (last 14 days)
-    const callsPerDay = await query(`
-      SELECT DATE(started_at AT TIME ZONE 'America/Toronto') as day,
-             COUNT(*) as calls
-      FROM call_logs
-      WHERE started_at >= NOW() - INTERVAL '14 days'
-      GROUP BY day ORDER BY day
-    `);
+    // Calls per day (last 14 days in tenant tz)
+    const callsPerDay = await query(
+      `SELECT (started_at AT TIME ZONE $2)::date AS day,
+              COUNT(*)::int AS calls
+         FROM call_logs
+        WHERE business_id = $1
+          AND started_at >= NOW() - INTERVAL '14 days'
+        GROUP BY day
+        ORDER BY day`,
+      [businessId, tz]
+    );
 
-    // Busiest hours (all time)
-    const busiestHours = await query(`
-      SELECT EXTRACT(HOUR FROM started_at AT TIME ZONE 'America/Toronto')::int as hour,
-             COUNT(*) as calls
-      FROM call_logs
-      GROUP BY hour ORDER BY hour
-    `);
+    // Busiest hours (all time, tenant tz)
+    const busiestHours = await query(
+      `SELECT EXTRACT(HOUR FROM started_at AT TIME ZONE $2)::int AS hour,
+              COUNT(*)::int AS calls
+         FROM call_logs
+        WHERE business_id = $1
+        GROUP BY hour
+        ORDER BY hour`,
+      [businessId, tz]
+    );
 
-    // Booking conversion: calls with a booking vs total calls (last 30 days)
-    const totalCalls30d = await query(`
-      SELECT COUNT(*) as total FROM call_logs
-      WHERE started_at >= NOW() - INTERVAL '30 days'
-    `);
-    const callsWithBooking30d = await query(`
-      SELECT COUNT(DISTINCT cl.id) as total
-      FROM call_logs cl
-      INNER JOIN booking_requests br ON br.call_id = cl.id
-      WHERE cl.started_at >= NOW() - INTERVAL '30 days'
-    `);
+    // Booking conversion (30d, this tenant)
+    const totalCalls30d = await query(
+      `SELECT COUNT(*)::int AS total FROM call_logs
+        WHERE business_id = $1 AND started_at >= NOW() - INTERVAL '30 days'`,
+      [businessId]
+    );
+    const callsWithBooking30d = await query(
+      `SELECT COUNT(DISTINCT cl.id)::int AS total
+         FROM call_logs cl
+         INNER JOIN booking_requests br
+           ON br.call_id = cl.id
+          AND br.business_id = cl.business_id
+        WHERE cl.business_id = $1
+          AND cl.started_at >= NOW() - INTERVAL '30 days'`,
+      [businessId]
+    );
 
-    // Average call duration (last 30 days, only completed calls)
-    const avgDuration = await query(`
-      SELECT ROUND(AVG(duration_seconds)) as avg_seconds
-      FROM call_logs
-      WHERE duration_seconds > 0
-        AND started_at >= NOW() - INTERVAL '30 days'
-    `);
+    // Average call duration (30d, this tenant)
+    const avgDuration = await query(
+      `SELECT ROUND(AVG(duration_seconds))::int AS avg_seconds
+         FROM call_logs
+        WHERE business_id = $1
+          AND duration_seconds > 0
+          AND started_at >= NOW() - INTERVAL '30 days'`,
+      [businessId]
+    );
 
-    // Total stats
-    const totalBookings = await query(`SELECT COUNT(*) as total FROM booking_requests`);
-    const confirmedBookings = await query(`SELECT COUNT(*) as total FROM booking_requests WHERE status = 'confirmed'`);
-    const noShows = await query(`SELECT COUNT(*) as total FROM booking_requests WHERE no_show = TRUE`);
+    // Totals (this tenant)
+    const totalBookings = await query(
+      `SELECT COUNT(*)::int AS total FROM booking_requests WHERE business_id = $1`,
+      [businessId]
+    );
+    const confirmedBookings = await query(
+      `SELECT COUNT(*)::int AS total FROM booking_requests
+        WHERE business_id = $1 AND status = 'confirmed'`,
+      [businessId]
+    );
+    const noShows = await query(
+      `SELECT COUNT(*)::int AS total FROM booking_requests
+        WHERE business_id = $1 AND no_show = TRUE`,
+      [businessId]
+    );
 
     res.json({
       callsPerDay: callsPerDay.rows,
       busiestHours: busiestHours.rows,
-      totalCalls30d: parseInt(totalCalls30d.rows[0]?.total || 0),
-      callsWithBooking30d: parseInt(callsWithBooking30d.rows[0]?.total || 0),
-      avgDurationSeconds: parseInt(avgDuration.rows[0]?.avg_seconds || 0),
-      totalBookings: parseInt(totalBookings.rows[0]?.total || 0),
-      confirmedBookings: parseInt(confirmedBookings.rows[0]?.total || 0),
-      totalNoShows: parseInt(noShows.rows[0]?.total || 0)
+      totalCalls30d: totalCalls30d.rows[0]?.total || 0,
+      callsWithBooking30d: callsWithBooking30d.rows[0]?.total || 0,
+      avgDurationSeconds: avgDuration.rows[0]?.avg_seconds || 0,
+      totalBookings: totalBookings.rows[0]?.total || 0,
+      confirmedBookings: confirmedBookings.rows[0]?.total || 0,
+      totalNoShows: noShows.rows[0]?.total || 0
     });
   } catch (err) {
-    console.error('Analytics query failed:', err.message);
+    console.error(`[tenant:${businessId}] Analytics query failed:`, err.message);
     res.status(500).json({ error: 'Failed to load analytics' });
   }
 });
@@ -308,30 +659,34 @@ router.get('/analytics', async (req, res) => {
 // MODIFICATIONS
 // ============================================
 
-// GET /api/modifications — List pending modification/cancellation requests
+// GET /api/modifications — List pending modification/cancellation requests (tenant)
 router.get('/modifications', async (req, res) => {
+  const businessId = tenantId(req);
   try {
-    const mods = await getPendingModifications();
+    const mods = await getPendingModifications(businessId);
     res.json(mods);
   } catch (err) {
+    console.error(`[tenant:${businessId}] Modifications list error:`, err.message);
     res.status(500).json({ error: 'Failed to load modifications' });
   }
 });
 
 // PUT /api/modifications/:id/status — Process a modification request
 router.put('/modifications/:id/status', async (req, res) => {
+  const businessId = tenantId(req);
   try {
     const { id } = req.params;
     const { status, staff_notes } = req.body;
     if (!['processed', 'rejected', 'pending'].includes(status)) {
       return res.status(400).json({ error: 'Invalid status. Must be processed, rejected, or pending.' });
     }
-    const mod = await updateModificationStatus(parseInt(id), status, staff_notes);
+    const mod = await updateModificationStatus(businessId, parseInt(id), status, staff_notes);
     if (!mod) {
       return res.status(404).json({ error: 'Modification request not found' });
     }
     res.json(mod);
   } catch (err) {
+    console.error(`[tenant:${businessId}] Modification status error:`, err.message);
     res.status(500).json({ error: 'Failed to update modification' });
   }
 });
@@ -340,8 +695,9 @@ router.put('/modifications/:id/status', async (req, res) => {
 // CUSTOMERS
 // ============================================
 
-// GET /api/customers — List all customers
+// GET /api/customers — List customers for this tenant
 router.get('/customers', async (req, res) => {
+  const businessId = tenantId(req);
   try {
     const { search, page = 1, limit = 50 } = req.query;
     const offset = (parseInt(page) - 1) * parseInt(limit);
@@ -349,77 +705,110 @@ router.get('/customers', async (req, res) => {
 
     if (search) {
       sql = `SELECT * FROM customers
-             WHERE LOWER(name) LIKE LOWER($1) OR phone LIKE $1 OR LOWER(email) LIKE LOWER($1)
-             ORDER BY last_call_at DESC LIMIT $2 OFFSET $3`;
-      params = [`%${search}%`, parseInt(limit), offset];
+              WHERE business_id = $1
+                AND (LOWER(name) LIKE LOWER($2) OR phone LIKE $2 OR LOWER(email) LIKE LOWER($2))
+              ORDER BY last_call_at DESC NULLS LAST
+              LIMIT $3 OFFSET $4`;
+      params = [businessId, `%${search}%`, parseInt(limit), offset];
     } else {
-      sql = 'SELECT * FROM customers ORDER BY last_call_at DESC LIMIT $1 OFFSET $2';
-      params = [parseInt(limit), offset];
+      sql = `SELECT * FROM customers
+              WHERE business_id = $1
+              ORDER BY last_call_at DESC NULLS LAST
+              LIMIT $2 OFFSET $3`;
+      params = [businessId, parseInt(limit), offset];
     }
 
     const result = await query(sql, params);
+
     let countSql, countParams;
     if (search) {
-      countSql = `SELECT COUNT(*) FROM customers WHERE LOWER(name) LIKE LOWER($1) OR phone LIKE $1 OR LOWER(email) LIKE LOWER($1)`;
-      countParams = [`%${search}%`];
+      countSql = `SELECT COUNT(*)::int AS count FROM customers
+                   WHERE business_id = $1
+                     AND (LOWER(name) LIKE LOWER($2) OR phone LIKE $2 OR LOWER(email) LIKE LOWER($2))`;
+      countParams = [businessId, `%${search}%`];
     } else {
-      countSql = 'SELECT COUNT(*) FROM customers';
-      countParams = [];
+      countSql = `SELECT COUNT(*)::int AS count FROM customers WHERE business_id = $1`;
+      countParams = [businessId];
     }
     const countResult = await query(countSql, countParams);
 
     res.json({
       customers: result.rows,
-      total: parseInt(countResult.rows[0].count),
+      total: countResult.rows[0].count,
       page: parseInt(page),
       limit: parseInt(limit)
     });
   } catch (err) {
+    console.error(`[tenant:${businessId}] Customers list error:`, err.message);
     res.status(500).json({ error: 'Failed to load customers' });
   }
 });
 
-// POST /api/customers — Manually add a new contact
+// POST /api/customers — Manually add a new contact for this tenant
 router.post('/customers', async (req, res) => {
+  const businessId = tenantId(req);
   try {
     const { name, phone, email, notes } = req.body;
     if (!name && !phone) return res.status(400).json({ error: 'Name or phone required' });
-    const { normalizePhone } = require('../services/caller-lookup');
     const normalized = phone ? normalizePhone(phone) : null;
 
-    // Check if phone already exists
+    // Dedupe within this tenant only — another tenant's customer with the
+    // same phone must remain independent.
     if (normalized) {
-      const existing = await query('SELECT * FROM customers WHERE phone = $1', [normalized]);
+      const existing = await query(
+        'SELECT * FROM customers WHERE business_id = $1 AND phone = $2',
+        [businessId, normalized]
+      );
       if (existing.rows.length > 0) {
-        // Update with name if missing
         const updated = await query(
-          `UPDATE customers SET name = COALESCE($1, name), email = COALESCE($2, email), notes = COALESCE($3, notes) WHERE phone = $4 RETURNING *`,
-          [name || null, email || null, notes || null, normalized]
+          `UPDATE customers
+              SET name = COALESCE($1, name),
+                  email = COALESCE($2, email),
+                  notes = COALESCE($3, notes)
+            WHERE business_id = $4 AND phone = $5
+            RETURNING *`,
+          [name || null, email || null, notes || null, businessId, normalized]
         );
         return res.json(updated.rows[0]);
       }
     }
 
     const result = await query(
-      `INSERT INTO customers (name, phone, email, notes, call_count, first_call_at, last_call_at)
-       VALUES ($1, $2, $3, $4, 0, NOW(), NOW()) RETURNING *`,
-      [name || null, normalized, email || null, notes || null]
+      `INSERT INTO customers
+         (business_id, name, phone, email, notes, call_count, first_call_at, last_call_at)
+       VALUES ($1, $2, $3, $4, $5, 0, NOW(), NOW())
+       RETURNING *`,
+      [businessId, name || null, normalized, email || null, notes || null]
     );
     res.json(result.rows[0]);
   } catch (err) {
-    console.error('Failed to create customer:', err.message);
+    console.error(`[tenant:${businessId}] Failed to create customer:`, err.message);
     res.status(500).json({ error: 'Failed to create contact' });
   }
 });
 
-// GET /api/customers/:id — Get a single customer with history
+// GET /api/customers/:id — Single customer with history (tenant-scoped)
 router.get('/customers/:id', async (req, res) => {
+  const businessId = tenantId(req);
   try {
     const { id } = req.params;
     const [customer, bookings, calls] = await Promise.all([
-      query('SELECT * FROM customers WHERE id = $1', [id]),
-      query('SELECT * FROM booking_requests WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 20', [id]),
-      query('SELECT * FROM call_logs WHERE customer_id = $1 ORDER BY started_at DESC LIMIT 20', [id])
+      query(
+        'SELECT * FROM customers WHERE id = $1 AND business_id = $2',
+        [id, businessId]
+      ),
+      query(
+        `SELECT * FROM booking_requests
+          WHERE customer_id = $1 AND business_id = $2
+          ORDER BY created_at DESC LIMIT 20`,
+        [id, businessId]
+      ),
+      query(
+        `SELECT * FROM call_logs
+          WHERE customer_id = $1 AND business_id = $2
+          ORDER BY started_at DESC LIMIT 20`,
+        [id, businessId]
+      )
     ]);
 
     if (customer.rows.length === 0) {
@@ -432,37 +821,51 @@ router.get('/customers/:id', async (req, res) => {
       calls: calls.rows
     });
   } catch (err) {
+    console.error(`[tenant:${businessId}] Customer load error:`, err.message);
     res.status(500).json({ error: 'Failed to load customer' });
   }
 });
 
-// PUT /api/customers/:id — Update customer info
+// PUT /api/customers/:id — Update customer info (tenant-scoped)
 router.put('/customers/:id', async (req, res) => {
+  const businessId = tenantId(req);
   try {
     const { id } = req.params;
-    const { name, email, phone, notes, custom_greeting, custom_greetings, customer_knowledge } = req.body;
+    const {
+      name, email, phone, notes,
+      custom_greeting, custom_greetings, customer_knowledge
+    } = req.body;
     const fields = [];
     const values = [];
     let p = 1;
 
     if (name !== undefined) { fields.push(`name = $${p++}`); values.push(name); }
     if (email !== undefined) { fields.push(`email = $${p++}`); values.push(email); }
-    if (phone !== undefined) { fields.push(`phone = $${p++}`); values.push(phone); }
+    if (phone !== undefined) { fields.push(`phone = $${p++}`); values.push(phone ? normalizePhone(phone) : null); }
     if (notes !== undefined) { fields.push(`notes = $${p++}`); values.push(notes); }
     if (custom_greeting !== undefined) { fields.push(`custom_greeting = $${p++}`); values.push(custom_greeting || null); }
-    if (custom_greetings !== undefined) { fields.push(`custom_greetings = $${p++}`); values.push(JSON.stringify(custom_greetings || [])); }
-    if (customer_knowledge !== undefined) { fields.push(`customer_knowledge = $${p++}`); values.push(customer_knowledge || null); }
+    if (custom_greetings !== undefined) {
+      fields.push(`custom_greetings = $${p++}`);
+      values.push(JSON.stringify(custom_greetings || []));
+    }
+    if (customer_knowledge !== undefined) {
+      fields.push(`customer_knowledge = $${p++}`);
+      values.push(customer_knowledge || null);
+    }
 
     if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
 
-    values.push(id);
+    values.push(id, businessId);
     const result = await query(
-      `UPDATE customers SET ${fields.join(', ')} WHERE id = $${p} RETURNING *`,
+      `UPDATE customers SET ${fields.join(', ')}
+        WHERE id = $${p++} AND business_id = $${p}
+        RETURNING *`,
       values
     );
     if (!result.rows[0]) return res.status(404).json({ error: 'Customer not found' });
     res.json(result.rows[0]);
   } catch (err) {
+    console.error(`[tenant:${businessId}] Customer update error:`, err.message);
     res.status(500).json({ error: 'Failed to update customer' });
   }
 });
@@ -471,47 +874,65 @@ router.put('/customers/:id', async (req, res) => {
 // CALL LOGS
 // ============================================
 
-// GET /api/calls — List call logs
+// GET /api/calls — List call logs (tenant-scoped)
 router.get('/calls', async (req, res) => {
+  const businessId = tenantId(req);
+  const tz = req.business.timezone || 'America/Toronto';
   try {
     const { page = 1, limit = 50, date } = req.query;
     const offset = (parseInt(page) - 1) * parseInt(limit);
     let sql, params;
 
     if (date) {
-      sql = `SELECT cl.*, c.name as customer_name
-             FROM call_logs cl LEFT JOIN customers c ON cl.customer_id = c.id
-             WHERE cl.started_at::date = $1
-             ORDER BY cl.started_at DESC LIMIT $2 OFFSET $3`;
-      params = [date, parseInt(limit), offset];
+      sql = `SELECT cl.*, c.name AS customer_name
+               FROM call_logs cl
+               LEFT JOIN customers c
+                 ON cl.customer_id = c.id
+                AND c.business_id = cl.business_id
+              WHERE cl.business_id = $1
+                AND (cl.started_at AT TIME ZONE $2)::date = $3
+              ORDER BY cl.started_at DESC
+              LIMIT $4 OFFSET $5`;
+      params = [businessId, tz, date, parseInt(limit), offset];
     } else {
-      sql = `SELECT cl.*, c.name as customer_name
-             FROM call_logs cl LEFT JOIN customers c ON cl.customer_id = c.id
-             ORDER BY cl.started_at DESC LIMIT $1 OFFSET $2`;
-      params = [parseInt(limit), offset];
+      sql = `SELECT cl.*, c.name AS customer_name
+               FROM call_logs cl
+               LEFT JOIN customers c
+                 ON cl.customer_id = c.id
+                AND c.business_id = cl.business_id
+              WHERE cl.business_id = $1
+              ORDER BY cl.started_at DESC
+              LIMIT $2 OFFSET $3`;
+      params = [businessId, parseInt(limit), offset];
     }
 
     const result = await query(sql, params);
     res.json({ calls: result.rows, page: parseInt(page), limit: parseInt(limit) });
   } catch (err) {
+    console.error(`[tenant:${businessId}] Calls list error:`, err.message);
     res.status(500).json({ error: 'Failed to load call logs' });
   }
 });
 
-// GET /api/calls/:id — Get a single call log with transcript
+// GET /api/calls/:id — Single call log with transcript (tenant-scoped)
 router.get('/calls/:id', async (req, res) => {
+  const businessId = tenantId(req);
   try {
     const result = await query(
-      `SELECT cl.*, c.name as customer_name
-       FROM call_logs cl LEFT JOIN customers c ON cl.customer_id = c.id
-       WHERE cl.id = $1`,
-      [req.params.id]
+      `SELECT cl.*, c.name AS customer_name
+         FROM call_logs cl
+         LEFT JOIN customers c
+           ON cl.customer_id = c.id
+          AND c.business_id = cl.business_id
+        WHERE cl.id = $1 AND cl.business_id = $2`,
+      [req.params.id, businessId]
     );
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Call log not found' });
     }
     res.json(result.rows[0]);
   } catch (err) {
+    console.error(`[tenant:${businessId}] Call log load error:`, err.message);
     res.status(500).json({ error: 'Failed to load call log' });
   }
 });
@@ -520,33 +941,58 @@ router.get('/calls/:id', async (req, res) => {
 // GREETINGS
 // ============================================
 
-// GET /api/greetings — List all greetings
+// GET /api/greetings — List greetings for this tenant
 router.get('/greetings', async (req, res) => {
+  const businessId = tenantId(req);
   try {
-    const result = await query('SELECT * FROM greetings ORDER BY for_known_caller, id');
+    const result = await query(
+      `SELECT * FROM greetings
+        WHERE business_id = $1
+        ORDER BY for_known_caller, id`,
+      [businessId]
+    );
     res.json(result.rows);
   } catch (err) {
+    console.error(`[tenant:${businessId}] Greetings list error:`, err.message);
     res.status(500).json({ error: 'Failed to load greetings' });
   }
 });
 
-// POST /api/greetings — Add a new greeting
+// POST /api/greetings — Add a new greeting for this tenant
 router.post('/greetings', async (req, res) => {
+  const businessId = tenantId(req);
   try {
     const { message, for_known_caller = false } = req.body;
     if (!message) return res.status(400).json({ error: 'Message is required' });
     const result = await query(
-      'INSERT INTO greetings (message, for_known_caller, active) VALUES ($1, $2, true) RETURNING *',
-      [message, for_known_caller]
+      `INSERT INTO greetings (business_id, message, for_known_caller, active)
+       VALUES ($1, $2, $3, true)
+       RETURNING *`,
+      [businessId, message, for_known_caller]
     );
-    res.json(result.rows[0]);
+    const row = result.rows[0];
+    await logEventFromReq(req, {
+      businessId,
+      action: 'greeting.created',
+      targetType: 'greeting',
+      targetId: row.id,
+      meta: {
+        for_known_caller: row.for_known_caller,
+        // Clip the stored message — audit is not the place for large
+        // copy-blocks, and the row itself is the source of truth.
+        message_preview: String(row.message || '').slice(0, 120)
+      }
+    });
+    res.json(row);
   } catch (err) {
+    console.error(`[tenant:${businessId}] Create greeting error:`, err.message);
     res.status(500).json({ error: 'Failed to create greeting' });
   }
 });
 
-// PUT /api/greetings/:id — Update a greeting
+// PUT /api/greetings/:id — Update a greeting for this tenant
 router.put('/greetings/:id', async (req, res) => {
+  const businessId = tenantId(req);
   try {
     const { message, active } = req.body;
     const fields = [];
@@ -554,23 +1000,42 @@ router.put('/greetings/:id', async (req, res) => {
     let p = 1;
     if (message !== undefined) { fields.push(`message = $${p++}`); values.push(message); }
     if (active !== undefined) { fields.push(`active = $${p++}`); values.push(active); }
-    values.push(req.params.id);
+    if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
+
+    values.push(req.params.id, businessId);
     const result = await query(
-      `UPDATE greetings SET ${fields.join(', ')} WHERE id = $${p} RETURNING *`,
+      `UPDATE greetings SET ${fields.join(', ')}
+        WHERE id = $${p++} AND business_id = $${p}
+        RETURNING *`,
       values
     );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Greeting not found' });
     res.json(result.rows[0]);
   } catch (err) {
+    console.error(`[tenant:${businessId}] Update greeting error:`, err.message);
     res.status(500).json({ error: 'Failed to update greeting' });
   }
 });
 
-// DELETE /api/greetings/:id — Remove a greeting
+// DELETE /api/greetings/:id — Remove a greeting (tenant-scoped)
 router.delete('/greetings/:id', async (req, res) => {
+  const businessId = tenantId(req);
   try {
-    await query('DELETE FROM greetings WHERE id = $1', [req.params.id]);
+    const result = await query(
+      'DELETE FROM greetings WHERE id = $1 AND business_id = $2 RETURNING id, for_known_caller',
+      [req.params.id, businessId]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Greeting not found' });
+    await logEventFromReq(req, {
+      businessId,
+      action: 'greeting.deleted',
+      targetType: 'greeting',
+      targetId: result.rows[0].id,
+      meta: { for_known_caller: result.rows[0].for_known_caller }
+    });
     res.json({ success: true });
   } catch (err) {
+    console.error(`[tenant:${businessId}] Delete greeting error:`, err.message);
     res.status(500).json({ error: 'Failed to delete greeting' });
   }
 });

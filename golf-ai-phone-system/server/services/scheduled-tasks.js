@@ -1,153 +1,190 @@
 /**
- * Scheduled Tasks Service
- * Handles recurring jobs like day-before reminder texts.
+ * Scheduled Tasks Service — multi-tenant.
  *
- * Runs on a simple setInterval — no external scheduler needed.
- * Uses Eastern time (America/Toronto) for all date logic since that's the course timezone.
+ * Runs once per 15 minutes and iterates every active business. For each
+ * tenant we honour that tenant's timezone and reminder settings, so a
+ * tenant in Vancouver gets 6 PM reminders at their local 6 PM and not
+ * 6 PM in Toronto.
  */
-const { query, getSetting } = require('../config/database');
+const { query, getSetting, listActiveBusinesses } = require('../config/database');
 const { sendSMS, formatShortDateTime } = require('./notification');
 
 /**
- * Get current Eastern time components
+ * Return the current hour/minute/date-string for a given IANA timezone.
  */
-function getEasternNow() {
+function getNowInTimezone(timezone) {
   const now = new Date();
   const formatter = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/Toronto',
+    timeZone: timezone,
     year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', hour12: false
   });
   const parts = formatter.formatToParts(now);
   const get = type => parts.find(p => p.type === type)?.value;
   return {
-    hour: parseInt(get('hour')),
-    minute: parseInt(get('minute')),
+    hour: parseInt(get('hour'), 10),
+    minute: parseInt(get('minute'), 10),
     dateStr: `${get('year')}-${get('month')}-${get('day')}`
   };
 }
 
 /**
- * Get tomorrow's date in YYYY-MM-DD format (Eastern time)
+ * Return YYYY-MM-DD for "tomorrow" in the given timezone.
  */
-function getTomorrowDateStr() {
+function getTomorrowDateStr(timezone) {
   const now = new Date();
-  // Add a day
   const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-  const formatter = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Toronto' });
+  const formatter = new Intl.DateTimeFormat('en-CA', { timeZone: timezone });
   return formatter.format(tomorrow);
 }
 
 /**
- * Send day-before reminder texts for tomorrow's confirmed bookings.
- * Only sends to customers who can receive SMS (mobile or alternate phone).
+ * Send day-before reminders for one tenant.
+ * Scoped by `business.id` on every query.
  */
-async function sendDayBeforeReminders() {
+async function sendDayBeforeRemindersForBusiness(business) {
+  const businessId = business.id;
+  const timezone = business.timezone || 'America/Toronto';
+  const businessName = business.name || 'Golf Course';
+  const transferNumber = business.transfer_number || '';
+
   try {
-    const settings = await getSetting('notifications');
+    const settings = await getSetting(businessId, 'notifications');
     if (!settings?.reminder_sms_enabled) {
-      console.log('[Reminders] Day-before reminders disabled — skipping');
+      console.log(`[tenant:${businessId}] Day-before reminders disabled — skipping`);
       return { sent: 0, skipped: 0, reason: 'disabled' };
     }
 
-    const tomorrow = getTomorrowDateStr();
-    console.log(`[Reminders] Checking for confirmed bookings on ${tomorrow}...`);
+    const tomorrow = getTomorrowDateStr(timezone);
+    console.log(`[tenant:${businessId}] Checking for confirmed bookings on ${tomorrow}...`);
 
-    // Get all confirmed bookings for tomorrow
+    // Join on customers scoped by the same business so a landline customer
+    // in a different tenant with the same phone can never satisfy this join.
     const res = await query(
       `SELECT br.*, c.line_type, c.alternate_phone
-       FROM booking_requests br
-       LEFT JOIN customers c ON c.phone = br.customer_phone
-       WHERE br.requested_date = $1
-         AND br.status = 'confirmed'
-         AND br.reminder_sent IS NOT TRUE`,
-      [tomorrow]
+         FROM booking_requests br
+         LEFT JOIN customers c
+           ON c.business_id = br.business_id
+          AND c.phone = br.customer_phone
+        WHERE br.business_id = $1
+          AND br.requested_date = $2
+          AND br.status = 'confirmed'
+          AND br.reminder_sent IS NOT TRUE`,
+      [businessId, tomorrow]
     );
 
     const bookings = res.rows;
     if (bookings.length === 0) {
-      console.log('[Reminders] No bookings to remind about tomorrow');
+      console.log(`[tenant:${businessId}] No bookings to remind about tomorrow`);
       return { sent: 0, skipped: 0, reason: 'no_bookings' };
     }
 
-    console.log(`[Reminders] Found ${bookings.length} confirmed bookings for tomorrow`);
+    console.log(`[tenant:${businessId}] Found ${bookings.length} confirmed bookings for tomorrow`);
 
     let sent = 0;
     let skipped = 0;
 
     for (const booking of bookings) {
-      // Determine the right phone to text
       let smsPhone = booking.customer_phone;
       if (booking.line_type === 'landline') {
         if (booking.alternate_phone) {
           smsPhone = booking.alternate_phone;
         } else {
-          console.log(`[Reminders] Skipping ${booking.customer_name} — landline, no alternate`);
+          console.log(`[tenant:${businessId}] Skipping ${booking.customer_name} — landline, no alternate`);
           skipped++;
           continue;
         }
       }
-
       if (!smsPhone) {
-        console.log(`[Reminders] Skipping ${booking.customer_name} — no phone number`);
+        console.log(`[tenant:${businessId}] Skipping ${booking.customer_name} — no phone number`);
         skipped++;
         continue;
       }
 
       try {
-        const when = formatShortDateTime(booking.requested_date, booking.requested_time);
+        const when = formatShortDateTime(booking.requested_date, booking.requested_time, timezone);
         const players = booking.party_size || 1;
         const playerWord = players === 1 ? 'player' : 'players';
         const firstName = booking.customer_name?.split(' ')[0] || 'there';
-        const msg = `Hey ${firstName}! Reminder: you've got a tee time tomorrow at Valleymede Columbus — ${when}, ${players} ${playerWord}. See you on the course! If plans change, call us at 905 655 6300.`;
+        const tail = transferNumber
+          ? `If plans change, call us at ${transferNumber}.`
+          : 'If plans change, please call us back.';
+        const msg = `Hey ${firstName}! Reminder: you've got a tee time tomorrow at ${businessName} — ${when}, ${players} ${playerWord}. See you on the course! ${tail}`;
 
-        await sendSMS(smsPhone, msg);
+        await sendSMS(businessId, smsPhone, msg);
 
-        // Mark as reminded so we don't double-send
-        await query('UPDATE booking_requests SET reminder_sent = TRUE WHERE id = $1', [booking.id]);
+        await query(
+          'UPDATE booking_requests SET reminder_sent = TRUE WHERE id = $1 AND business_id = $2',
+          [booking.id, businessId]
+        );
 
         sent++;
-        console.log(`[Reminders] ✓ Sent reminder to ${booking.customer_name} at ${smsPhone}`);
+        console.log(`[tenant:${businessId}] ✓ Sent reminder to ${booking.customer_name} at ${smsPhone}`);
       } catch (err) {
-        console.error(`[Reminders] Failed to send reminder to ${booking.customer_name}:`, err.message);
+        console.error(`[tenant:${businessId}] Failed to send reminder to ${booking.customer_name}:`, err.message);
         skipped++;
       }
     }
 
-    console.log(`[Reminders] Done — sent: ${sent}, skipped: ${skipped}`);
+    console.log(`[tenant:${businessId}] Reminders done — sent: ${sent}, skipped: ${skipped}`);
     return { sent, skipped, total: bookings.length };
   } catch (err) {
-    console.error('[Reminders] Error running reminders:', err.message);
+    console.error(`[tenant:${businessId}] Error running reminders:`, err.message);
     return { sent: 0, skipped: 0, error: err.message };
   }
 }
 
 /**
- * Start the reminder scheduler.
- * Checks every 15 minutes. Sends reminders at 6 PM Eastern.
- * The reminder_sent flag on each booking prevents double-sends.
+ * Iterate every active tenant and fire reminders in that tenant's local
+ * evening window. Exposed for ad-hoc manual runs and for scheduled
+ * invocation every 15 minutes.
+ *
+ * `options.force = true` sends regardless of the local clock — used from
+ * debug/admin endpoints so ops can manually kick off a run.
+ * `options.businessId` restricts the run to one tenant.
+ */
+async function sendDayBeforeReminders(options = {}) {
+  const { force = false, businessId = null } = options;
+  const results = [];
+  try {
+    const tenants = await listActiveBusinesses();
+    const scoped = businessId ? tenants.filter(t => t.id === businessId) : tenants;
+
+    for (const business of scoped) {
+      const tz = business.timezone || 'America/Toronto';
+      const { hour, minute } = getNowInTimezone(tz);
+      const inWindow = hour === 18 && minute < 15;
+
+      if (!force && !inWindow) continue;
+
+      const result = await sendDayBeforeRemindersForBusiness(business);
+      results.push({ business_id: business.id, slug: business.slug, ...result });
+    }
+  } catch (err) {
+    console.error('[Reminders] Failed to iterate tenants:', err.message);
+    return { error: err.message, results };
+  }
+  return { results };
+}
+
+/**
+ * Start the reminder scheduler. One shared interval fires every 15 minutes
+ * and each tenant decides independently whether the local 6 PM window is open.
  */
 let reminderInterval = null;
 function startReminderScheduler() {
-  console.log('[Reminders] Scheduler started — will send reminders at 6 PM Eastern');
+  console.log('[Reminders] Scheduler started — each tenant fires at their local 6 PM');
 
-  // Check every 15 minutes
-  reminderInterval = setInterval(async () => {
-    const { hour, minute } = getEasternNow();
+  reminderInterval = setInterval(() => {
+    sendDayBeforeReminders().catch(err =>
+      console.error('[Reminders] Scheduled run failed:', err.message)
+    );
+  }, 15 * 60 * 1000);
 
-    // Send between 6:00 PM and 6:14 PM Eastern (one 15-min window)
-    if (hour === 18 && minute < 15) {
-      console.log('[Reminders] 6 PM window — triggering day-before reminders');
-      await sendDayBeforeReminders();
-    }
-  }, 15 * 60 * 1000); // every 15 minutes
-
-  // Also do an initial check in case server restarted during the window
-  const { hour, minute } = getEasternNow();
-  if (hour === 18 && minute < 15) {
-    console.log('[Reminders] Server started during 6 PM window — sending now');
-    sendDayBeforeReminders().catch(err => console.error('[Reminders] Initial check failed:', err.message));
-  }
+  // Catch a restart that lands inside any tenant's window.
+  sendDayBeforeReminders().catch(err =>
+    console.error('[Reminders] Initial check failed:', err.message)
+  );
 }
 
 function stopReminderScheduler() {
@@ -159,6 +196,7 @@ function stopReminderScheduler() {
 
 module.exports = {
   sendDayBeforeReminders,
+  sendDayBeforeRemindersForBusiness,
   startReminderScheduler,
   stopReminderScheduler
 };

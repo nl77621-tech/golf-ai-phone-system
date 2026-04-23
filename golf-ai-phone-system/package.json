@@ -1,7 +1,7 @@
 {
-  "name": "valleymede-golf-ai-phone",
+  "name": "golf-ai-phone-system",
   "version": "1.0.0",
-  "description": "AI Phone Answering System for Valleymede Columbus Golf Course",
+  "description": "Multi-tenant AI phone answering platform. First tenant: Valleymede Columbus Golf Course.",
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",

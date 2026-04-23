@@ -2,7 +2,15 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
 
 // ============================================
-// API Helper
+// API Helper + session storage
+// ============================================
+// localStorage keys
+//   gc_token              — JWT bearer token
+//   gc_session            — JSON { role, business_id, business_name, username, name }
+//   gc_selected_business  — super-admin only: numeric id of the tenant they're
+//                           currently acting as via the Business Switcher.
+//                           When set, the UI reads/writes tenant data via
+//                           /api/* with X-Business-Id: <id>.
 // ============================================
 const API_BASE = '';
 
@@ -10,18 +18,68 @@ function getToken() {
   return localStorage.getItem('gc_token');
 }
 
+function getSession() {
+  try {
+    const raw = localStorage.getItem('gc_session');
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function setSession(session) {
+  if (!session) {
+    localStorage.removeItem('gc_session');
+  } else {
+    localStorage.setItem('gc_session', JSON.stringify(session));
+  }
+}
+
+function getSelectedBusinessId() {
+  const v = localStorage.getItem('gc_selected_business');
+  return v ? parseInt(v, 10) : null;
+}
+
+function setSelectedBusinessId(id) {
+  if (id === null || id === undefined) {
+    localStorage.removeItem('gc_selected_business');
+  } else {
+    localStorage.setItem('gc_selected_business', String(id));
+  }
+}
+
+function clearAuth() {
+  localStorage.removeItem('gc_token');
+  localStorage.removeItem('gc_session');
+  localStorage.removeItem('gc_selected_business');
+}
+
+// Decide whether to attach X-Business-Id for this request. Only super-admin
+// sessions do — tenant users must not try to override their JWT binding.
+function inferBusinessHeader(path) {
+  const session = getSession();
+  if (!session || session.role !== 'super_admin') return null;
+  const selected = getSelectedBusinessId();
+  if (!selected) return null;
+  // Don't send it on super-admin-only endpoints or on auth routes.
+  if (path.startsWith('/api/super') || path.startsWith('/auth')) return null;
+  return selected;
+}
+
 async function api(path, options = {}) {
   const token = getToken();
+  const businessHeader = inferBusinessHeader(path);
   const res = await fetch(`${API_BASE}${path}`, {
     ...options,
     headers: {
       'Content-Type': 'application/json',
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(businessHeader ? { 'X-Business-Id': String(businessHeader) } : {}),
       ...options.headers
     }
   });
   if (res.status === 401) {
-    localStorage.removeItem('gc_token');
+    clearAuth();
     window.location.reload();
     throw new Error('Unauthorized');
   }
@@ -51,6 +109,20 @@ function LoginPage({ onLogin }) {
         body: JSON.stringify({ username, password })
       });
       localStorage.setItem('gc_token', data.token);
+      setSession({
+        role: data.role,
+        business_id: data.business_id,
+        business_name: data.business_name || null,
+        username: data.username,
+        name: data.name
+      });
+      // Super admin starts with no business selected; tenant users bind
+      // the switcher to their own tenant so api() header logic is uniform.
+      if (data.role === 'super_admin') {
+        setSelectedBusinessId(null);
+      } else {
+        setSelectedBusinessId(data.business_id);
+      }
       onLogin(data);
     } catch (err) {
       setError('Invalid username or password');
@@ -63,8 +135,8 @@ function LoginPage({ onLogin }) {
     React.createElement('div', { className: 'bg-white rounded-2xl shadow-2xl p-8 w-full max-w-md' },
       React.createElement('div', { className: 'text-center mb-8' },
         React.createElement('div', { className: 'text-5xl mb-3' }, '\u26f3'),
-        React.createElement('h1', { className: 'text-2xl font-bold text-gray-800' }, 'Valleymede Columbus'),
-        React.createElement('p', { className: 'text-gray-500 mt-1' }, 'Command Center')
+        React.createElement('h1', { className: 'text-2xl font-bold text-gray-800' }, 'Command Center'),
+        React.createElement('p', { className: 'text-gray-500 mt-1' }, 'AI Phone Platform')
       ),
       React.createElement('form', { onSubmit: handleSubmit },
         error && React.createElement('div', { className: 'bg-red-50 text-red-600 p-3 rounded-lg mb-4 text-sm' }, error),
@@ -96,7 +168,7 @@ function LoginPage({ onLogin }) {
 // ============================================
 // SIDEBAR
 // ============================================
-function Sidebar({ currentPage, onNavigate, onLogout }) {
+function Sidebar({ currentPage, onNavigate, onLogout, tenantName }) {
   const menuItems = [
     { id: 'dashboard', label: 'Dashboard', icon: '\ud83d\udcca' },
     { id: 'teesheet', label: 'Tee Sheet', icon: '\u26f3' },
@@ -109,8 +181,8 @@ function Sidebar({ currentPage, onNavigate, onLogout }) {
   return React.createElement('aside', { className: 'w-64 bg-golf-800 text-white min-h-screen flex flex-col' },
     React.createElement('div', { className: 'p-6 border-b border-golf-700' },
       React.createElement('div', { className: 'text-2xl mb-1' }, '\u26f3'),
-      React.createElement('h2', { className: 'font-bold text-lg' }, 'Valleymede'),
-      React.createElement('p', { className: 'text-golf-200 text-sm' }, 'Command Center')
+      React.createElement('h2', { className: 'font-bold text-lg truncate' }, tenantName || 'Command Center'),
+      React.createElement('p', { className: 'text-golf-200 text-sm' }, tenantName ? 'Command Center' : 'AI Phone Platform')
     ),
     React.createElement('nav', { className: 'flex-1 p-4' },
       menuItems.map(item =>
@@ -1268,6 +1340,214 @@ function DailyInstructionsTab({ settings, saveSetting, saving }) {
 }
 
 // ============================================
+// PHONE NUMBERS MANAGER (Phase 5)
+// ============================================
+//
+// Reusable panel for listing + CRUD on business_phone_numbers. Powers both:
+//   - The tenant Settings → Phones tab (endpointBase='/api/phone-numbers')
+//   - The Super Admin dashboard's per-business phone manager
+//     (endpointBase='/api/super/businesses/:id/phone-numbers').
+//
+// The parent is responsible for passing the right base URL. Everything else
+// — E.164 validation, primary enforcement, status toggles — is encapsulated
+// here and must match the backend's rules so the UX never gets wedged.
+function PhoneNumbersManager({ endpointBase, canEdit = true, title = 'Phone Numbers' }) {
+  const [phones, setPhones] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState('');
+  const [newPhone, setNewPhone] = useState('');
+  const [newLabel, setNewLabel] = useState('');
+  const [newIsPrimary, setNewIsPrimary] = useState(false);
+
+  const load = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const data = await api(endpointBase);
+      setPhones(Array.isArray(data.phone_numbers) ? data.phone_numbers : []);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { load(); }, [endpointBase]);
+
+  const handleAdd = async () => {
+    const phone = newPhone.trim();
+    if (!isValidE164(phone)) {
+      alert('Phone must be in E.164 format, e.g. +19053334444');
+      return;
+    }
+    setBusy('add');
+    try {
+      await api(endpointBase, {
+        method: 'POST',
+        body: JSON.stringify({
+          phone_number: phone,
+          label: newLabel.trim() || undefined,
+          is_primary: newIsPrimary
+        })
+      });
+      setNewPhone('');
+      setNewLabel('');
+      setNewIsPrimary(false);
+      await load();
+    } catch (err) {
+      alert('Failed to add phone: ' + err.message);
+    } finally {
+      setBusy('');
+    }
+  };
+
+  // Build a human-readable label for a phone row, used in confirm dialogs so
+  // the operator sees exactly which number is about to change.
+  const describePhone = (p) =>
+    p.label ? `${p.phone_number} (${p.label})` : p.phone_number;
+
+  const patchPhone = async (phoneId, patch, confirmMsg) => {
+    if (confirmMsg && !window.confirm(confirmMsg)) return;
+    setBusy('p' + phoneId);
+    try {
+      await api(`${endpointBase}/${phoneId}`, {
+        method: 'PATCH',
+        body: JSON.stringify(patch)
+      });
+      await load();
+    } catch (err) {
+      alert('Failed: ' + err.message);
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const deletePhone = async (phone) => {
+    const label = describePhone(phone);
+    const primaryWarn = phone.is_primary
+      ? '\n\nThis is the PRIMARY number — deleting it will leave outbound SMS without a configured From address until another number is promoted.'
+      : '';
+    const msg =
+      `Permanently delete ${label}?\n\n` +
+      `Inbound calls to this number will stop resolving to this business.${primaryWarn}\n\n` +
+      `This cannot be undone. Prefer "Disable" if you just want to pause it.`;
+    if (!window.confirm(msg)) return;
+    setBusy('d' + phone.id);
+    try {
+      await api(`${endpointBase}/${phone.id}`, { method: 'DELETE' });
+      await load();
+    } catch (err) {
+      alert('Failed: ' + err.message);
+    } finally {
+      setBusy('');
+    }
+  };
+
+  if (loading) return React.createElement('div', { className: 'p-4 text-gray-500 text-sm' }, 'Loading phone numbers\u2026');
+
+  return React.createElement('div', null,
+    React.createElement('div', { className: 'mb-4' },
+      React.createElement('h3', { className: 'font-semibold text-lg text-gray-800' }, title),
+      React.createElement('p', { className: 'text-sm text-gray-500 mt-1' },
+        'Numbers listed here route inbound Twilio calls to this business. ',
+        React.createElement('strong', null, 'Primary'),
+        ' is the From-address for outbound SMS. Inactive numbers no longer route calls.'
+      )
+    ),
+
+    error && React.createElement('div', { className: 'bg-red-50 border border-red-200 text-red-600 text-sm rounded-lg px-3 py-2 mb-3' }, error),
+
+    // Existing numbers
+    phones.length === 0
+      ? React.createElement('div', { className: 'text-sm text-gray-400 italic mb-4' }, 'No phone numbers configured yet.')
+      : React.createElement('div', { className: 'flex flex-col gap-2 mb-6' },
+          phones.map(p => {
+            const isActive = p.status === 'active';
+            return React.createElement('div', {
+              key: p.id,
+              className: `flex items-center gap-3 rounded-lg border px-3 py-2 text-sm ${p.is_primary ? 'border-golf-300 bg-golf-50' : isActive ? 'bg-white' : 'bg-gray-50 opacity-75'}`
+            },
+              React.createElement('div', { className: 'flex-1 min-w-0' },
+                React.createElement('div', { className: 'flex items-center gap-2 flex-wrap' },
+                  React.createElement('span', { className: 'font-mono font-medium text-gray-900' }, p.phone_number),
+                  p.is_primary && React.createElement('span', { className: 'text-xs px-2 py-0.5 rounded-full bg-golf-600 text-white font-semibold' }, 'PRIMARY'),
+                  !isActive && React.createElement('span', { className: 'text-xs px-2 py-0.5 rounded-full bg-gray-300 text-gray-700 font-semibold' }, 'INACTIVE')
+                ),
+                React.createElement('div', { className: 'text-xs text-gray-500 mt-0.5' }, p.label || '\u2014')
+              ),
+              canEdit && React.createElement('div', { className: 'flex items-center gap-2 flex-wrap justify-end' },
+                !p.is_primary && isActive && React.createElement('button', {
+                  onClick: () => patchPhone(p.id, { is_primary: true },
+                    `Make ${describePhone(p)} the primary number?\n\n` +
+                    `The current primary will be demoted, and outbound SMS will start using this number as the From address.`
+                  ),
+                  disabled: busy === 'p' + p.id,
+                  className: 'text-xs px-2.5 py-1 rounded-md border border-golf-300 text-golf-700 hover:bg-golf-50'
+                }, 'Make primary'),
+                React.createElement('button', {
+                  onClick: () => patchPhone(p.id, { status: isActive ? 'inactive' : 'active' },
+                    isActive
+                      ? `Disable ${describePhone(p)}?\n\n` +
+                        `Inbound calls to this number will stop routing to this business immediately. ` +
+                        `The row is preserved — you can re-enable it later.`
+                      : `Re-enable ${describePhone(p)}?\n\n` +
+                        `Inbound calls to this number will resume routing to this business.`
+                  ),
+                  disabled: busy === 'p' + p.id || (p.is_primary && isActive),
+                  title: p.is_primary && isActive ? 'Demote this from primary first.' : '',
+                  className: `text-xs px-2.5 py-1 rounded-md border ${isActive ? 'border-amber-300 text-amber-700 hover:bg-amber-50' : 'border-green-300 text-green-700 hover:bg-green-50'} disabled:opacity-40 disabled:cursor-not-allowed`
+                }, isActive ? 'Disable' : 'Enable'),
+                React.createElement('button', {
+                  onClick: () => deletePhone(p),
+                  disabled: busy === 'd' + p.id,
+                  className: 'text-xs px-2.5 py-1 rounded-md border border-red-200 text-red-600 hover:bg-red-50'
+                }, 'Delete')
+              )
+            );
+          })
+        ),
+
+    canEdit && React.createElement('div', { className: 'border-t pt-4' },
+      React.createElement('h4', { className: 'font-semibold mb-2 text-gray-800' }, 'Add a phone number'),
+      React.createElement('div', { className: 'flex flex-col md:flex-row md:items-center gap-2' },
+        React.createElement('input', {
+          type: 'tel',
+          value: newPhone,
+          onChange: e => setNewPhone(e.target.value),
+          placeholder: '+19053334444',
+          className: 'flex-1 border rounded-lg px-3 py-2 text-sm font-mono'
+        }),
+        React.createElement('input', {
+          type: 'text',
+          value: newLabel,
+          onChange: e => setNewLabel(e.target.value),
+          placeholder: 'Label (e.g. Main Line)',
+          maxLength: 50,
+          className: 'flex-1 border rounded-lg px-3 py-2 text-sm'
+        }),
+        React.createElement('label', { className: 'flex items-center gap-2 text-sm text-gray-600 whitespace-nowrap' },
+          React.createElement('input', {
+            type: 'checkbox',
+            checked: newIsPrimary,
+            onChange: e => setNewIsPrimary(e.target.checked)
+          }),
+          'Set as primary'
+        ),
+        React.createElement('button', {
+          onClick: handleAdd,
+          disabled: busy === 'add' || !newPhone.trim(),
+          className: 'bg-golf-600 hover:bg-golf-700 text-white px-4 py-2 rounded-lg text-sm font-semibold disabled:opacity-50'
+        }, busy === 'add' ? 'Adding\u2026' : 'Add number')
+      ),
+      React.createElement('p', { className: 'text-xs text-gray-400 mt-2' },
+        'Format: E.164 with leading + and country code, e.g. +19053334444.'
+      )
+    )
+  );
+}
+
+// ============================================
 // SETTINGS PAGE
 // ============================================
 function SettingsPage() {
@@ -1317,10 +1597,12 @@ function SettingsPage() {
   const tabs = [
     { id: 'daily', label: '📋 Daily' },
     { id: 'general', label: 'General' },
+    { id: 'phones', label: '📞 Phones' },
     { id: 'knowledge', label: 'Knowledge' },
     { id: 'hours', label: 'Hours' },
     { id: 'pricing', label: 'Pricing' },
     { id: 'greetings', label: 'Greetings' },
+    { id: 'prompt', label: 'Prompt' },
     { id: 'notifications', label: 'Notifications' },
     { id: 'ai', label: 'AI Behavior' },
     { id: 'test', label: 'Test Mode' }
@@ -1390,6 +1672,46 @@ function SettingsPage() {
         React.createElement(SettingTextarea, { label: 'Course Announcements (JSON)', description: 'Active announcements. Format: [{"message": "...", "active": true}]',
           value: JSON.stringify(val('announcements') || [], null, 2),
           onSave: v => { try { saveSetting('announcements', JSON.parse(v)); } catch(e) { alert('Invalid JSON'); } }, saving: saving === 'announcements' })
+      ),
+
+      // PHONES TAB
+      activeTab === 'phones' && React.createElement('div', null,
+        React.createElement('p', { className: 'text-sm text-gray-500 mb-4' },
+          'Inbound Twilio DIDs that route to this business. Disable a number to take it offline without losing history.'
+        ),
+        React.createElement(PhoneNumbersManager, {
+          endpointBase: '/api/phone-numbers',
+          title: 'This Business\u2019s Phone Numbers'
+        })
+      ),
+
+      // PROMPT TAB
+      activeTab === 'prompt' && React.createElement('div', null,
+        React.createElement('p', { className: 'text-sm text-gray-500 mb-4' },
+          'Free-form system prompt additions. The AI receives these as extra instructions on top of the vertical template. Keep it short and specific — long blocks drown out the rest of the prompt.'
+        ),
+        React.createElement(SettingTextarea, {
+          label: 'Custom Prompt Additions',
+          description: 'Additional guidance layered onto the base system prompt. Example: "Always mention our loyalty program if the caller asks about pricing."',
+          value: val('custom_prompt') || '',
+          rows: 14,
+          onSave: v => saveSetting('custom_prompt', v),
+          saving: saving === 'custom_prompt'
+        }),
+        React.createElement(SettingField, {
+          label: 'AI Name',
+          description: 'The name the AI uses when introducing itself. Defaults to \u201cAI Assistant\u201d.',
+          value: val('ai_personality')?.name || '',
+          onSave: v => saveSetting('ai_personality', { ...val('ai_personality'), name: v }),
+          saving: saving === 'ai_personality'
+        }),
+        React.createElement(SettingField, {
+          label: 'Language Handling',
+          description: 'How the AI decides which language to respond in.',
+          value: val('ai_personality')?.language || '',
+          onSave: v => saveSetting('ai_personality', { ...val('ai_personality'), language: v }),
+          saving: saving === 'ai_personality'
+        })
       ),
 
       // KNOWLEDGE TAB
@@ -1464,7 +1786,7 @@ function SettingsPage() {
           React.createElement('h3', { className: 'font-semibold mb-2' }, 'Add New Greeting'),
           React.createElement('input', {
             type: 'text', value: newGreeting, onChange: e => setNewGreeting(e.target.value),
-            placeholder: 'e.g., Hey there! Thanks for calling Valleymede Columbus...',
+            placeholder: 'e.g., Hey there! Thanks for calling. How can I help you today?',
             className: 'w-full border rounded-lg px-3 py-2 mb-2 text-sm'
           }),
           React.createElement('div', { className: 'flex items-center gap-4' },
@@ -2058,22 +2380,1367 @@ function SettingTextarea({ label, description, value, onSave, saving, rows = 6 }
 }
 
 // ============================================
+// ACCEPT INVITE PAGE (public)
+// ============================================
+// Reached via /accept-invite?token=... — the super admin or business
+// admin who sent the invite hands this URL to the invitee. The page
+// validates the token against /auth/invite/:token, collects a password
+// (and optional name), then POSTs to /auth/accept-invite and drops the
+// user straight into the Command Center.
+function AcceptInvitePage() {
+  const [invite, setInvite] = useState(null);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [password, setPassword] = useState('');
+  const [confirm, setConfirm] = useState('');
+  const [name, setName] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  const token = new URLSearchParams(window.location.search).get('token') || '';
+
+  useEffect(() => {
+    if (!token) {
+      setError('Missing invite token.');
+      setLoading(false);
+      return;
+    }
+    api(`/auth/invite/${encodeURIComponent(token)}`)
+      .then(setInvite)
+      .catch(err => setError(err.message || 'Invite not found or expired.'))
+      .finally(() => setLoading(false));
+  }, [token]);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setError('');
+    if (password.length < 8) { setError('Password must be at least 8 characters.'); return; }
+    if (password !== confirm) { setError('Passwords do not match.'); return; }
+    setSubmitting(true);
+    try {
+      const data = await api('/auth/accept-invite', {
+        method: 'POST',
+        body: JSON.stringify({ token, password, name: name || null })
+      });
+      localStorage.setItem('gc_token', data.token);
+      setSession({
+        role: data.role,
+        business_id: data.business_id,
+        username: data.username,
+        name: data.name
+      });
+      if (data.role === 'super_admin') setSelectedBusinessId(null);
+      else setSelectedBusinessId(data.business_id);
+      // Drop the query string and reload — takes us into the main app.
+      window.location.href = '/';
+    } catch (err) {
+      setError(err.message || 'Failed to accept invite.');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const labelCls = 'block text-sm font-medium text-gray-700 mb-1';
+  const inputCls = 'w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-golf-500 focus:border-transparent outline-none';
+
+  return React.createElement('div', { className: 'min-h-screen flex items-center justify-center bg-gradient-to-br from-golf-800 to-golf-900 p-4' },
+    React.createElement('div', { className: 'bg-white rounded-2xl shadow-2xl p-8 w-full max-w-md' },
+      React.createElement('h1', { className: 'text-2xl font-bold text-gray-800 mb-2' }, 'Accept Invite'),
+      loading && React.createElement('p', { className: 'text-gray-500' }, 'Validating invite\u2026'),
+      !loading && error && React.createElement('div', { className: 'bg-red-50 text-red-600 p-3 rounded-lg text-sm' }, error),
+      !loading && invite && React.createElement('form', { onSubmit: handleSubmit },
+        React.createElement('p', { className: 'text-gray-600 mb-4 text-sm' },
+          `You've been invited to join `,
+          React.createElement('strong', null, invite.business_name || 'the platform'),
+          ` as `,
+          React.createElement('strong', null, invite.role.replace('_', ' ')),
+          `. Set a password to activate `,
+          React.createElement('span', { className: 'font-mono' }, invite.email),
+          '.'
+        ),
+        error && React.createElement('div', { className: 'bg-red-50 text-red-600 p-3 rounded-lg mb-4 text-sm' }, error),
+        React.createElement('div', { className: 'mb-4' },
+          React.createElement('label', { className: labelCls }, 'Your name'),
+          React.createElement('input', { className: inputCls, type: 'text', value: name, onChange: e => setName(e.target.value), placeholder: 'Jane Doe' })
+        ),
+        React.createElement('div', { className: 'mb-4' },
+          React.createElement('label', { className: labelCls }, 'Password'),
+          React.createElement('input', { className: inputCls, type: 'password', value: password, onChange: e => setPassword(e.target.value), minLength: 8, required: true })
+        ),
+        React.createElement('div', { className: 'mb-6' },
+          React.createElement('label', { className: labelCls }, 'Confirm password'),
+          React.createElement('input', { className: inputCls, type: 'password', value: confirm, onChange: e => setConfirm(e.target.value), minLength: 8, required: true })
+        ),
+        React.createElement('button', {
+          type: 'submit',
+          disabled: submitting,
+          className: 'w-full bg-golf-600 hover:bg-golf-700 text-white font-semibold py-2 px-4 rounded-lg transition-colors disabled:opacity-50'
+        }, submitting ? 'Activating\u2026' : 'Activate account')
+      )
+    )
+  );
+}
+
+// ============================================
+// BUSINESS SWITCHER (super admin only)
+// ============================================
+// Appears in the top bar when a super admin is signed in. Selecting a
+// business pins an X-Business-Id header on every subsequent /api/* call,
+// so super admins can "act as" a tenant for support / debugging without
+// logging out.
+function BusinessSwitcher({ businesses, selectedId, onSelect }) {
+  // Sort alphabetically so the dropdown is easy to scan even with dozens of
+  // tenants. Platform (no-tenant) always sits at the top.
+  const sorted = [...businesses].sort((a, b) =>
+    String(a.name || '').localeCompare(String(b.name || ''))
+  );
+  const options = [{ id: 'platform', label: 'Platform (no tenant)' }]
+    .concat(sorted.map(b => {
+      const suffix = b.status && b.status !== 'active' ? ` \u2022 ${b.status}` : '';
+      return { id: b.id, label: `${b.name}${suffix}` };
+    }));
+  const currentValue = selectedId || 'platform';
+  return React.createElement('select', {
+    value: currentValue,
+    onChange: e => {
+      const v = e.target.value;
+      onSelect(v === 'platform' ? null : parseInt(v, 10));
+    },
+    className: 'px-3 py-1.5 border border-gray-300 rounded-lg text-sm bg-white focus:ring-2 focus:ring-golf-500 focus:border-transparent outline-none max-w-[18rem]',
+    title: 'Switch which tenant you are acting as'
+  },
+    options.map(o =>
+      React.createElement('option', { key: o.id, value: o.id }, o.label)
+    )
+  );
+}
+
+// Two-letter avatar tile for a business, derived from the name. Purely
+// visual — we don't rely on the characters anywhere meaningful.
+function BusinessInitials({ name, size = 'md', color }) {
+  const letters = String(name || '?')
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map(w => w[0].toUpperCase())
+    .join('') || '?';
+  const sizeCls = size === 'lg'
+    ? 'w-12 h-12 text-base'
+    : size === 'sm'
+      ? 'w-7 h-7 text-xs'
+      : 'w-10 h-10 text-sm';
+  const bg = color || 'linear-gradient(135deg,#2E7D32,#1B5E20)';
+  return React.createElement('div', {
+    className: `${sizeCls} rounded-lg flex items-center justify-center text-white font-bold shrink-0`,
+    style: { background: bg }
+  }, letters);
+}
+
+// Visual status pill reused by the dashboard and the acting-as ribbon.
+function StatusPill({ status }) {
+  const tone = status === 'active' ? 'bg-green-100 text-green-700'
+    : status === 'trial' ? 'bg-blue-100 text-blue-700'
+    : status === 'suspended' ? 'bg-red-100 text-red-700'
+    : status === 'cancelled' ? 'bg-gray-200 text-gray-600'
+    : 'bg-gray-100 text-gray-600';
+  return React.createElement('span', {
+    className: `inline-block px-2 py-0.5 rounded-full text-[11px] font-semibold uppercase tracking-wider ${tone}`
+  }, status || 'unknown');
+}
+
+// A single metric chip ("Calls 30d · 42"). Compact enough to live inside a
+// card grid without taking over the composition.
+function MetricChip({ label, value, tone = 'default' }) {
+  const toneCls = tone === 'green' ? 'bg-green-50 text-green-700'
+    : tone === 'blue' ? 'bg-blue-50 text-blue-700'
+    : tone === 'amber' ? 'bg-amber-50 text-amber-700'
+    : 'bg-gray-50 text-gray-700';
+  return React.createElement('div', { className: `${toneCls} rounded-lg px-3 py-2` },
+    React.createElement('div', { className: 'text-[10px] uppercase tracking-wider opacity-70 font-semibold' }, label),
+    React.createElement('div', { className: 'text-base font-bold mt-0.5' }, value)
+  );
+}
+
+// Card rendered in the super-admin grid. Same information density as the
+// old table row, but scannable at a glance and prettier for a platform
+// operator flipping between tenants all day.
+function BusinessCard({ business, onActAs, onManagePhones }) {
+  return React.createElement('div', {
+    className: 'bg-white rounded-xl shadow-sm border hover:shadow-md transition-shadow overflow-hidden flex flex-col'
+  },
+    React.createElement('div', { className: 'p-5 flex items-start gap-3 border-b bg-gradient-to-br from-gray-50 to-white' },
+      React.createElement(BusinessInitials, {
+        name: business.name,
+        size: 'lg',
+        color: business.primary_color
+          ? `linear-gradient(135deg, ${business.primary_color}, ${business.primary_color}CC)`
+          : undefined
+      }),
+      React.createElement('div', { className: 'flex-1 min-w-0' },
+        React.createElement('div', { className: 'flex items-center gap-2 flex-wrap' },
+          React.createElement('h3', { className: 'text-base font-bold text-gray-800 truncate' }, business.name),
+          React.createElement(StatusPill, { status: business.status })
+        ),
+        React.createElement('p', { className: 'text-xs text-gray-500 font-mono mt-1 truncate' }, business.slug),
+        React.createElement('p', { className: 'text-xs text-gray-500 mt-1 truncate' },
+          business.twilio_phone_number || React.createElement('span', { className: 'italic text-amber-600' }, 'no phone number yet')
+        )
+      )
+    ),
+    React.createElement('div', { className: 'p-4 grid grid-cols-3 gap-2' },
+      React.createElement(MetricChip, { label: 'Users', value: business.active_user_count ?? 0 }),
+      React.createElement(MetricChip, { label: 'Calls 30d', value: business.calls_last_30d ?? 0, tone: 'blue' }),
+      React.createElement(MetricChip, { label: 'Bookings 30d', value: business.bookings_last_30d ?? 0, tone: 'green' })
+    ),
+    React.createElement('div', { className: 'px-4 py-3 bg-gray-50 border-t flex items-center justify-between text-xs gap-3' },
+      React.createElement('span', { className: 'text-gray-500 truncate' },
+        business.plan ? `Plan: ${business.plan}` : 'Plan: —',
+        business.setup_complete ? '' : ' \u2022 setup pending'
+      ),
+      React.createElement('div', { className: 'flex items-center gap-3 flex-shrink-0' },
+        typeof onManagePhones === 'function' && React.createElement('button', {
+          onClick: () => onManagePhones(business),
+          className: 'text-gray-600 hover:text-gray-900 font-semibold'
+        }, '\ud83d\udcde Phones'),
+        React.createElement('button', {
+          onClick: () => onActAs(business.id),
+          className: 'text-golf-700 hover:text-golf-900 font-semibold'
+        }, 'Act as \u2192')
+      )
+    )
+  );
+}
+
+// Lightweight modal that wraps PhoneNumbersManager for Super Admin use. The
+// modal is reused from the dashboard when the operator clicks "Phones" on a
+// business card — keeps the card compact while still giving ops full CRUD
+// without switching context.
+function PhoneNumbersModal({ business, onClose, onSaved }) {
+  if (!business) return null;
+  return React.createElement('div', {
+    className: 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4',
+    onClick: onClose
+  },
+    React.createElement('div', {
+      className: 'bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-hidden flex flex-col',
+      onClick: e => e.stopPropagation()
+    },
+      React.createElement('div', { className: 'px-6 py-4 border-b flex items-center justify-between bg-gray-50' },
+        React.createElement('div', null,
+          React.createElement('h2', { className: 'text-lg font-bold text-gray-800' }, '\ud83d\udcde Phone Numbers'),
+          React.createElement('p', { className: 'text-xs text-gray-500 mt-0.5' }, `${business.name} (${business.slug})`)
+        ),
+        React.createElement('button', {
+          onClick: () => { if (typeof onSaved === 'function') onSaved(); onClose(); },
+          className: 'text-gray-400 hover:text-gray-600 text-2xl leading-none'
+        }, '\u00d7')
+      ),
+      React.createElement('div', { className: 'p-6 overflow-y-auto' },
+        React.createElement(PhoneNumbersManager, {
+          endpointBase: `/api/super/businesses/${business.id}/phone-numbers`,
+          title: 'Routing configuration'
+        })
+      ),
+      React.createElement('div', { className: 'px-6 py-3 border-t bg-gray-50 flex justify-end' },
+        React.createElement('button', {
+          onClick: () => { if (typeof onSaved === 'function') onSaved(); onClose(); },
+          className: 'bg-gray-200 hover:bg-gray-300 text-gray-800 px-4 py-2 rounded-lg text-sm font-semibold'
+        }, 'Done')
+      )
+    )
+  );
+}
+
+// ============================================
+// SUPER ADMIN DASHBOARD
+// ============================================
+// Cross-tenant overview for platform operators. Renders the business grid
+// with quick-scan cards, global totals, live search, and launches the
+// OnboardingWizard.
+function SuperAdminDashboard({ onSwitchInto, onBusinessCreated }) {
+  const [businesses, setBusinesses] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [showWizard, setShowWizard] = useState(false);
+  const [lastCreated, setLastCreated] = useState(null);
+  const [search, setSearch] = useState('');
+  const [phoneModalBiz, setPhoneModalBiz] = useState(null);
+  const [analytics, setAnalytics] = useState(null);
+  const [auditEvents, setAuditEvents] = useState([]);
+  const [showAudit, setShowAudit] = useState(false);
+
+  const refresh = useCallback(() => {
+    setLoading(true);
+    Promise.all([
+      api('/api/super/businesses'),
+      // Analytics and audit feed are nice-to-haves — if either
+      // endpoint fails (older backend, DB blip) the dashboard still
+      // renders the core business list.
+      api('/api/super/analytics').catch(() => null),
+      api('/api/super/audit-log?limit=10').catch(() => ({ events: [] }))
+    ])
+      .then(([bizResp, analyticsResp, auditResp]) => {
+        setBusinesses(bizResp.businesses || []);
+        setAnalytics(analyticsResp || null);
+        setAuditEvents(auditResp?.events || []);
+      })
+      .catch(err => setError(err.message))
+      .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const handleCreated = (resp) => {
+    refresh();
+    setLastCreated(resp || null);
+    setShowWizard(false);
+    // Let the parent App() refresh its top-level businesses list so the
+    // TopBar's BusinessSwitcher picks up the new tenant without a reload.
+    if (typeof onBusinessCreated === 'function') onBusinessCreated(resp);
+  };
+
+  // Cheap local filter over the already-loaded list.
+  const q = search.trim().toLowerCase();
+  const filtered = q
+    ? businesses.filter(b =>
+        [b.name, b.slug, b.twilio_phone_number, b.contact_email]
+          .some(v => String(v || '').toLowerCase().includes(q))
+      )
+    : businesses;
+
+  const totals = businesses.reduce((acc, b) => ({
+    tenants: acc.tenants + 1,
+    active: acc.active + (b.status === 'active' ? 1 : 0),
+    trial: acc.trial + (b.status === 'trial' ? 1 : 0),
+    calls: acc.calls + (b.calls_last_30d || 0),
+    bookings: acc.bookings + (b.bookings_last_30d || 0)
+  }), { tenants: 0, active: 0, trial: 0, calls: 0, bookings: 0 });
+
+  return React.createElement('div', { className: 'max-w-7xl mx-auto' },
+    // ---------- Header row ----------
+    React.createElement('div', { className: 'flex items-center justify-between mb-6 flex-wrap gap-3' },
+      React.createElement('div', null,
+        React.createElement('div', { className: 'flex items-center gap-2 mb-1' },
+          React.createElement('span', { className: 'text-xs uppercase tracking-wider font-semibold text-purple-600 bg-purple-50 px-2 py-0.5 rounded' }, 'Super Admin'),
+          React.createElement('span', { className: 'text-xs text-gray-400' }, 'Control Centre')
+        ),
+        React.createElement('h1', { className: 'text-2xl font-bold text-gray-800' }, 'Businesses'),
+        React.createElement('p', { className: 'text-sm text-gray-500 mt-1' }, 'Every tenant running on the platform, at a glance.')
+      ),
+      React.createElement('button', {
+        onClick: () => setShowWizard(true),
+        className: 'bg-golf-600 hover:bg-golf-700 text-white px-5 py-2.5 rounded-lg text-sm font-semibold shadow-sm flex items-center gap-2'
+      },
+        React.createElement('span', { className: 'text-lg leading-none' }, '+'),
+        React.createElement('span', null, 'New Business')
+      )
+    ),
+
+    // ---------- Global totals ----------
+    // Prefer the authoritative `/api/super/analytics` numbers (they
+    // include active-now calls + minutes + open invites). If the
+    // analytics call failed, fall back to summing the per-business
+    // counts we already have in hand.
+    React.createElement('div', { className: 'grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3 mb-3' },
+      React.createElement(MetricChip, {
+        label: 'Tenants',
+        value: analytics?.businesses?.total ?? totals.tenants
+      }),
+      React.createElement(MetricChip, {
+        label: 'Active',
+        value: analytics?.businesses?.active ?? totals.active,
+        tone: 'green'
+      }),
+      React.createElement(MetricChip, {
+        label: 'In Trial',
+        value: analytics?.businesses?.trial ?? totals.trial,
+        tone: 'blue'
+      }),
+      React.createElement(MetricChip, {
+        label: 'Calls Today',
+        value: analytics?.calls?.today ?? 0,
+        tone: 'blue'
+      }),
+      React.createElement(MetricChip, {
+        label: 'Active Now',
+        value: analytics?.calls?.active_now ?? 0,
+        tone: (analytics?.calls?.active_now || 0) > 0 ? 'green' : 'neutral'
+      }),
+      React.createElement(MetricChip, {
+        label: 'Minutes 30d',
+        value: analytics?.calls?.minutes_last_30d ?? Math.round((totals.calls || 0) * 2),
+        tone: 'blue'
+      }),
+      React.createElement(MetricChip, {
+        label: 'Open Invites',
+        value: analytics?.invites?.open ?? 0,
+        tone: (analytics?.invites?.open || 0) > 0 ? 'amber' : 'neutral'
+      })
+    ),
+    // Secondary row — bookings + user counts. Cheap to render, helpful
+    // at a glance, and gated on analytics being present so we don't
+    // draw an empty ghost strip if the endpoint failed.
+    analytics && React.createElement('div', { className: 'grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-3 mb-6' },
+      React.createElement(MetricChip, {
+        label: 'Bookings Today',
+        value: analytics.bookings?.today ?? 0,
+        tone: 'green'
+      }),
+      React.createElement(MetricChip, {
+        label: 'Bookings 30d',
+        value: analytics.bookings?.last_30d ?? totals.bookings,
+        tone: 'green'
+      }),
+      React.createElement(MetricChip, {
+        label: 'Pending Bookings',
+        value: analytics.bookings?.pending ?? 0,
+        tone: (analytics.bookings?.pending || 0) > 0 ? 'amber' : 'neutral'
+      }),
+      React.createElement(MetricChip, {
+        label: 'Business Users',
+        value: (analytics.users?.business_admins ?? 0) + (analytics.users?.staff ?? 0)
+      }),
+      React.createElement(MetricChip, {
+        label: 'Phones Active',
+        value: analytics.phones?.active ?? 0
+      })
+    ),
+
+    // ---------- Recent activity (audit log) ----------
+    // Collapsible so it doesn't dominate the dashboard, but visible on
+    // toggle so platform operators can spot a mis-click or a cross-tenant
+    // impersonation at a glance without leaving the dashboard.
+    React.createElement('div', { className: 'bg-white border rounded-xl mb-5 overflow-hidden' },
+      React.createElement('button', {
+        onClick: () => setShowAudit(s => !s),
+        className: 'w-full flex items-center justify-between px-4 py-3 text-left hover:bg-gray-50'
+      },
+        React.createElement('div', null,
+          React.createElement('div', { className: 'text-xs uppercase tracking-wider font-semibold text-gray-500' }, 'Recent Activity'),
+          React.createElement('div', { className: 'text-sm text-gray-700' },
+            auditEvents.length === 0
+              ? 'No recent activity'
+              : `Last ${auditEvents.length} platform-wide event${auditEvents.length === 1 ? '' : 's'}`
+          )
+        ),
+        React.createElement('span', { className: 'text-gray-400 text-xs' }, showAudit ? '\u25B2 Hide' : '\u25BC Show')
+      ),
+      showAudit && React.createElement('div', { className: 'border-t divide-y' },
+        auditEvents.length === 0
+          ? React.createElement('div', { className: 'px-4 py-6 text-sm text-gray-500 text-center' },
+              'Audit log is empty. Actions you take across tenants will show up here.'
+            )
+          : auditEvents.map(ev =>
+              React.createElement('div', { key: ev.id, className: 'px-4 py-2 flex items-center gap-3 text-sm' },
+                React.createElement('span', {
+                  className: 'text-xs font-mono bg-gray-100 text-gray-700 px-2 py-0.5 rounded whitespace-nowrap'
+                }, ev.action),
+                React.createElement('span', { className: 'text-gray-600 flex-1 truncate' },
+                  [
+                    ev.actor_email || ev.user_type || 'system',
+                    ev.target_type ? `${ev.target_type}:${ev.target_id || '-'}` : null,
+                    ev.business_id !== null && ev.business_id !== undefined ? `biz:${ev.business_id}` : null
+                  ].filter(Boolean).join(' \u2192 ')
+                ),
+                React.createElement('span', { className: 'text-xs text-gray-400 whitespace-nowrap' },
+                  new Date(ev.created_at).toLocaleString()
+                )
+              )
+            )
+      )
+    ),
+
+    error && React.createElement('div', { className: 'bg-red-50 text-red-600 p-3 rounded-lg mb-4 text-sm' }, error),
+
+    // ---------- Last-created ribbon ----------
+    lastCreated && React.createElement('div', { className: 'bg-green-50 border border-green-200 rounded-xl p-4 mb-5 text-sm' },
+      React.createElement('div', { className: 'flex items-start justify-between gap-4' },
+        React.createElement('div', { className: 'flex-1 min-w-0' },
+          React.createElement('p', { className: 'font-semibold text-green-800 mb-1' },
+            `\u2728 ${lastCreated.business?.name || 'New business'} is live.`
+          ),
+          lastCreated.invite && React.createElement('div', null,
+            React.createElement('p', { className: 'text-green-700 mb-2' }, `Share this magic link with ${lastCreated.invite.email}:`),
+            React.createElement('code', { className: 'block bg-white border border-green-200 rounded p-2 text-xs break-all' }, lastCreated.invite.invite_url),
+            React.createElement('button', {
+              onClick: () => { try { navigator.clipboard.writeText(lastCreated.invite.invite_url); } catch (_) {} },
+              className: 'text-green-700 text-xs mt-2 font-semibold underline'
+            }, 'Copy link')
+          ),
+          !lastCreated.invite && React.createElement('p', { className: 'text-green-700' }, 'No admin invite was generated. You can send one from the business card.')
+        ),
+        React.createElement('button', { onClick: () => setLastCreated(null), className: 'text-green-700 text-sm' }, '\u00d7')
+      )
+    ),
+
+    // ---------- Search ----------
+    !loading && businesses.length > 0 && React.createElement('div', { className: 'mb-4' },
+      React.createElement('input', {
+        type: 'text',
+        value: search,
+        onChange: e => setSearch(e.target.value),
+        placeholder: 'Search tenants by name, slug, phone, or email\u2026',
+        className: 'w-full px-4 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-golf-500 focus:border-transparent outline-none'
+      })
+    ),
+
+    loading && React.createElement('p', { className: 'text-gray-500' }, 'Loading businesses\u2026'),
+
+    // ---------- Empty state ----------
+    !loading && businesses.length === 0 && React.createElement('div', {
+      className: 'bg-white border border-dashed rounded-xl p-12 text-center'
+    },
+      React.createElement('div', { className: 'text-5xl mb-3' }, '\ud83c\udfcc\ufe0f'),
+      React.createElement('h3', { className: 'text-lg font-bold text-gray-800 mb-1' }, 'No businesses yet'),
+      React.createElement('p', { className: 'text-sm text-gray-500 mb-5' }, 'Spin up your first tenant and the AI receptionist is live in under 5 minutes.'),
+      React.createElement('button', {
+        onClick: () => setShowWizard(true),
+        className: 'bg-golf-600 hover:bg-golf-700 text-white px-5 py-2.5 rounded-lg text-sm font-semibold'
+      }, 'Create first business')
+    ),
+
+    // ---------- Card grid ----------
+    !loading && businesses.length > 0 && React.createElement('div', null,
+      filtered.length === 0 && React.createElement('p', { className: 'text-sm text-gray-400 py-4' },
+        `No tenants match "${search}".`
+      ),
+      React.createElement('div', { className: 'grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4' },
+        filtered.map(b =>
+          React.createElement(BusinessCard, {
+            key: b.id,
+            business: b,
+            onActAs: onSwitchInto,
+            onManagePhones: setPhoneModalBiz
+          })
+        )
+      )
+    ),
+
+    showWizard && React.createElement(OnboardingWizard, {
+      onCancel: () => setShowWizard(false),
+      onCreated: handleCreated,
+      // Thread through so the Success step can switch directly into the
+      // new tenant instead of bouncing through the dashboard first.
+      onActAs: onSwitchInto
+    }),
+
+    phoneModalBiz && React.createElement(PhoneNumbersModal, {
+      business: phoneModalBiz,
+      // After editing a tenant's phones, refresh the grid so updated
+      // primary / denormalized twilio_phone_number values show up on the
+      // card without a page reload.
+      onSaved: refresh,
+      onClose: () => setPhoneModalBiz(null)
+    })
+  );
+}
+
+// ============================================
+// ONBOARDING WIZARD (super admin only)
+// ============================================
+// Six-step guided flow for spinning up a new tenant. Everything happens in
+// memory until the final "Create business" click — the server only sees one
+// POST /api/super/businesses call with the full payload.
+//
+// Steps (in order):
+//   0. Basics        — name, slug, contact email, primary color, logo URL
+//   1. Phone numbers — primary Twilio DID + any additional lines
+//   2. Template      — vertical (Golf / Driving Range / Restaurant / Other)
+//   3. Review        — previews what the template applies
+//   4. Invite        — optional: send magic-link to first business admin
+//   5. Success       — confirmation screen with the invite URL
+// ---------- validation helpers (module-level so tests/inspection are trivial) ----------
+
+// Loose E.164: leading +, 8-15 digits total. Rejects common pasted noise like
+// parentheses, dashes, and spaces so operators don't ship a malformed DID
+// into Twilio.
+const E164_RE = /^\+[1-9]\d{7,14}$/;
+function isValidE164(v) {
+  const s = String(v || '').trim();
+  return s !== '' && E164_RE.test(s);
+}
+function isValidEmail(v) {
+  const s = String(v || '').trim();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
+}
+function slugifyClient(s) {
+  return String(s || '')
+    .toLowerCase().trim()
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+    .slice(0, 60);
+}
+
+function OnboardingWizard({ onCancel, onCreated, onActAs }) {
+  const [step, setStep] = useState(0);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const [templates, setTemplates] = useState([]);
+  const [loadingTemplates, setLoadingTemplates] = useState(true);
+  const [result, setResult] = useState(null);
+  const [form, setForm] = useState({
+    name: '',
+    slug: '',
+    contact_email: '',
+    contact_phone: '',
+    primary_color: '#2E7D32',
+    logo_url: '',
+    timezone: 'America/Toronto',
+    plan: 'starter',
+    twilio_phone_number: '',
+    transfer_number: '',
+    phone_numbers: [],              // [{ phone_number, label }]
+    template_key: 'golf_course',
+    admin_email: '',
+    admin_name: ''
+  });
+
+  // Live slug-availability state, driven by /api/super/slug-check.
+  //   status: 'idle' | 'checking' | 'available' | 'taken' | 'invalid' | 'error'
+  const [slugCheck, setSlugCheck] = useState({ status: 'idle', value: '' });
+
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+  // Auto-slugify while the slug field is untouched.
+  const [slugTouched, setSlugTouched] = useState(false);
+  useEffect(() => {
+    if (slugTouched) return;
+    setForm(f => ({ ...f, slug: slugifyClient(f.name) }));
+  }, [form.name, slugTouched]);
+
+  // Debounced slug uniqueness check. Runs whenever the slug changes.
+  // We don't block UI — the wizard still lets the operator proceed if the
+  // check fails, but the Next button disables on "taken" / "invalid".
+  useEffect(() => {
+    const slug = form.slug.trim();
+    if (!slug) { setSlugCheck({ status: 'idle', value: '' }); return; }
+    // Client-side quick-fail before a network round trip.
+    if (!/^[a-z0-9-]+$/.test(slug)) {
+      setSlugCheck({ status: 'invalid', value: slug, reason: 'Slugs can only use lowercase letters, numbers, and dashes.' });
+      return;
+    }
+    let cancelled = false;
+    setSlugCheck({ status: 'checking', value: slug });
+    const handle = setTimeout(() => {
+      api('/api/super/slug-check?slug=' + encodeURIComponent(slug))
+        .then(d => {
+          if (cancelled) return;
+          if (d.available) {
+            setSlugCheck({ status: 'available', value: slug, normalized: d.normalized });
+          } else {
+            setSlugCheck({
+              status: 'taken', value: slug, normalized: d.normalized,
+              existing_name: d.existing_name, existing_id: d.existing_id
+            });
+          }
+        })
+        .catch(err => {
+          if (cancelled) return;
+          setSlugCheck({ status: 'error', value: slug, reason: err.message || 'Slug check failed' });
+        });
+    }, 350);
+    return () => { cancelled = true; clearTimeout(handle); };
+  }, [form.slug]);
+
+  // Load templates on mount. Fall back to a hardcoded minimal list if the
+  // API is unreachable so the wizard still works.
+  useEffect(() => {
+    api('/api/super/templates')
+      .then(d => {
+        setTemplates(d.templates || []);
+        if (d.default_template_key) set('template_key', d.default_template_key);
+      })
+      .catch(() => {
+        setTemplates([
+          { key: 'golf_course', label: 'Golf Course', tagline: 'Tee times, pricing, league play.', icon_emoji: '\u26f3\ufe0f' },
+          { key: 'driving_range', label: 'Driving Range', tagline: 'Bay reservations, bucket pricing.', icon_emoji: '\ud83c\udfaf' },
+          { key: 'restaurant', label: 'Restaurant', tagline: 'Reservations, hours, menu Q&A.', icon_emoji: '\ud83c\udf7d\ufe0f' },
+          { key: 'other', label: 'Other / Generic', tagline: 'Safe, unopinionated starting point.', icon_emoji: '\u2728' }
+        ]);
+      })
+      .finally(() => setLoadingTemplates(false));
+  }, []);
+
+  const labelCls = 'block text-xs font-semibold text-gray-600 mb-1';
+  const inputCls = 'w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-golf-500 focus:border-transparent outline-none';
+
+  const steps = [
+    { title: 'Business basics', sub: 'Name, contact, branding' },
+    { title: 'Phone numbers',   sub: 'Route inbound calls + SMS' },
+    { title: 'Choose template', sub: 'Pick a vertical to seed defaults' },
+    { title: 'Review & confirm', sub: 'What we\u2019re about to apply' },
+    { title: 'First admin',      sub: 'Invite the business owner' },
+    { title: 'All set',          sub: 'Share the magic link' }
+  ];
+
+  // Per-step gating — disables "Next" until required fields exist and
+  // free-form inputs pass format checks. These MUST match the server-side
+  // checks (E.164, email, slug shape) so a green UI never produces a 400.
+  const extraPhoneErrors = (form.phone_numbers || [])
+    .map(p => p.phone_number && !isValidE164(p.phone_number));
+  const canAdvance = () => {
+    if (step === 0) {
+      if (!form.name.trim()) return false;
+      if (!form.slug.trim()) return false;
+      if (slugCheck.status === 'taken' || slugCheck.status === 'invalid') return false;
+      if (form.contact_email && !isValidEmail(form.contact_email)) return false;
+      return true;
+    }
+    if (step === 1) {
+      if (form.twilio_phone_number && !isValidE164(form.twilio_phone_number)) return false;
+      if (form.transfer_number && !isValidE164(form.transfer_number)) return false;
+      if (extraPhoneErrors.some(Boolean)) return false;
+      return true;
+    }
+    if (step === 2) return !!form.template_key;
+    if (step === 3) return true;
+    if (step === 4) {
+      if (!form.admin_email) return true;           // optional — "skip invite"
+      return isValidEmail(form.admin_email);
+    }
+    return true;
+  };
+
+  const chosenTemplate = templates.find(t => t.key === form.template_key) || null;
+
+  const handleCreate = async () => {
+    setSaving(true);
+    setError('');
+    try {
+      const extra = (form.phone_numbers || [])
+        .map(p => ({ phone_number: String(p.phone_number || '').trim(), label: String(p.label || '').trim() }))
+        .filter(p => p.phone_number);
+      const resp = await api('/api/super/businesses', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: form.name.trim(),
+          slug: form.slug.trim(),
+          timezone: form.timezone.trim() || 'America/Toronto',
+          plan: form.plan,
+          contact_email: form.contact_email.trim() || null,
+          contact_phone: form.contact_phone.trim() || null,
+          primary_color: form.primary_color || null,
+          logo_url: form.logo_url.trim() || null,
+          twilio_phone_number: form.twilio_phone_number.trim() || null,
+          transfer_number: form.transfer_number.trim() || null,
+          phone_numbers: extra,
+          template_key: form.template_key,
+          admin_email: form.admin_email.trim() || null
+        })
+      });
+      setResult(resp);
+      setStep(5);
+    } catch (err) {
+      setError(err.message || 'Failed to create business');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleFinish = () => {
+    if (result) onCreated(result);
+    else onCancel();
+  };
+
+  const addExtraPhone = () => setForm(f => ({
+    ...f,
+    phone_numbers: [...(f.phone_numbers || []), { phone_number: '', label: 'Additional Line' }]
+  }));
+  const updateExtraPhone = (i, k, v) => setForm(f => {
+    const next = [...(f.phone_numbers || [])];
+    next[i] = { ...next[i], [k]: v };
+    return { ...f, phone_numbers: next };
+  });
+  const removeExtraPhone = (i) => setForm(f => {
+    const next = [...(f.phone_numbers || [])];
+    next.splice(i, 1);
+    return { ...f, phone_numbers: next };
+  });
+
+  // ---------------- Step renderers ----------------
+
+  const renderBasics = () => React.createElement('div', { className: 'space-y-4' },
+    React.createElement('div', null,
+      React.createElement('label', { className: labelCls }, 'Business name *'),
+      React.createElement('input', {
+        className: inputCls, type: 'text', value: form.name,
+        onChange: e => set('name', e.target.value),
+        placeholder: 'e.g. Cedar Ridge Golf Club', autoFocus: true
+      })
+    ),
+    React.createElement('div', { className: 'grid grid-cols-2 gap-4' },
+      React.createElement('div', null,
+        React.createElement('label', { className: labelCls }, 'Slug (URL identifier) *'),
+        React.createElement('input', {
+          className: `${inputCls} font-mono ${
+            slugCheck.status === 'taken' || slugCheck.status === 'invalid'
+              ? 'border-red-400 focus:ring-red-300'
+              : slugCheck.status === 'available'
+                ? 'border-green-400 focus:ring-green-300'
+                : ''
+          }`,
+          type: 'text', value: form.slug,
+          onChange: e => { setSlugTouched(true); set('slug', e.target.value); },
+          placeholder: 'cedar-ridge'
+        }),
+        // Live slug feedback — this check is just for operator UX; the server's
+        // UNIQUE(slug) constraint is the authoritative gate at submit time.
+        React.createElement('p', {
+          className: `text-[11px] mt-1 ${
+            slugCheck.status === 'taken' || slugCheck.status === 'invalid' || slugCheck.status === 'error'
+              ? 'text-red-600'
+              : slugCheck.status === 'available'
+                ? 'text-green-600'
+                : 'text-gray-400'
+          }`
+        },
+          slugCheck.status === 'checking'
+            ? 'Checking availability\u2026'
+            : slugCheck.status === 'available'
+              ? `\u2713 "${slugCheck.normalized || form.slug}" is available`
+              : slugCheck.status === 'taken'
+                ? `Taken by ${slugCheck.existing_name || 'another tenant'} (#${slugCheck.existing_id || '?'})`
+                : slugCheck.status === 'invalid'
+                  ? (slugCheck.reason || 'Slug must contain letters/numbers.')
+                  : slugCheck.status === 'error'
+                    ? (slugCheck.reason || 'Could not check slug availability.')
+                    : slugTouched
+                      ? 'Custom slug'
+                      : 'Auto-generated from name \u2014 edit to customise'
+        )
+      ),
+      React.createElement('div', null,
+        React.createElement('label', { className: labelCls }, 'Timezone'),
+        React.createElement('input', {
+          className: inputCls, type: 'text', value: form.timezone,
+          onChange: e => set('timezone', e.target.value),
+          placeholder: 'America/Toronto'
+        })
+      )
+    ),
+    React.createElement('div', { className: 'grid grid-cols-2 gap-4' },
+      React.createElement('div', null,
+        React.createElement('label', { className: labelCls }, 'Contact email'),
+        React.createElement('input', {
+          className: inputCls, type: 'email', value: form.contact_email,
+          onChange: e => set('contact_email', e.target.value),
+          placeholder: 'ops@business.com'
+        })
+      ),
+      React.createElement('div', null,
+        React.createElement('label', { className: labelCls }, 'Contact phone'),
+        React.createElement('input', {
+          className: inputCls, type: 'text', value: form.contact_phone,
+          onChange: e => set('contact_phone', e.target.value),
+          placeholder: '+1 555 123 4567'
+        })
+      )
+    ),
+    React.createElement('div', { className: 'grid grid-cols-2 gap-4' },
+      React.createElement('div', null,
+        React.createElement('label', { className: labelCls }, 'Primary brand color'),
+        React.createElement('div', { className: 'flex items-center gap-2' },
+          React.createElement('input', {
+            type: 'color',
+            value: form.primary_color || '#2E7D32',
+            onChange: e => set('primary_color', e.target.value),
+            className: 'w-12 h-10 rounded border border-gray-300 cursor-pointer'
+          }),
+          React.createElement('input', {
+            className: `${inputCls} font-mono`, type: 'text',
+            value: form.primary_color,
+            onChange: e => set('primary_color', e.target.value)
+          })
+        )
+      ),
+      React.createElement('div', null,
+        React.createElement('label', { className: labelCls }, 'Logo URL (optional)'),
+        React.createElement('input', {
+          className: inputCls, type: 'url', value: form.logo_url,
+          onChange: e => set('logo_url', e.target.value),
+          placeholder: 'https://cdn.example.com/logo.png'
+        })
+      )
+    ),
+    // Live preview card
+    React.createElement('div', { className: 'bg-gray-50 border rounded-xl p-4 flex items-center gap-3 mt-2' },
+      React.createElement(BusinessInitials, {
+        name: form.name || '?',
+        size: 'lg',
+        color: form.primary_color
+          ? `linear-gradient(135deg, ${form.primary_color}, ${form.primary_color}CC)`
+          : undefined
+      }),
+      React.createElement('div', null,
+        React.createElement('div', { className: 'font-semibold text-gray-800' }, form.name || 'Your business name'),
+        React.createElement('div', { className: 'text-xs text-gray-500 font-mono' }, form.slug || 'slug-appears-here'),
+        React.createElement('div', { className: 'text-xs text-gray-400 mt-1' }, form.timezone)
+      )
+    )
+  );
+
+  const renderPhones = () => React.createElement('div', { className: 'space-y-4' },
+    React.createElement('div', { className: 'bg-blue-50 border border-blue-200 rounded-lg p-3 text-xs text-blue-800' },
+      'The primary Twilio number is how inbound calls find this tenant. Additional lines can be a second DID, an SMS-only number, or a ported phone you still need to migrate.'
+    ),
+    React.createElement('div', { className: 'grid grid-cols-2 gap-4' },
+      React.createElement('div', null,
+        React.createElement('label', { className: labelCls }, 'Primary Twilio number (E.164)'),
+        React.createElement('input', {
+          className: `${inputCls} font-mono ${
+            form.twilio_phone_number && !isValidE164(form.twilio_phone_number) ? 'border-red-400 focus:ring-red-300' : ''
+          }`,
+          type: 'text',
+          value: form.twilio_phone_number,
+          onChange: e => set('twilio_phone_number', e.target.value),
+          placeholder: '+15551234567'
+        }),
+        form.twilio_phone_number && !isValidE164(form.twilio_phone_number) &&
+          React.createElement('p', { className: 'text-[11px] text-red-600 mt-1' }, 'Use E.164 format: + followed by 8\u201315 digits (e.g. +15551234567)')
+      ),
+      React.createElement('div', null,
+        React.createElement('label', { className: labelCls }, 'Transfer-to number'),
+        React.createElement('input', {
+          className: `${inputCls} font-mono ${
+            form.transfer_number && !isValidE164(form.transfer_number) ? 'border-red-400 focus:ring-red-300' : ''
+          }`,
+          type: 'text',
+          value: form.transfer_number,
+          onChange: e => set('transfer_number', e.target.value),
+          placeholder: '+15559876543'
+        }),
+        form.transfer_number && !isValidE164(form.transfer_number)
+          ? React.createElement('p', { className: 'text-[11px] text-red-600 mt-1' }, 'Use E.164 format (+ then 8\u201315 digits).')
+          : React.createElement('p', { className: 'text-[11px] text-gray-400 mt-1' }, 'Used when the AI transfers a live call to a human.')
+      )
+    ),
+    React.createElement('div', null,
+      React.createElement('div', { className: 'flex items-center justify-between mb-2' },
+        React.createElement('span', { className: labelCls + ' mb-0' }, 'Additional lines (optional)'),
+        React.createElement('button', {
+          type: 'button',
+          onClick: addExtraPhone,
+          className: 'text-xs text-golf-700 hover:text-golf-900 font-semibold'
+        }, '+ Add line')
+      ),
+      (form.phone_numbers || []).length === 0 &&
+        React.createElement('p', { className: 'text-xs text-gray-400' }, 'No extra lines. One primary number is fine to start.'),
+      (form.phone_numbers || []).map((p, i) => {
+        const invalid = p.phone_number && !isValidE164(p.phone_number);
+        return React.createElement('div', { key: i, className: 'mb-2' },
+          React.createElement('div', { className: 'grid grid-cols-12 gap-2 items-center' },
+            React.createElement('input', {
+              className: `${inputCls} col-span-6 font-mono ${invalid ? 'border-red-400 focus:ring-red-300' : ''}`,
+              type: 'text',
+              value: p.phone_number,
+              onChange: e => updateExtraPhone(i, 'phone_number', e.target.value),
+              placeholder: '+1...'
+            }),
+            React.createElement('input', {
+              className: `${inputCls} col-span-5`, type: 'text',
+              value: p.label,
+              onChange: e => updateExtraPhone(i, 'label', e.target.value),
+              placeholder: 'Label (e.g. SMS line)'
+            }),
+            React.createElement('button', {
+              type: 'button',
+              onClick: () => removeExtraPhone(i),
+              className: 'col-span-1 text-red-500 hover:text-red-700 text-xs'
+            }, 'Remove')
+          ),
+          invalid && React.createElement('p', { className: 'text-[11px] text-red-600 mt-1' },
+            'Use E.164 format (+ then 8\u201315 digits).'
+          )
+        );
+      })
+    )
+  );
+
+  const renderTemplate = () => React.createElement('div', null,
+    loadingTemplates
+      ? React.createElement('p', { className: 'text-sm text-gray-500' }, 'Loading templates\u2026')
+      : React.createElement('div', { className: 'grid grid-cols-1 md:grid-cols-2 gap-3' },
+        templates.map(t => {
+          const selected = form.template_key === t.key;
+          return React.createElement('button', {
+            key: t.key,
+            type: 'button',
+            onClick: () => set('template_key', t.key),
+            className: `text-left rounded-xl border-2 p-4 transition-colors ${
+              selected
+                ? 'border-golf-600 bg-golf-50 ring-2 ring-golf-200'
+                : 'border-gray-200 hover:border-golf-400 bg-white'
+            }`
+          },
+            React.createElement('div', { className: 'flex items-start gap-3' },
+              // Prominent vertical icon — falls back to a neutral glyph if the
+              // template catalog pre-dates the polish pass that introduced it.
+              React.createElement('span', {
+                className: 'text-3xl leading-none flex-shrink-0',
+                'aria-hidden': 'true'
+              }, t.icon_emoji || '\u2728'),
+              React.createElement('div', { className: 'flex-1 min-w-0' },
+                React.createElement('div', { className: 'flex items-start justify-between gap-2 mb-1' },
+                  React.createElement('h4', { className: 'font-bold text-gray-800' }, t.label),
+                  selected && React.createElement('span', { className: 'text-[11px] font-bold text-golf-700 bg-golf-100 px-1.5 py-0.5 rounded' }, 'Selected')
+                ),
+                React.createElement('p', { className: 'text-xs font-medium text-gray-700 mb-1' }, t.tagline),
+                t.description && React.createElement('p', { className: 'text-[11px] text-gray-500 mb-2 leading-snug' }, t.description),
+                Array.isArray(t.features) && t.features.length > 0 &&
+                  React.createElement('ul', { className: 'text-[11px] text-gray-500 space-y-0.5 mt-1' },
+                    t.features.map((f, i) =>
+                      React.createElement('li', { key: i }, `\u2022 ${f}`)
+                    )
+                  )
+              )
+            )
+          );
+        })
+      )
+  );
+
+  const renderReview = () => React.createElement('div', { className: 'space-y-4 text-sm' },
+    React.createElement('div', { className: 'bg-gray-50 border rounded-xl p-4' },
+      React.createElement('h4', { className: 'font-semibold text-gray-800 mb-2' }, 'Business'),
+      React.createElement('dl', { className: 'grid grid-cols-2 gap-y-1 text-xs' },
+        React.createElement('dt', { className: 'text-gray-500' }, 'Name'),
+        React.createElement('dd', { className: 'text-gray-800 font-medium' }, form.name || '\u2014'),
+        React.createElement('dt', { className: 'text-gray-500' }, 'Slug'),
+        React.createElement('dd', { className: 'text-gray-800 font-mono' }, form.slug || '\u2014'),
+        React.createElement('dt', { className: 'text-gray-500' }, 'Timezone'),
+        React.createElement('dd', { className: 'text-gray-800' }, form.timezone || '\u2014'),
+        React.createElement('dt', { className: 'text-gray-500' }, 'Plan'),
+        React.createElement('dd', { className: 'text-gray-800' }, form.plan),
+        React.createElement('dt', { className: 'text-gray-500' }, 'Contact'),
+        React.createElement('dd', { className: 'text-gray-800' }, form.contact_email || '\u2014'),
+        React.createElement('dt', { className: 'text-gray-500' }, 'Primary color'),
+        React.createElement('dd', { className: 'text-gray-800 flex items-center gap-2' },
+          React.createElement('span', {
+            className: 'inline-block w-4 h-4 rounded border',
+            style: { background: form.primary_color }
+          }),
+          React.createElement('span', { className: 'font-mono text-xs' }, form.primary_color)
+        )
+      )
+    ),
+    React.createElement('div', { className: 'bg-gray-50 border rounded-xl p-4' },
+      React.createElement('h4', { className: 'font-semibold text-gray-800 mb-2' }, 'Phone numbers'),
+      form.twilio_phone_number
+        ? React.createElement('p', { className: 'text-xs font-mono text-gray-800' }, `${form.twilio_phone_number} \u2014 Main Line`)
+        : React.createElement('p', { className: 'text-xs text-amber-700' }, 'No primary number set \u2014 inbound calls won\u2019t resolve until you add one.'),
+      form.transfer_number &&
+        React.createElement('p', { className: 'text-xs text-gray-600 mt-1' }, `Transfers to ${form.transfer_number}`),
+      (form.phone_numbers || []).filter(p => p.phone_number).length > 0 &&
+        React.createElement('ul', { className: 'mt-2 space-y-0.5 text-xs font-mono text-gray-700' },
+          form.phone_numbers.filter(p => p.phone_number).map((p, i) =>
+            React.createElement('li', { key: i }, `${p.phone_number} \u2014 ${p.label}`)
+          )
+        )
+    ),
+    React.createElement('div', { className: 'bg-gray-50 border rounded-xl p-4' },
+      React.createElement('h4', { className: 'font-semibold text-gray-800 mb-2' }, 'Template'),
+      chosenTemplate
+        ? React.createElement('div', null,
+            React.createElement('p', { className: 'text-sm font-medium text-gray-800' }, chosenTemplate.label),
+            React.createElement('p', { className: 'text-xs text-gray-500' }, chosenTemplate.tagline),
+            Array.isArray(chosenTemplate.settings_keys) && chosenTemplate.settings_keys.length > 0 &&
+              React.createElement('p', { className: 'text-[11px] text-gray-400 mt-2' },
+                `Seeds ${chosenTemplate.settings_keys.length} settings keys + ${chosenTemplate.greeting_count || 0} greetings.`
+              )
+          )
+        : React.createElement('p', { className: 'text-xs text-gray-500' }, 'None selected.')
+    )
+  );
+
+  const renderInvite = () => React.createElement('div', { className: 'space-y-4' },
+    React.createElement('div', { className: 'bg-blue-50 border border-blue-200 rounded-lg p-3 text-xs text-blue-800' },
+      'Enter the email of the person who\u2019ll own this tenant. We\u2019ll mint a magic-link invite and show you the URL on the next step \u2014 share it however you like (email, Slack, carrier pigeon). Skip this if you want to invite them later.'
+    ),
+    React.createElement('div', { className: 'grid grid-cols-2 gap-4' },
+      React.createElement('div', null,
+        React.createElement('label', { className: labelCls }, 'Admin email'),
+        React.createElement('input', {
+          className: inputCls, type: 'email',
+          value: form.admin_email,
+          onChange: e => set('admin_email', e.target.value),
+          placeholder: 'owner@business.com'
+        })
+      ),
+      React.createElement('div', null,
+        React.createElement('label', { className: labelCls }, 'Admin name (optional)'),
+        React.createElement('input', {
+          className: inputCls, type: 'text',
+          value: form.admin_name,
+          onChange: e => set('admin_name', e.target.value),
+          placeholder: 'Jamie Rivera'
+        })
+      )
+    )
+  );
+
+  const renderSuccess = () => React.createElement('div', { className: 'text-center py-4' },
+    React.createElement('div', { className: 'text-5xl mb-3' }, '\ud83c\udf89'),
+    React.createElement('h3', { className: 'text-xl font-bold text-gray-800 mb-1' },
+      `${result?.business?.name || 'Business'} is live`
+    ),
+    React.createElement('p', { className: 'text-sm text-gray-500 mb-5' },
+      result?.template
+        ? `Seeded ${result.template.settings_applied} settings + ${result.template.greetings_applied} greetings from the ${result.template.template_key} template.`
+        : 'Tenant created.'
+    ),
+    result?.invite && React.createElement('div', { className: 'bg-green-50 border border-green-200 rounded-xl p-4 text-left mb-4' },
+      React.createElement('p', { className: 'text-sm font-semibold text-green-800 mb-2' },
+        `Magic link for ${result.invite.email}:`
+      ),
+      React.createElement('code', { className: 'block bg-white border border-green-200 rounded p-2 text-xs break-all' },
+        result.invite.invite_url
+      ),
+      React.createElement('button', {
+        onClick: () => { try { navigator.clipboard.writeText(result.invite.invite_url); } catch (_) {} },
+        className: 'text-green-700 text-xs mt-2 font-semibold underline'
+      }, 'Copy link')
+    ),
+    Array.isArray(result?.phone_numbers) && result.phone_numbers.length > 0 &&
+      React.createElement('div', { className: 'bg-gray-50 border rounded-xl p-4 text-left mb-4' },
+        React.createElement('p', { className: 'text-xs font-semibold text-gray-700 mb-2' }, 'Phone numbers registered'),
+        React.createElement('ul', { className: 'text-xs font-mono text-gray-800 space-y-0.5' },
+          result.phone_numbers.map(p =>
+            React.createElement('li', { key: p.id },
+              `${p.phone_number} \u2014 ${p.label || 'Line'}${p.is_primary ? ' (primary)' : ''}`
+            )
+          )
+        )
+      ),
+    // When the operator skipped the invite, surface a friendly reminder so the
+    // tenant doesn't silently end up without an owner account.
+    !result?.invite && React.createElement('p', { className: 'text-xs text-gray-500 mt-1' },
+      'No admin invite was created. You can send one later from the business card.'
+    )
+  );
+
+  const stepBodies = [
+    renderBasics,
+    renderPhones,
+    renderTemplate,
+    renderReview,
+    renderInvite,
+    renderSuccess
+  ];
+
+  return React.createElement('div', { className: 'fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50' },
+    React.createElement('div', { className: 'bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[92vh] flex flex-col overflow-hidden' },
+      // ---------- Header / progress ----------
+      React.createElement('div', { className: 'px-6 py-5 border-b bg-gradient-to-br from-golf-50 to-white' },
+        React.createElement('div', { className: 'flex items-center justify-between mb-4' },
+          React.createElement('div', null,
+            React.createElement('h2', { className: 'text-lg font-bold text-gray-800' }, steps[step].title),
+            React.createElement('p', { className: 'text-xs text-gray-500' }, steps[step].sub)
+          ),
+          React.createElement('button', {
+            onClick: onCancel,
+            className: 'text-gray-400 hover:text-gray-600 text-xl leading-none',
+            'aria-label': 'Close'
+          }, '\u00d7')
+        ),
+        React.createElement('div', { className: 'flex items-center gap-1' },
+          steps.map((_, i) =>
+            React.createElement('div', {
+              key: i,
+              className: `flex-1 h-1.5 rounded-full ${
+                i < step ? 'bg-golf-600' : i === step ? 'bg-golf-400' : 'bg-gray-200'
+              }`
+            })
+          )
+        ),
+        React.createElement('p', { className: 'text-[11px] text-gray-400 mt-2' }, `Step ${Math.min(step + 1, steps.length)} of ${steps.length}`)
+      ),
+
+      // ---------- Body ----------
+      React.createElement('div', { className: 'flex-1 overflow-auto px-6 py-5' },
+        error && React.createElement('div', { className: 'bg-red-50 text-red-600 p-3 rounded-lg mb-4 text-sm' }, error),
+        stepBodies[step]()
+      ),
+
+      // ---------- Footer / navigation ----------
+      React.createElement('div', { className: 'px-6 py-4 border-t bg-gray-50 flex items-center justify-between' },
+        step < 5
+          ? React.createElement('button', {
+              type: 'button',
+              onClick: () => step === 0 ? onCancel() : setStep(step - 1),
+              className: 'px-4 py-2 rounded-lg bg-white border border-gray-300 hover:bg-gray-100 text-sm font-medium text-gray-700'
+            }, step === 0 ? 'Cancel' : 'Back')
+          : React.createElement('span', null),
+        step < 3 && React.createElement('button', {
+          type: 'button',
+          disabled: !canAdvance(),
+          onClick: () => setStep(step + 1),
+          className: 'px-5 py-2 rounded-lg bg-golf-600 hover:bg-golf-700 text-white text-sm font-semibold disabled:opacity-40'
+        }, 'Next \u2192'),
+        step === 3 && React.createElement('button', {
+          type: 'button',
+          onClick: () => setStep(4),
+          className: 'px-5 py-2 rounded-lg bg-golf-600 hover:bg-golf-700 text-white text-sm font-semibold'
+        }, 'Looks good \u2192'),
+        // Step 4 footer: the operator either fills an admin_email and creates
+        // with an invite, or explicitly skips the invite (with a clear hint).
+        step === 4 && React.createElement('div', { className: 'flex items-center gap-2' },
+          !form.admin_email.trim() && React.createElement('span', { className: 'text-[11px] text-gray-500' },
+            'You can invite an admin later from the business card.'
+          ),
+          React.createElement('button', {
+            type: 'button',
+            disabled: saving || !canAdvance(),
+            onClick: handleCreate,
+            className: 'px-5 py-2 rounded-lg bg-golf-600 hover:bg-golf-700 text-white text-sm font-semibold disabled:opacity-50'
+          }, saving
+            ? 'Creating business\u2026'
+            : (form.admin_email.trim()
+                ? 'Create business + send invite'
+                : 'Skip invite & create business')
+          )
+        ),
+        // Step 5 footer: offer to switch into the new tenant or return to
+        // the super-admin dashboard. The Act-as button is only visible if the
+        // wizard was handed an onActAs handler (wired in SuperAdminDashboard).
+        step === 5 && React.createElement('div', { className: 'flex items-center gap-2' },
+          typeof onActAs === 'function' && result?.business?.id && React.createElement('button', {
+            type: 'button',
+            onClick: () => onActAs(result.business.id),
+            className: 'px-4 py-2 rounded-lg bg-white border border-golf-300 hover:bg-golf-50 text-sm font-semibold text-golf-700'
+          }, `Act as ${result.business.name || 'this business'}`),
+          React.createElement('button', {
+            type: 'button',
+            onClick: handleFinish,
+            className: 'px-5 py-2 rounded-lg bg-golf-600 hover:bg-golf-700 text-white text-sm font-semibold'
+          }, 'Back to dashboard')
+        )
+      )
+    )
+  );
+}
+
+// ============================================
+// TOP BAR (shown above all authenticated views)
+// ============================================
+function TopBar({ session, businesses, selectedBusinessId, onSelectBusiness, onLogout }) {
+  const isSuper = session?.role === 'super_admin';
+  const selectedName = selectedBusinessId
+    ? (businesses.find(b => b.id === selectedBusinessId)?.name || `Business #${selectedBusinessId}`)
+    : null;
+
+  return React.createElement('header', { className: 'bg-white border-b px-6 py-3 flex items-center justify-between' },
+    React.createElement('div', { className: 'flex items-center gap-3' },
+      isSuper && React.createElement('span', { className: 'text-xs uppercase tracking-wider font-semibold text-purple-600 bg-purple-50 px-2 py-0.5 rounded' }, 'SUPER ADMIN'),
+      !isSuper && React.createElement('span', { className: 'text-xs uppercase tracking-wider font-semibold text-gray-500' }, session?.role?.replace('_', ' ') || ''),
+      isSuper && selectedName && React.createElement('span', { className: 'text-sm text-gray-400' }, '\u2192'),
+      isSuper && selectedName && React.createElement('span', { className: 'text-sm font-medium text-gray-700' }, `Acting as ${selectedName}`)
+    ),
+    React.createElement('div', { className: 'flex items-center gap-3' },
+      isSuper && React.createElement(BusinessSwitcher, {
+        businesses,
+        selectedId: selectedBusinessId,
+        onSelect: onSelectBusiness
+      }),
+      React.createElement('span', { className: 'text-sm text-gray-500' }, session?.username || ''),
+      React.createElement('button', {
+        onClick: onLogout,
+        className: 'text-sm text-gray-500 hover:text-gray-800'
+      }, 'Sign out')
+    )
+  );
+}
+
+// ============================================
 // MAIN APP
 // ============================================
 function App() {
+  // If the URL path is /accept-invite, short-circuit to the public page
+  // BEFORE we look at auth state — the invitee has no session yet.
+  if (typeof window !== 'undefined' && window.location.pathname === '/accept-invite') {
+    return React.createElement(AcceptInvitePage);
+  }
+
   const [authenticated, setAuthenticated] = useState(!!getToken());
+  const [session, setSessionState] = useState(() => getSession());
   const [currentPage, setCurrentPage] = useState('dashboard');
+  const [selectedBusinessId, setSelectedBusinessIdState] = useState(() => getSelectedBusinessId());
+  const [businesses, setBusinesses] = useState([]);
+
+  // On mount, rehydrate the session from /auth/verify if we have a token
+  // but no saved session blob (e.g. upgrading from a pre-Phase-3 login).
+  useEffect(() => {
+    if (authenticated && !session) {
+      api('/auth/verify')
+        .then(d => {
+          const s = {
+            role: d.user.role,
+            business_id: d.user.business_id,
+            username: d.user.username
+          };
+          setSession(s);
+          setSessionState(s);
+          if (s.role !== 'super_admin') {
+            setSelectedBusinessId(s.business_id);
+            setSelectedBusinessIdState(s.business_id);
+          }
+        })
+        .catch(() => {
+          clearAuth();
+          setAuthenticated(false);
+        });
+    }
+  }, [authenticated, session]);
+
+  // Super admins load the full business list so the switcher works.
+  const refreshBusinessList = useCallback(() => {
+    if (!authenticated || session?.role !== 'super_admin') return Promise.resolve([]);
+    return api('/api/super/businesses')
+      .then(d => {
+        const list = d.businesses || [];
+        setBusinesses(list);
+        return list;
+      })
+      .catch(() => {
+        setBusinesses([]);
+        return [];
+      });
+  }, [authenticated, session?.role]);
+
+  useEffect(() => {
+    refreshBusinessList();
+  }, [refreshBusinessList]);
+
+  const handleLogin = (data) => {
+    setSessionState({
+      role: data.role,
+      business_id: data.business_id,
+      username: data.username,
+      name: data.name
+    });
+    setSelectedBusinessIdState(data.role === 'super_admin' ? null : data.business_id);
+    setAuthenticated(true);
+  };
 
   const handleLogout = () => {
-    localStorage.removeItem('gc_token');
+    clearAuth();
+    setSessionState(null);
+    setSelectedBusinessIdState(null);
     setAuthenticated(false);
   };
 
+  const handleSelectBusiness = (id) => {
+    setSelectedBusinessId(id);
+    setSelectedBusinessIdState(id);
+    setCurrentPage(id ? 'dashboard' : 'super');
+  };
+
   if (!authenticated) {
-    return React.createElement(LoginPage, { onLogin: () => setAuthenticated(true) });
+    return React.createElement(LoginPage, { onLogin: handleLogin });
+  }
+  // Waiting for verify on a bare token
+  if (!session) {
+    return React.createElement('div', { className: 'min-h-screen flex items-center justify-center text-gray-500' }, 'Loading\u2026');
   }
 
-  const pages = {
+  const isSuper = session.role === 'super_admin';
+  const tenantPages = {
     dashboard: DashboardPage,
     teesheet: TeeSheetPage,
     bookings: BookingsPage,
@@ -2082,12 +3749,49 @@ function App() {
     settings: SettingsPage
   };
 
-  const PageComponent = pages[currentPage] || DashboardPage;
+  // Super admin with no selected business → platform dashboard only.
+  if (isSuper && !selectedBusinessId) {
+    return React.createElement('div', { className: 'flex flex-col min-h-screen bg-gray-50' },
+      React.createElement(TopBar, {
+        session, businesses,
+        selectedBusinessId,
+        onSelectBusiness: handleSelectBusiness,
+        onLogout: handleLogout
+      }),
+      React.createElement('main', { className: 'flex-1 p-8 overflow-auto' },
+        React.createElement(SuperAdminDashboard, {
+          onSwitchInto: handleSelectBusiness,
+          // When the wizard finishes, pull the fresh business list so the
+          // TopBar's BusinessSwitcher includes the new tenant immediately.
+          onBusinessCreated: () => refreshBusinessList()
+        })
+      )
+    );
+  }
 
-  return React.createElement('div', { className: 'flex min-h-screen' },
-    React.createElement(Sidebar, { currentPage, onNavigate: setCurrentPage, onLogout: handleLogout }),
-    React.createElement('main', { className: 'flex-1 p-8 overflow-auto' },
-      React.createElement(PageComponent)
+  // Tenant user OR super admin acting as a tenant → regular sidebar + page.
+  const PageComponent = tenantPages[currentPage] || DashboardPage;
+  return React.createElement('div', { className: 'flex flex-col min-h-screen' },
+    React.createElement(TopBar, {
+      session, businesses,
+      selectedBusinessId,
+      onSelectBusiness: handleSelectBusiness,
+      onLogout: handleLogout
+    }),
+    React.createElement('div', { className: 'flex flex-1' },
+      React.createElement(Sidebar, {
+        currentPage,
+        onNavigate: setCurrentPage,
+        onLogout: handleLogout,
+        // Show the active tenant's display name in the sidebar header so
+        // a super-admin "acting-as" another business always sees whose
+        // data they're looking at. Falls back to generic text when the
+        // lookup hasn't resolved yet (first render after act-as).
+        tenantName: (businesses.find(b => b.id === selectedBusinessId) || {}).name
+      }),
+      React.createElement('main', { className: 'flex-1 p-8 overflow-auto bg-gray-50' },
+        React.createElement(PageComponent)
+      )
     )
   );
 }

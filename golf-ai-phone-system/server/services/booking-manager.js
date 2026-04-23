@@ -1,8 +1,15 @@
 /**
- * Booking Manager Service
- * Handles booking requests, modifications, and cancellations
+ * Booking Manager Service — tenant-scoped.
+ *
+ * Every function takes `businessId` as its first argument. List-style
+ * functions (used by Super Admin dashboards later) accept `null` when the
+ * caller is a super admin; pass the explicit businessId for tenant users.
  */
-const { query } = require('../config/database');
+const { query, getBusinessById } = require('../config/database');
+const {
+  requireBusinessId,
+  requireBusinessIdOrSuperAdmin
+} = require('../context/tenant-context');
 const {
   sendBookingNotification,
   sendModificationNotification,
@@ -12,11 +19,24 @@ const {
   sendBookingRejectedToCustomer
 } = require('./notification');
 
+// Resolve a business's timezone with a safe default. All date math in this
+// file uses the tenant's timezone rather than hardcoded America/Toronto.
+async function getBusinessTimezone(businessId) {
+  try {
+    const business = await getBusinessById(businessId);
+    return business?.timezone || 'America/Toronto';
+  } catch (_) {
+    return 'America/Toronto';
+  }
+}
+
 // Create a new booking request
 async function createBookingRequest({
-  customerId, customerName, customerPhone, customerEmail,
+  businessId, customerId, customerName, customerPhone, customerEmail,
   requestedDate, requestedTime, partySize, numCarts, specialRequests, cardLastFour, callId
 }) {
+  requireBusinessId(businessId, 'createBookingRequest');
+
   // Validate required fields
   if (!customerName || typeof customerName !== 'string') {
     throw new Error('customer_name is required');
@@ -30,8 +50,8 @@ async function createBookingRequest({
   if (isNaN(parsed.getTime())) {
     throw new Error(`Invalid date format: "${requestedDate}". Expected YYYY-MM-DD.`);
   }
-  // Always store as YYYY-MM-DD
   normalizedDate = parsed.toISOString().split('T')[0];
+
   const size = parseInt(partySize) || 1;
   if (size < 1 || size > 20) {
     throw new Error('party_size must be between 1 and 20');
@@ -39,27 +59,26 @@ async function createBookingRequest({
   const carts = parseInt(numCarts) || 0;
 
   try {
-    // Validate card_last_four if provided (must be exactly 4 digits)
     const cardDigits = cardLastFour ? String(cardLastFour).replace(/\D/g, '').slice(-4) : null;
 
     const res = await query(
       `INSERT INTO booking_requests
-       (customer_id, customer_name, customer_phone, customer_email,
+       (business_id, customer_id, customer_name, customer_phone, customer_email,
         requested_date, requested_time, party_size, num_carts, special_requests, card_last_four, call_id, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending')
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'pending')
        RETURNING *`,
-      [customerId || null, customerName.trim(), customerPhone || null, customerEmail || null,
-       normalizedDate, requestedTime || null, size, carts, specialRequests || null, cardDigits, callId || null]
+      [businessId, customerId || null, customerName.trim(), customerPhone || null,
+       customerEmail || null, normalizedDate, requestedTime || null, size, carts,
+       specialRequests || null, cardDigits, callId || null]
     );
 
     const booking = res.rows[0];
-
     if (!booking) {
-      console.error('Booking insert returned no rows. Expected booking with status=pending');
+      console.error(`[tenant:${businessId}] Booking insert returned no rows`);
       throw new Error('Booking insertion returned no rows');
     }
 
-    console.log('✓ Booking created:', {
+    console.log(`[tenant:${businessId}] ✓ Booking created:`, {
       id: booking.id,
       customer: customerName,
       date: requestedDate,
@@ -68,23 +87,17 @@ async function createBookingRequest({
       phone: customerPhone
     });
 
-    // Notify staff of new pending booking
+    // Notify staff of new pending booking (tenant-scoped)
     try {
-      await sendBookingNotification(booking);
+      await sendBookingNotification(businessId, booking);
     } catch (err) {
-      console.error('Failed to send booking notification:', err.message);
+      console.error(`[tenant:${businessId}] Failed to send booking notification:`, err.message);
     }
-
-    // NOTE: We do NOT send SMS to the customer here.
-    // The customer only receives a confirmation text when staff CONFIRMS the booking in Command Center.
 
     return booking;
   } catch (err) {
-    console.error('Failed to create booking:', err.message, {
-      customerName,
-      requestedDate,
-      requestedTime,
-      partySize: size
+    console.error(`[tenant:${businessId}] Failed to create booking:`, err.message, {
+      customerName, requestedDate, requestedTime, partySize: size
     });
     throw err;
   }
@@ -92,9 +105,11 @@ async function createBookingRequest({
 
 // Create a modification or cancellation request
 async function createModificationRequest({
-  customerId, customerName, customerPhone, requestType,
+  businessId, customerId, customerName, customerPhone, requestType,
   originalDate, originalTime, newDate, newTime, details, callId
 }) {
+  requireBusinessId(businessId, 'createModificationRequest');
+
   if (!requestType || !['modify', 'cancel'].includes(requestType)) {
     throw new Error('requestType must be "modify" or "cancel"');
   }
@@ -103,66 +118,80 @@ async function createModificationRequest({
   }
   const res = await query(
     `INSERT INTO modification_requests
-     (customer_id, customer_name, customer_phone, request_type,
+     (business_id, customer_id, customer_name, customer_phone, request_type,
       original_date, original_time, new_date, new_time, details, call_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
      RETURNING *`,
-    [customerId, customerName, customerPhone, requestType,
+    [businessId, customerId, customerName, customerPhone, requestType,
      originalDate, originalTime, newDate, newTime, details, callId]
   );
 
   const modification = res.rows[0];
-
   try {
-    await sendModificationNotification(modification);
+    await sendModificationNotification(businessId, modification);
   } catch (err) {
-    console.error('Failed to send modification notification:', err.message);
+    console.error(`[tenant:${businessId}] Failed to send modification notification:`, err.message);
   }
-
   return modification;
 }
 
-// Get all pending booking requests
-async function getPendingBookings() {
+// Get all pending booking requests for a tenant
+async function getPendingBookings(businessId) {
+  requireBusinessId(businessId, 'getPendingBookings');
   const res = await query(
-    `SELECT * FROM booking_requests WHERE status = 'pending' ORDER BY created_at DESC`
+    `SELECT * FROM booking_requests
+      WHERE business_id = $1 AND status = 'pending'
+      ORDER BY created_at DESC`,
+    [businessId]
   );
   return res.rows;
 }
 
-// Get all pending modification requests
-async function getPendingModifications() {
+// Get all pending modification requests for a tenant
+async function getPendingModifications(businessId) {
+  requireBusinessId(businessId, 'getPendingModifications');
   const res = await query(
-    `SELECT * FROM modification_requests WHERE status = 'pending' ORDER BY created_at DESC`
+    `SELECT * FROM modification_requests
+      WHERE business_id = $1 AND status = 'pending'
+      ORDER BY created_at DESC`,
+    [businessId]
   );
   return res.rows;
 }
 
 // Update booking status (from Command Center)
-async function updateBookingStatus(id, status, staffNotes) {
-  // Capture previous status so we only notify on actual transitions
-  const prev = await query('SELECT status FROM booking_requests WHERE id = $1', [id]);
-  const prevStatus = prev.rows[0]?.status;
+async function updateBookingStatus(businessId, id, status, staffNotes) {
+  requireBusinessId(businessId, 'updateBookingStatus');
+
+  // Capture previous status so we only notify on actual transitions, and
+  // ensure the booking belongs to this tenant before touching it.
+  const prev = await query(
+    'SELECT status FROM booking_requests WHERE id = $1 AND business_id = $2',
+    [id, businessId]
+  );
+  if (prev.rows.length === 0) return null; // belongs to a different tenant (or doesn't exist)
+  const prevStatus = prev.rows[0].status;
 
   const res = await query(
-    `UPDATE booking_requests SET status = $1, staff_notes = $2, updated_at = NOW()
-     WHERE id = $3 RETURNING *`,
-    [status, staffNotes, id]
+    `UPDATE booking_requests
+        SET status = $1, staff_notes = $2, updated_at = NOW()
+      WHERE id = $3 AND business_id = $4
+      RETURNING *`,
+    [status, staffNotes, id, businessId]
   );
   const booking = res.rows[0];
 
-  // Send customer SMS on status transitions
   if (booking && prevStatus !== status) {
     try {
       if (status === 'confirmed') {
-        await sendBookingConfirmedToCustomer(booking);
+        await sendBookingConfirmedToCustomer(businessId, booking);
       } else if (status === 'cancelled') {
-        await sendBookingCancelledToCustomer(booking);
+        await sendBookingCancelledToCustomer(businessId, booking);
       } else if (status === 'rejected') {
-        await sendBookingRejectedToCustomer(booking, staffNotes);
+        await sendBookingRejectedToCustomer(businessId, booking, staffNotes);
       }
     } catch (err) {
-      console.error('Failed to send status-change SMS to customer:', err.message);
+      console.error(`[tenant:${businessId}] Status-change SMS failed:`, err.message);
     }
   }
 
@@ -171,32 +200,42 @@ async function updateBookingStatus(id, status, staffNotes) {
 
 // Update modification status
 // When a cancellation request is processed, also cancel the matching booking
-async function updateModificationStatus(id, status, staffNotes) {
+async function updateModificationStatus(businessId, id, status, staffNotes) {
+  requireBusinessId(businessId, 'updateModificationStatus');
+
   const res = await query(
-    `UPDATE modification_requests SET status = $1, staff_notes = $2, updated_at = NOW()
-     WHERE id = $3 RETURNING *`,
-    [status, staffNotes, id]
+    `UPDATE modification_requests
+        SET status = $1, staff_notes = $2, updated_at = NOW()
+      WHERE id = $3 AND business_id = $4
+      RETURNING *`,
+    [status, staffNotes, id, businessId]
   );
   const mod = res.rows[0];
+  if (!mod) return null;
 
   // If staff processed a cancellation request, auto-cancel the matching booking
-  if (mod && mod.request_type === 'cancel' && status === 'processed') {
+  if (mod.request_type === 'cancel' && status === 'processed') {
     try {
-      // Find the matching active booking by phone + date
       const matchQuery = await query(
         `SELECT id FROM booking_requests
-         WHERE customer_phone = $1
-           AND status IN ('pending', 'confirmed')
-           AND ($2::date IS NULL OR requested_date = $2::date)
-         ORDER BY requested_date ASC
-         LIMIT 1`,
-        [mod.customer_phone, mod.original_date || null]
+           WHERE business_id = $1
+             AND customer_phone = $2
+             AND status IN ('pending', 'confirmed')
+             AND ($3::date IS NULL OR requested_date = $3::date)
+           ORDER BY requested_date ASC
+           LIMIT 1`,
+        [businessId, mod.customer_phone, mod.original_date || null]
       );
       if (matchQuery.rows[0]) {
-        await updateBookingStatus(matchQuery.rows[0].id, 'cancelled', staffNotes || 'Cancelled by customer via phone call');
+        await updateBookingStatus(
+          businessId,
+          matchQuery.rows[0].id,
+          'cancelled',
+          staffNotes || 'Cancelled by customer via phone call'
+        );
       }
     } catch (err) {
-      console.error('Failed to auto-cancel matching booking:', err.message);
+      console.error(`[tenant:${businessId}] Auto-cancel failed:`, err.message);
     }
   }
 
@@ -204,24 +243,32 @@ async function updateModificationStatus(id, status, staffNotes) {
 }
 
 // Get bookings for a date range
-async function getBookingsForDateRange(startDate, endDate) {
+async function getBookingsForDateRange(businessId, startDate, endDate) {
+  requireBusinessId(businessId, 'getBookingsForDateRange');
   const res = await query(
     `SELECT * FROM booking_requests
-     WHERE requested_date BETWEEN $1 AND $2
-     ORDER BY requested_date, requested_time`,
-    [startDate, endDate]
+      WHERE business_id = $1
+        AND requested_date BETWEEN $2 AND $3
+      ORDER BY requested_date, requested_time`,
+    [businessId, startDate, endDate]
   );
   return res.rows;
 }
 
-// Get all bookings (with pagination)
-async function getAllBookings(page = 1, limit = 50, status = null) {
+/**
+ * Get all bookings (with pagination). Scoped to one tenant.
+ * Super-admin callers that need cross-tenant listings should hit a dedicated
+ * /api/admin/* endpoint that doesn't go through this function.
+ */
+async function getAllBookings(businessId, page = 1, limit = 50, status = null) {
+  requireBusinessId(businessId, 'getAllBookings');
+
   const offset = (page - 1) * limit;
-  let sql = 'SELECT * FROM booking_requests';
-  const params = [];
+  let sql = 'SELECT * FROM booking_requests WHERE business_id = $1';
+  const params = [businessId];
 
   if (status) {
-    sql += ' WHERE status = $1';
+    sql += ` AND status = $${params.length + 1}`;
     params.push(status);
   }
 
@@ -230,11 +277,10 @@ async function getAllBookings(page = 1, limit = 50, status = null) {
 
   const res = await query(sql, params);
 
-  // Get total count
-  let countSql = 'SELECT COUNT(*) FROM booking_requests';
-  const countParams = [];
+  let countSql = 'SELECT COUNT(*) FROM booking_requests WHERE business_id = $1';
+  const countParams = [businessId];
   if (status) {
-    countSql += ' WHERE status = $1';
+    countSql += ` AND status = $${countParams.length + 1}`;
     countParams.push(status);
   }
   const countRes = await query(countSql, countParams);
@@ -247,41 +293,53 @@ async function getAllBookings(page = 1, limit = 50, status = null) {
   };
 }
 
-// Find the most recent active booking for a phone number
-// Used by the SMS CANCEL reply handler
-async function findActiveBookingByPhone(phone) {
+// Find the most recent active booking for a phone number (one tenant)
+// Used by the SMS CANCEL reply handler.
+async function findActiveBookingByPhone(businessId, phone) {
+  requireBusinessId(businessId, 'findActiveBookingByPhone');
   if (!phone) return null;
+  const tz = await getBusinessTimezone(businessId);
   const res = await query(
     `SELECT * FROM booking_requests
-     WHERE customer_phone = $1
-       AND status IN ('pending', 'confirmed')
-       AND requested_date >= (NOW() AT TIME ZONE 'America/Toronto')::date
-     ORDER BY requested_date ASC, requested_time ASC
-     LIMIT 1`,
-    [phone]
+      WHERE business_id = $1
+        AND customer_phone = $2
+        AND status IN ('pending', 'confirmed')
+        AND requested_date >= (NOW() AT TIME ZONE $3)::date
+      ORDER BY requested_date ASC, requested_time ASC
+      LIMIT 1`,
+    [businessId, phone, tz]
   );
   return res.rows[0] || null;
 }
 
-// Get all active upcoming bookings for a phone number (confirmed + pending)
-// Used by the AI to read back bookings when caller wants to cancel/modify or check their tee time
-// Uses Eastern time (course timezone) to determine "today" since Railway runs UTC
-async function getConfirmedBookingsByPhone(phone) {
+/**
+ * Get all active upcoming bookings for a phone number (confirmed + pending).
+ * Used by the AI to read back bookings when the caller wants to cancel/modify
+ * or check their tee time. Uses the business's configured timezone.
+ */
+async function getConfirmedBookingsByPhone(businessId, phone) {
+  requireBusinessId(businessId, 'getConfirmedBookingsByPhone');
   if (!phone) return [];
+  const tz = await getBusinessTimezone(businessId);
   const res = await query(
     `SELECT * FROM booking_requests
-     WHERE customer_phone = $1
-       AND status IN ('confirmed', 'pending')
-       AND requested_date >= (NOW() AT TIME ZONE 'America/Toronto')::date
-     ORDER BY requested_date ASC, requested_time ASC`,
-    [phone]
+      WHERE business_id = $1
+        AND customer_phone = $2
+        AND status IN ('confirmed', 'pending')
+        AND requested_date >= (NOW() AT TIME ZONE $3)::date
+      ORDER BY requested_date ASC, requested_time ASC`,
+    [businessId, phone, tz]
   );
   return res.rows;
 }
 
-// Get a specific confirmed booking by ID
-async function getBookingById(id) {
-  const res = await query('SELECT * FROM booking_requests WHERE id = $1', [id]);
+// Get a specific booking by ID, scoped to one tenant
+async function getBookingById(businessId, id) {
+  requireBusinessId(businessId, 'getBookingById');
+  const res = await query(
+    'SELECT * FROM booking_requests WHERE id = $1 AND business_id = $2',
+    [id, businessId]
+  );
   return res.rows[0] || null;
 }
 

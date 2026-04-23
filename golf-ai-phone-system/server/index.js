@@ -1,11 +1,12 @@
 /**
- * Valleymede Columbus Golf Course — AI Phone Answering System
+ * Multi-Tenant AI Phone Answering Platform
  * Main Server Entry Point
  *
  * Express server handling:
- * - Twilio webhooks (inbound calls)
- * - WebSocket media streams (Twilio <-> Grok bridge)
- * - REST API (Command Center backend)
+ * - Twilio webhooks (inbound calls) — tenant resolved from the called DID
+ * - WebSocket media streams (Twilio <-> Grok bridge) — tenant threaded in
+ *   via customParameters on the `start` frame
+ * - REST API (Command Center backend) — tenant resolved from JWT
  * - Static file serving (Command Center UI)
  */
 require('dotenv').config();
@@ -14,12 +15,12 @@ const http = require('http');
 const WebSocket = require('ws');
 const path = require('path');
 const cors = require('cors');
-const fs = require('fs');
 
 // Routes
 const twilioRoutes = require('./routes/twilio');
 const authRoutes = require('./routes/auth');
 const apiRoutes = require('./routes/api');
+const superAdminRoutes = require('./routes/super-admin');
 
 // Services
 const { handleMediaStream } = require('./services/grok-voice');
@@ -174,7 +175,11 @@ app.use('/twilio', twilioRoutes);
 // Authentication
 app.use('/auth', authRoutes);
 
-// Command Center API
+// Super admin (cross-tenant platform operator endpoints). Mounted BEFORE
+// /api so super-admin paths don't get routed into the tenant-scoped router.
+app.use('/api/super', superAdminRoutes);
+
+// Command Center API (per-tenant)
 app.use('/api', apiRoutes);
 
 // Serve Command Center static files (built React app)
@@ -220,11 +225,27 @@ wss.on('connection', (ws, req) => {
         const callSid = params.callSid || msg.start.callSid || 'unknown';
         const appUrl = params.appUrl || process.env.APP_URL || '';
 
-        const streamSid = msg.start.streamSid;
-        console.log(`Media stream started: caller=${callerPhone}, sid=${callSid}, stream=${streamSid}, appUrl=${appUrl}`);
+        // Tenant id is required — the /twilio/voice webhook resolved the
+        // business from the called DID and injected it into the TwiML. If it
+        // isn't here something has gone very wrong upstream; close the socket
+        // rather than risk running under the wrong tenant.
+        const businessId = parseInt(params.businessId, 10);
+        if (!Number.isInteger(businessId) || businessId <= 0) {
+          console.error(
+            `[media-stream] Missing/invalid businessId on start frame — closing. callSid=${callSid} params=${JSON.stringify(params)}`
+          );
+          try { ws.close(); } catch (_) {}
+          return;
+        }
 
-        // Hand off to the Grok voice bridge — pass streamSid and appUrl so transfer can work
-        handleMediaStream(ws, callerPhone, callSid, streamSid, appUrl);
+        const streamSid = msg.start.streamSid;
+        console.log(
+          `[tenant:${businessId}] Media stream started: caller=${callerPhone}, sid=${callSid}, stream=${streamSid}, appUrl=${appUrl}`
+        );
+
+        // Hand off to the Grok voice bridge — businessId is the tenant scope
+        // for every DB write, settings read, and tool call it performs.
+        handleMediaStream(ws, businessId, callerPhone, callSid, streamSid, appUrl);
       }
     } catch (err) {
       // Not JSON or not a start event — ignore, the handler will process it
@@ -240,73 +261,39 @@ wss.on('connection', (ws, req) => {
 // ============================================
 // Auto-Initialize Database (if DATABASE_URL is set)
 // ============================================
+//
+// Delegates to the canonical flow in `server/db/init.js`:
+//   1. apply schema.sql        (idempotent — tables guarded by IF NOT EXISTS)
+//   2. apply migrations/*.sql  (ledgered in the `migrations` table, runs each
+//                               file exactly once — this is where Phase 1's
+//                               multi-tenant migration lives)
+//   3. apply seed.sql          (idempotent via ON CONFLICT / NOT EXISTS)
+//
+// On a rolling deploy of Phase 2 this guarantees `001_multi_tenant.sql` has
+// run before any request hits the new tenant-scoped code paths.
 async function initializeDatabaseIfNeeded() {
   if (!process.env.DATABASE_URL) {
     console.log('⚠️  DATABASE_URL not set — skipping database initialization');
     return;
   }
 
+  const { applySchema, applyMigrations, applySeed } = require('./db/init');
+
   try {
-    console.log('🔧 Checking database schema...');
+    console.log('🔧 Initializing database (schema → migrations → seed)...');
     const client = await pool.connect();
-
-    // Check if tables exist
-    const result = await client.query(`
-      SELECT EXISTS (
-        SELECT 1 FROM information_schema.tables
-        WHERE table_schema = 'public' AND table_name = 'call_logs'
-      ) as exists
-    `);
-
-    if (!result.rows[0].exists) {
-      console.log('📋 Creating database schema...');
-      const schema = fs.readFileSync(path.join(__dirname, 'db', 'schema.sql'), 'utf8');
-      await client.query(schema);
-      console.log('✅ Schema created');
-
-      console.log('🌱 Seeding initial data...');
-      const seed = fs.readFileSync(path.join(__dirname, 'db', 'seed.sql'), 'utf8');
-      await client.query(seed);
-      console.log('✅ Seed data inserted');
-    } else {
-      console.log('✅ Database tables already exist');
-    }
-
-    // Run migrations — add new columns if they don't exist
     try {
-      await client.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS custom_greeting TEXT`);
-      await client.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS custom_greetings JSONB DEFAULT '[]'`);
-      await client.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS customer_knowledge TEXT`);
-      // Migrate old custom_greeting → custom_greetings array if needed
-      await client.query(`
-        UPDATE customers
-        SET custom_greetings = jsonb_build_array(custom_greeting)
-        WHERE custom_greeting IS NOT NULL
-          AND custom_greeting != ''
-          AND (custom_greetings IS NULL OR custom_greetings = '[]'::jsonb)
-      `);
-      // Phone type detection + credit card fields
-      await client.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS line_type VARCHAR(20)`);
-      await client.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS alternate_phone VARCHAR(20)`);
-      await client.query(`ALTER TABLE booking_requests ADD COLUMN IF NOT EXISTS card_last_four VARCHAR(4)`);
-      await client.query(`
-        INSERT INTO settings (key, value, description)
-        VALUES ('booking_settings', '{"require_credit_card": false}', 'Booking behavior settings (credit card requirement, etc.)')
-        ON CONFLICT (key) DO NOTHING
-      `);
-      // Day-before reminders + no-show tracking
-      await client.query(`ALTER TABLE booking_requests ADD COLUMN IF NOT EXISTS reminder_sent BOOLEAN DEFAULT FALSE`);
-      await client.query(`ALTER TABLE booking_requests ADD COLUMN IF NOT EXISTS no_show BOOLEAN DEFAULT FALSE`);
-      await client.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS no_show_count INTEGER DEFAULT 0`);
-      console.log('✅ Migrations applied');
-    } catch (migErr) {
-      console.warn('⚠️  Migration warning:', migErr.message);
+      await applySchema(client);
+      await applyMigrations(client);
+      await applySeed(client);
+      console.log('✅ Database initialization complete');
+    } finally {
+      client.release();
     }
-
-    client.release();
   } catch (err) {
     console.error('⚠️  Database initialization warning:', err.message);
-    // Don't crash the server if DB init fails — it might be a temporary connection issue
+    // Don't crash the server if DB init fails — it might be a transient
+    // connection issue, and the app will surface DB errors at request time.
   }
 }
 
@@ -321,16 +308,15 @@ async function startServer() {
 
   server.listen(PORT, () => {
     console.log('');
-    console.log('🏌️ ============================================');
-    console.log('🏌️  Valleymede Columbus Golf Course');
-    console.log('🏌️  AI Phone Answering System');
-    console.log('🏌️ ============================================');
+    console.log('============================================');
+    console.log(' Multi-Tenant AI Phone Platform');
+    console.log('============================================');
     console.log(`🌐 Server running on port ${PORT}`);
-    console.log(`📞 Twilio webhook: /twilio/voice`);
+    console.log(`📞 Twilio webhook: /twilio/voice (tenant resolved from To number)`);
     console.log(`🔌 WebSocket: /twilio/media-stream`);
     console.log(`🎛️  Command Center: http://localhost:${PORT}`);
-    console.log(`📡 API: /api/*`);
-    console.log(`⏰ Reminder scheduler: active (6 PM ET daily)`);
+    console.log(`📡 API: /api/*     Super Admin: /api/admin/*`);
+    console.log(`⏰ Reminder scheduler: active (per-tenant local 6 PM)`);
     console.log('============================================');
     console.log('');
 

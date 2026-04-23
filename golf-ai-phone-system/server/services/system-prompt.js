@@ -1,12 +1,19 @@
 /**
- * Dynamic System Prompt Builder
- * Composes the AI's system prompt from database settings + caller context
+ * Dynamic System Prompt Builder — tenant-scoped.
+ *
+ * buildSystemPrompt(businessId, callerContext) loads ALL settings from the
+ * tenant's rows in `settings` and the tenant's row in `businesses`. There are
+ * no hardcoded references to Valleymede here — everything that used to be
+ * hardcoded now falls back to the business row or a generic label.
  */
-const { getSetting, query } = require('../config/database');
+const { getSetting, getBusinessById } = require('../config/database');
+const { requireBusinessId } = require('../context/tenant-context');
 
-async function buildSystemPrompt(callerContext = {}) {
-  // Load all settings from database
+async function buildSystemPrompt(businessId, callerContext = {}) {
+  requireBusinessId(businessId, 'buildSystemPrompt');
+
   const [
+    business,
     courseInfo,
     pricing,
     hours,
@@ -20,35 +27,43 @@ async function buildSystemPrompt(callerContext = {}) {
     generalKnowledge,
     faq,
     seasonalNotes,
-    bookingSettings
+    bookingSettings,
+    greetingSettings
   ] = await Promise.all([
-    getSetting('course_info'),
-    getSetting('pricing'),
-    getSetting('business_hours'),
-    getSetting('policies'),
-    getSetting('memberships'),
-    getSetting('tournaments'),
-    getSetting('amenities'),
-    getSetting('ai_personality'),
-    getSetting('announcements'),
-    getSetting('daily_instructions'),
-    getSetting('general_knowledge'),
-    getSetting('faq'),
-    getSetting('seasonal_notes'),
-    getSetting('booking_settings')
+    getBusinessById(businessId),
+    getSetting(businessId, 'course_info'),
+    getSetting(businessId, 'pricing'),
+    getSetting(businessId, 'business_hours'),
+    getSetting(businessId, 'policies'),
+    getSetting(businessId, 'memberships'),
+    getSetting(businessId, 'tournaments'),
+    getSetting(businessId, 'amenities'),
+    getSetting(businessId, 'ai_personality'),
+    getSetting(businessId, 'announcements'),
+    getSetting(businessId, 'daily_instructions'),
+    getSetting(businessId, 'general_knowledge'),
+    getSetting(businessId, 'faq'),
+    getSetting(businessId, 'seasonal_notes'),
+    getSetting(businessId, 'booking_settings'),
+    getSetting(businessId, 'greetings')
   ]);
+
+  // Tenant identity + timezone — everything downstream uses these.
+  const businessName =
+    courseInfo?.name || business?.name || 'the Golf Course';
+  const timezone = business?.timezone || 'America/Toronto';
 
   const requireCreditCard = bookingSettings?.require_credit_card ?? false;
 
-  // Determine current day/time context
+  // Determine current day/time context in the tenant's timezone.
   const now = new Date();
-  const options = { timeZone: 'America/Toronto' };
-  const dayName = now.toLocaleDateString('en-US', { ...options, weekday: 'long' }).toLowerCase();
-  const timeStr = now.toLocaleTimeString('en-US', { ...options, hour: '2-digit', minute: '2-digit', hour12: true });
-  const dateStr = now.toLocaleDateString('en-US', { ...options, weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+  const tzOpts = { timeZone: timezone };
+  const dayName = now.toLocaleDateString('en-US', { ...tzOpts, weekday: 'long' }).toLowerCase();
+  const timeStr = now.toLocaleTimeString('en-US', { ...tzOpts, hour: '2-digit', minute: '2-digit', hour12: true });
+  const dateStr = now.toLocaleDateString('en-US', { ...tzOpts, weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
 
   const todayHours = hours?.[dayName];
-  const isOpen = todayHours ? isCurrentlyOpen(todayHours) : false;
+  const isOpen = todayHours ? isCurrentlyOpen(todayHours, timezone) : false;
 
   // Build caller context section
   let callerSection = '';
@@ -85,7 +100,6 @@ Use save_customer_info to save their name so we remember them next time.
 `;
   }
 
-  // Add landline warning to caller context
   if (callerContext.isLandline) {
     if (callerContext.alternatePhone) {
       callerSection += `
@@ -106,23 +120,22 @@ This caller is calling from a HOME/LANDLINE phone. They CANNOT receive text mess
     }
   }
 
-  // Build daily instructions section — keyed by YYYY-MM-DD date
+  // Build daily instructions section — keyed by YYYY-MM-DD date (tenant tz)
   let dailySection = '';
   const toDateKey = (offsetDays) => {
     const d = new Date(now);
     d.setDate(d.getDate() + offsetDays);
-    return d.toLocaleDateString('en-CA', { timeZone: 'America/Toronto' });
+    return d.toLocaleDateString('en-CA', { timeZone: timezone });
   };
   const toFriendlyDay = (offsetDays) => {
     const d = new Date(now);
     d.setDate(d.getDate() + offsetDays);
-    return d.toLocaleDateString('en-US', { timeZone: 'America/Toronto', weekday: 'long', month: 'long', day: 'numeric' });
+    return d.toLocaleDateString('en-US', { timeZone: timezone, weekday: 'long', month: 'long', day: 'numeric' });
   };
 
   const todayKey = toDateKey(0);
   const todayEntry = dailyInstructions?.[todayKey];
 
-  // Build upcoming days info (tomorrow + 2 more days) for callers who ask
   const upcomingLines = [];
   for (let i = 1; i <= 3; i++) {
     const k = toDateKey(i);
@@ -148,7 +161,7 @@ ${upcomingLines.join('\n')}
 `;
   }
 
-  // Build announcements section
+  // Announcements
   let announcementSection = '';
   const activeAnnouncements = (announcements || []).filter(a => a.active);
   if (activeAnnouncements.length > 0) {
@@ -158,7 +171,23 @@ ${activeAnnouncements.map(a => `- ${a.message}`).join('\n')}
 `;
   }
 
-  const systemPrompt = `You are a friendly, natural-sounding staff member answering the phone at ${courseInfo?.name || 'Valleymede Columbus Golf Course'}. You are NOT a robot — you're a real person who works at the course and loves golf.
+  // Optional per-tenant greeting overrides (used by grok-voice at stream start)
+  let greetingSection = '';
+  if (greetingSettings?.opening_line) {
+    greetingSection = `
+## OPENING LINE
+When you pick up the call, open with something like: "${greetingSettings.opening_line}".
+Keep it short and natural.
+`;
+  }
+
+  // Phone/contact fallback: prefer the business row, then course_info, then transfer_number.
+  const businessPhoneLocal =
+    business?.transfer_number ||
+    courseInfo?.phone_local ||
+    '';
+
+  const systemPrompt = `You are a friendly, natural-sounding staff member answering the phone at ${businessName}. You are NOT a robot — you're a real person who works at the course and loves golf.
 
 ## YOUR PERSONALITY
 ${personality?.style || 'Friendly, warm, and conversational. Sound like a real person.'}
@@ -186,69 +215,69 @@ ${personality?.style || 'Friendly, warm, and conversational. Sound like a real p
 
 ## CURRENT DATE & TIME
 - Today is ${dateStr}
-- Current time: ${timeStr} (Eastern)
+- Current time: ${timeStr} (${timezone})
 - The course is currently: ${isOpen ? 'OPEN' : 'CLOSED'}
 ${todayHours ? `- Today's hours: ${todayHours.open} - ${todayHours.close}` : '- Hours not set for today'}
 
 ## DATE REFERENCE (use this to convert what callers say to YYYY-MM-DD)
-${buildDateReference()}
+${buildDateReference(timezone)}
 
 ## COURSE INFORMATION
-- Name: ${courseInfo?.name}
-- Address: ${courseInfo?.address}
-- Phone: ${courseInfo?.phone_local} | Toll-free: ${courseInfo?.phone_tollfree}
-- Email: ${courseInfo?.email}
-- Website: ${courseInfo?.website}
-- Course: ${courseInfo?.holes} holes, ${courseInfo?.style}, ${courseInfo?.acres} acres, approximately ${courseInfo?.yards} yards
-- ${courseInfo?.description}
-- Directions: ${courseInfo?.directions}
+- Name: ${businessName}
+- Address: ${courseInfo?.address || business?.address || ''}
+- Phone: ${businessPhoneLocal}${courseInfo?.phone_tollfree ? ` | Toll-free: ${courseInfo.phone_tollfree}` : ''}
+- Email: ${courseInfo?.email || business?.email || ''}
+- Website: ${courseInfo?.website || business?.website || ''}
+${courseInfo?.holes ? `- Course: ${courseInfo?.holes} holes, ${courseInfo?.style || ''}, ${courseInfo?.acres ? courseInfo.acres + ' acres, ' : ''}${courseInfo?.yards ? 'approximately ' + courseInfo.yards + ' yards' : ''}` : ''}
+${courseInfo?.description ? `- ${courseInfo.description}` : ''}
+${courseInfo?.directions ? `- Directions: ${courseInfo.directions}` : ''}
 ${courseInfo?.signature_holes ? `- Signature holes: ${courseInfo.signature_holes.map(h => `Hole ${h.hole}: ${h.description}`).join('; ')}` : ''}
 
 ## GREEN FEES & PRICING
 ### Monday - Thursday:
-- 18 Holes: $${pricing?.green_fees?.weekday?.['18_holes']}
-- 9 Holes: $${pricing?.green_fees?.weekday?.['9_holes']}
-- Twilight: $${pricing?.green_fees?.weekday?.twilight}
+- 18 Holes: $${pricing?.green_fees?.weekday?.['18_holes'] ?? ''}
+- 9 Holes: $${pricing?.green_fees?.weekday?.['9_holes'] ?? ''}
+- Twilight: $${pricing?.green_fees?.weekday?.twilight ?? ''}
 
 ### Friday - Sunday & Holidays:
-- 18 Holes: $${pricing?.green_fees?.weekend_holiday?.['18_holes']}
-- 9 Holes: $${pricing?.green_fees?.weekend_holiday?.['9_holes']}
-- Twilight: $${pricing?.green_fees?.weekend_holiday?.twilight}
+- 18 Holes: $${pricing?.green_fees?.weekend_holiday?.['18_holes'] ?? ''}
+- 9 Holes: $${pricing?.green_fees?.weekend_holiday?.['9_holes'] ?? ''}
+- Twilight: $${pricing?.green_fees?.weekend_holiday?.twilight ?? ''}
 
 ### Cart Fees:
-- Power Cart (18 holes): $${pricing?.rentals?.power_cart_18}
-- Power Cart (9 holes): $${pricing?.rentals?.power_cart_9}
-- Pull Cart: $${pricing?.rentals?.pull_cart}
+- Power Cart (18 holes): $${pricing?.rentals?.power_cart_18 ?? ''}
+- Power Cart (9 holes): $${pricing?.rentals?.power_cart_9 ?? ''}
+- Pull Cart: $${pricing?.rentals?.pull_cart ?? ''}
 
 ## BUSINESS HOURS
 ${Object.entries(hours || {}).map(([day, h]) => `- ${day.charAt(0).toUpperCase() + day.slice(1)}: ${h.open} - ${h.close}`).join('\n')}
 
 ## POLICIES
-- Minimum age: ${policies?.min_age} years old
-- Maximum booking size: ${policies?.max_booking_size} players (${Math.ceil((policies?.max_booking_size || 8) / 4)} foursomes)
-- Maximum players per group: ${policies?.max_players_per_group}
-- Walk-ins: ${policies?.walk_ins}
-- Pairing: ${policies?.pairing_policy}
+- Minimum age: ${policies?.min_age ?? 'n/a'} years old
+- Maximum booking size: ${policies?.max_booking_size ?? 8} players (${Math.ceil((policies?.max_booking_size || 8) / 4)} foursomes)
+- Maximum players per group: ${policies?.max_players_per_group ?? 4}
+- Walk-ins: ${policies?.walk_ins || 'Welcome'}
+- Pairing: ${policies?.pairing_policy || 'As needed'}
 - Cart rules: ${(policies?.cart_rules || []).join('. ')}
 - NO outside alcoholic beverages. All alcohol must be purchased through clubhouse or beverage cart.
 
 ## MEMBERSHIPS
-- Status: ${memberships?.status}
+- Status: ${memberships?.status || 'Not currently offered'}
 ${memberships?.waitlist ? `- Waitlist: Available. Email ${memberships?.waitlist_email} to join.` : ''}
 ${memberships?.types ? memberships.types.map(t => `- ${t.name}: $${t.price} (${t.note})`).join('\n') : ''}
-- Benefits: ${memberships?.benefits}
+${memberships?.benefits ? `- Benefits: ${memberships.benefits}` : ''}
 
 ## TOURNAMENTS & GROUP OUTINGS
-- Capacity: ${tournaments?.capacity_min} to ${tournaments?.capacity_max} golfers
+- Capacity: ${tournaments?.capacity_min ?? ''} to ${tournaments?.capacity_max ?? ''} golfers
 - Services: ${(tournaments?.services || []).join(', ')}
-- ${tournaments?.booking_info}
-- ${tournaments?.note}
+${tournaments?.booking_info ? `- ${tournaments.booking_info}` : ''}
+${tournaments?.note ? `- ${tournaments.note}` : ''}
 
 ## AMENITIES
 - Facilities: ${(amenities?.facilities || []).join(', ')}
-- Pull carts: ${amenities?.rentals?.pull_carts}
-- Club rentals: ${amenities?.rentals?.club_rentals}
-- Single rider cart: ${amenities?.rentals?.single_rider_cart}
+- Pull carts: ${amenities?.rentals?.pull_carts ?? ''}
+- Club rentals: ${amenities?.rentals?.club_rentals ?? ''}
+- Single rider cart: ${amenities?.rentals?.single_rider_cart ?? ''}
 ${generalKnowledge ? `
 ## GENERAL COURSE KNOWLEDGE
 ${generalKnowledge}
@@ -260,6 +289,7 @@ ${faq}
 ${seasonalNotes}
 ` : ''}${dailySection}
 ${announcementSection}
+${greetingSection}
 ${callerSection}
 
 ## AFTER-HOURS BEHAVIOR
@@ -357,19 +387,20 @@ When a caller wants to cancel or change a booking:
   return systemPrompt;
 }
 
-function buildDateReference() {
-  // Build a reference of upcoming dates so the AI can convert
-  // "today", "tomorrow", "Sunday", "next Saturday" etc. to YYYY-MM-DD
-  // Use Eastern time (course timezone) for "today" calculation
-  const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Toronto' }); // YYYY-MM-DD
+/**
+ * Build a "today = YYYY-MM-DD, tomorrow = YYYY-MM-DD, ..." block in the
+ * given IANA timezone. Defaults to America/Toronto for legacy callers.
+ */
+function buildDateReference(timezone = 'America/Toronto') {
+  const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: timezone });
   const [y, m, d] = todayStr.split('-').map(Number);
-  const easternToday = new Date(y, m - 1, d); // midnight local = Eastern today
+  const localToday = new Date(y, m - 1, d);
 
   const lines = [];
   for (let i = 0; i <= 13; i++) {
-    const dt = new Date(easternToday);
+    const dt = new Date(localToday);
     dt.setDate(dt.getDate() + i);
-    const dateKey = dt.toLocaleDateString('en-CA'); // YYYY-MM-DD
+    const dateKey = dt.toLocaleDateString('en-CA');
     const dayLabel = dt.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' });
     const prefix = i === 0 ? ' (TODAY)' : i === 1 ? ' (tomorrow)' : '';
     lines.push(`- ${dayLabel}${prefix} = ${dateKey}`);
@@ -377,25 +408,26 @@ function buildDateReference() {
   return lines.join('\n');
 }
 
-function getEasternTime() {
-  // Reliably get current hour/minute in Eastern time using Intl.DateTimeFormat
-  // This works correctly regardless of what timezone the server is in
+/**
+ * Return the current hour/minute in the given IANA timezone.
+ */
+function getCurrentLocalTime(timezone) {
   const now = new Date();
   const formatter = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/Toronto',
+    timeZone: timezone,
     hour: 'numeric',
     minute: 'numeric',
     hour12: false
   });
   const parts = formatter.formatToParts(now);
-  const hour = parseInt(parts.find(p => p.type === 'hour').value);
-  const minute = parseInt(parts.find(p => p.type === 'minute').value);
+  const hour = parseInt(parts.find(p => p.type === 'hour').value, 10);
+  const minute = parseInt(parts.find(p => p.type === 'minute').value, 10);
   return { hour, minute, totalMinutes: hour * 60 + minute };
 }
 
-function isCurrentlyOpen(todayHours) {
+function isCurrentlyOpen(todayHours, timezone = 'America/Toronto') {
   if (!todayHours) return false;
-  const { totalMinutes } = getEasternTime();
+  const { totalMinutes } = getCurrentLocalTime(timezone);
   const [openH, openM] = todayHours.open.split(':').map(Number);
   const [closeH, closeM] = todayHours.close.split(':').map(Number);
   return totalMinutes >= (openH * 60 + openM) && totalMinutes <= (closeH * 60 + closeM);

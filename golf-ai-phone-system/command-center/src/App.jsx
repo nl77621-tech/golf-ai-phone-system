@@ -3066,7 +3066,11 @@ function SuperAdminDashboard({ onSwitchInto, onBusinessCreated }) {
   const [businesses, setBusinesses] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [showWizard, setShowWizard] = useState(false);
+  // `wizardMode` is null when the wizard is closed, 'business' for the
+  // standard tenant onboarding flow, and 'personal' for the "New Personal
+  // Account" shortcut (pre-selects template_key='personal_assistant' and
+  // swaps copy/defaults so the form reads like a personal-account flow).
+  const [wizardMode, setWizardMode] = useState(null);
   const [lastCreated, setLastCreated] = useState(null);
   const [search, setSearch] = useState('');
   const [phoneModalBiz, setPhoneModalBiz] = useState(null);
@@ -3100,7 +3104,7 @@ function SuperAdminDashboard({ onSwitchInto, onBusinessCreated }) {
   const handleCreated = (resp) => {
     refresh();
     setLastCreated(resp || null);
-    setShowWizard(false);
+    setWizardMode(null);
     // Let the parent App() refresh its top-level businesses list so the
     // TopBar's BusinessSwitcher picks up the new tenant without a reload.
     if (typeof onBusinessCreated === 'function') onBusinessCreated(resp);
@@ -3134,12 +3138,26 @@ function SuperAdminDashboard({ onSwitchInto, onBusinessCreated }) {
         React.createElement('h1', { className: 'text-2xl font-bold text-gray-800' }, 'Businesses'),
         React.createElement('p', { className: 'text-sm text-gray-500 mt-1' }, 'Every tenant running on the platform, at a glance.')
       ),
-      React.createElement('button', {
-        onClick: () => setShowWizard(true),
-        className: 'bg-golf-600 hover:bg-golf-700 text-white px-5 py-2.5 rounded-lg text-sm font-semibold shadow-sm flex items-center gap-2'
-      },
-        React.createElement('span', { className: 'text-lg leading-none' }, '+'),
-        React.createElement('span', null, 'New Business')
+      // Two onboarding entry points, side by side. The primary "New
+      // Business" CTA stays the headline action; "New Personal Account"
+      // sits next to it so a PA tenant is one click away instead of
+      // buried inside the same wizard's template grid.
+      React.createElement('div', { className: 'flex items-center gap-2' },
+        React.createElement('button', {
+          onClick: () => setWizardMode('personal'),
+          className: 'bg-white hover:bg-indigo-50 text-indigo-700 border border-indigo-200 px-4 py-2.5 rounded-lg text-sm font-semibold shadow-sm flex items-center gap-2',
+          title: 'Create a Personal Assistant account'
+        },
+          React.createElement('span', { className: 'text-lg leading-none' }, '\ud83d\udc64'),
+          React.createElement('span', null, 'New Personal Account')
+        ),
+        React.createElement('button', {
+          onClick: () => setWizardMode('business'),
+          className: 'bg-golf-600 hover:bg-golf-700 text-white px-5 py-2.5 rounded-lg text-sm font-semibold shadow-sm flex items-center gap-2'
+        },
+          React.createElement('span', { className: 'text-lg leading-none' }, '+'),
+          React.createElement('span', null, 'New Business')
+        )
       )
     ),
 
@@ -3300,10 +3318,16 @@ function SuperAdminDashboard({ onSwitchInto, onBusinessCreated }) {
       React.createElement('div', { className: 'text-5xl mb-3' }, '\ud83c\udfcc\ufe0f'),
       React.createElement('h3', { className: 'text-lg font-bold text-gray-800 mb-1' }, 'No businesses yet'),
       React.createElement('p', { className: 'text-sm text-gray-500 mb-5' }, 'Spin up your first tenant and the AI receptionist is live in under 5 minutes.'),
-      React.createElement('button', {
-        onClick: () => setShowWizard(true),
-        className: 'bg-golf-600 hover:bg-golf-700 text-white px-5 py-2.5 rounded-lg text-sm font-semibold'
-      }, 'Create first business')
+      React.createElement('div', { className: 'flex items-center justify-center gap-2' },
+        React.createElement('button', {
+          onClick: () => setWizardMode('personal'),
+          className: 'bg-white hover:bg-indigo-50 text-indigo-700 border border-indigo-200 px-4 py-2.5 rounded-lg text-sm font-semibold'
+        }, '\ud83d\udc64 New personal account'),
+        React.createElement('button', {
+          onClick: () => setWizardMode('business'),
+          className: 'bg-golf-600 hover:bg-golf-700 text-white px-5 py-2.5 rounded-lg text-sm font-semibold'
+        }, 'Create first business')
+      )
     ),
 
     // ---------- Card grid ----------
@@ -3325,8 +3349,13 @@ function SuperAdminDashboard({ onSwitchInto, onBusinessCreated }) {
       )
     ),
 
-    showWizard && React.createElement(OnboardingWizard, {
-      onCancel: () => setShowWizard(false),
+    wizardMode && React.createElement(OnboardingWizard, {
+      // Keyed on mode so switching entry points fully remounts the wizard —
+      // no stale template_key / color from the previous flow can bleed in.
+      key: wizardMode,
+      mode: wizardMode,
+      initialTemplateKey: wizardMode === 'personal' ? 'personal_assistant' : null,
+      onCancel: () => setWizardMode(null),
       onCreated: handleCreated,
       // Thread through so the Success step can switch directly into the
       // new tenant instead of bouncing through the dashboard first.
@@ -3391,7 +3420,14 @@ function slugifyClient(s) {
     .slice(0, 60);
 }
 
-function OnboardingWizard({ onCancel, onCreated, onActAs }) {
+// `mode` controls a thin layer of copy + defaults that makes the wizard
+// feel right whether the operator is spinning up a business tenant or a
+// personal-assistant account. Everything else — validation, server payload,
+// template picker, invite flow — is identical. `initialTemplateKey` lets
+// the caller pre-select a template so the "New Personal Account" shortcut
+// doesn't force the operator to click through the template grid again.
+function OnboardingWizard({ onCancel, onCreated, onActAs, mode = 'business', initialTemplateKey = null }) {
+  const isPersonal = mode === 'personal';
   const [step, setStep] = useState(0);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
@@ -3403,14 +3439,14 @@ function OnboardingWizard({ onCancel, onCreated, onActAs }) {
     slug: '',
     contact_email: '',
     contact_phone: '',
-    primary_color: '#2E7D32',
+    primary_color: isPersonal ? '#4F46E5' : '#2E7D32',
     logo_url: '',
     timezone: 'America/Toronto',
     plan: 'starter',
     twilio_phone_number: '',
     transfer_number: '',
     phone_numbers: [],              // [{ phone_number, label }]
-    template_key: 'golf_course',
+    template_key: initialTemplateKey || 'golf_course',
     admin_email: '',
     admin_name: '',
     // Personal Assistant-only: the voice-facing name of the assistant.
@@ -3467,11 +3503,16 @@ function OnboardingWizard({ onCancel, onCreated, onActAs }) {
 
   // Load templates on mount. Fall back to a hardcoded minimal list if the
   // API is unreachable so the wizard still works.
+  //
+  // If the caller pre-selected a template (e.g. the "New Personal Account"
+  // shortcut hands us 'personal_assistant'), we honour that and skip the
+  // server-supplied default — otherwise we'd silently flip the wizard back
+  // to golf_course on mount and the shortcut would feel broken.
   useEffect(() => {
     api('/api/super/templates')
       .then(d => {
         setTemplates(d.templates || []);
-        if (d.default_template_key) set('template_key', d.default_template_key);
+        if (!initialTemplateKey && d.default_template_key) set('template_key', d.default_template_key);
       })
       .catch(() => {
         setTemplates([
@@ -3488,14 +3529,23 @@ function OnboardingWizard({ onCancel, onCreated, onActAs }) {
   const labelCls = 'block text-xs font-semibold text-gray-600 mb-1';
   const inputCls = 'w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-golf-500 focus:border-transparent outline-none';
 
-  const steps = [
-    { title: 'Business basics', sub: 'Name, contact, branding' },
-    { title: 'Phone numbers',   sub: 'Route inbound calls + SMS' },
-    { title: 'Choose template', sub: 'Pick a vertical to seed defaults' },
-    { title: 'Review & confirm', sub: 'What we\u2019re about to apply' },
-    { title: 'First admin',      sub: 'Invite the business owner' },
-    { title: 'All set',          sub: 'Share the magic link' }
-  ];
+  const steps = isPersonal
+    ? [
+        { title: 'Account basics',   sub: 'Name, contact, look & feel' },
+        { title: 'Phone number',     sub: 'Where your assistant answers calls' },
+        { title: 'Confirm template', sub: 'Personal Assistant is pre-selected' },
+        { title: 'Review & confirm', sub: 'What we\u2019re about to apply' },
+        { title: 'Account owner',    sub: 'Invite yourself (or the owner)' },
+        { title: 'All set',          sub: 'Share the magic link' }
+      ]
+    : [
+        { title: 'Business basics', sub: 'Name, contact, branding' },
+        { title: 'Phone numbers',   sub: 'Route inbound calls + SMS' },
+        { title: 'Choose template', sub: 'Pick a vertical to seed defaults' },
+        { title: 'Review & confirm', sub: 'What we\u2019re about to apply' },
+        { title: 'First admin',      sub: 'Invite the business owner' },
+        { title: 'All set',          sub: 'Share the magic link' }
+      ];
 
   // Per-step gating — disables "Next" until required fields exist and
   // free-form inputs pass format checks. These MUST match the server-side
@@ -3589,11 +3639,14 @@ function OnboardingWizard({ onCancel, onCreated, onActAs }) {
 
   const renderBasics = () => React.createElement('div', { className: 'space-y-4' },
     React.createElement('div', null,
-      React.createElement('label', { className: labelCls }, 'Business name *'),
+      React.createElement('label', { className: labelCls },
+        isPersonal ? 'Account name *' : 'Business name *'
+      ),
       React.createElement('input', {
         className: inputCls, type: 'text', value: form.name,
         onChange: e => set('name', e.target.value),
-        placeholder: 'e.g. Cedar Ridge Golf Club', autoFocus: true
+        placeholder: isPersonal ? 'e.g. Alex\u2019s Assistant' : 'e.g. Cedar Ridge Golf Club',
+        autoFocus: true
       })
     ),
     React.createElement('div', { className: 'grid grid-cols-2 gap-4' },
@@ -4037,7 +4090,9 @@ function OnboardingWizard({ onCancel, onCreated, onActAs }) {
         // with an invite, or explicitly skips the invite (with a clear hint).
         step === 4 && React.createElement('div', { className: 'flex items-center gap-2' },
           !form.admin_email.trim() && React.createElement('span', { className: 'text-[11px] text-gray-500' },
-            'You can invite an admin later from the business card.'
+            isPersonal
+              ? 'You can invite the account owner later from the card.'
+              : 'You can invite an admin later from the business card.'
           ),
           React.createElement('button', {
             type: 'button',
@@ -4045,10 +4100,10 @@ function OnboardingWizard({ onCancel, onCreated, onActAs }) {
             onClick: handleCreate,
             className: 'px-5 py-2 rounded-lg bg-golf-600 hover:bg-golf-700 text-white text-sm font-semibold disabled:opacity-50'
           }, saving
-            ? 'Creating business\u2026'
+            ? (isPersonal ? 'Creating account\u2026' : 'Creating business\u2026')
             : (form.admin_email.trim()
-                ? 'Create business + send invite'
-                : 'Skip invite & create business')
+                ? (isPersonal ? 'Create account + send invite' : 'Create business + send invite')
+                : (isPersonal ? 'Skip invite & create account' : 'Skip invite & create business'))
           )
         ),
         // Step 5 footer: offer to switch into the new tenant or return to

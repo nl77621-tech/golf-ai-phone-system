@@ -2646,12 +2646,18 @@ function BusinessCard({ business, onActAs, onManagePhones, onEdit, onDelete }) {
       React.createElement(MetricChip, { label: 'Calls 30d', value: business.calls_last_30d ?? 0, tone: 'blue' }),
       React.createElement(MetricChip, { label: 'Bookings 30d', value: business.bookings_last_30d ?? 0, tone: 'green' })
     ),
-    React.createElement('div', { className: 'px-4 py-3 bg-gray-50 border-t flex items-center justify-between text-xs gap-3' },
-      React.createElement('span', { className: 'text-gray-500 truncate' },
+    React.createElement('div', { className: 'px-4 py-3 bg-gray-50 border-t flex items-center justify-between text-xs gap-3 flex-wrap' },
+      React.createElement('span', { className: 'text-gray-500 truncate min-w-0' },
         business.plan ? `Plan: ${business.plan}` : 'Plan: \u2014',
         business.setup_complete ? '' : ' \u2022 setup pending'
       ),
-      React.createElement('div', { className: 'flex items-center gap-3 flex-shrink-0' },
+      // Action row. Wraps to a second line on narrow card widths so Delete
+      // and Act-as never get pushed off the card. Legacy tenants (Valleymede
+      // safety lock) still render Delete, but disabled + tooltipped so the
+      // operator can see the button exists and understand why it's greyed —
+      // previously we hid it entirely, which made it look like Delete was
+      // missing from the UI.
+      React.createElement('div', { className: 'flex items-center gap-3 flex-shrink-0 flex-wrap justify-end' },
         !isDeleted && typeof onEdit === 'function' && React.createElement('button', {
           onClick: () => onEdit(business),
           className: 'text-gray-600 hover:text-gray-900 font-semibold'
@@ -2660,13 +2666,15 @@ function BusinessCard({ business, onActAs, onManagePhones, onEdit, onDelete }) {
           onClick: () => onManagePhones(business),
           className: 'text-gray-600 hover:text-gray-900 font-semibold'
         }, '\ud83d\udcde Phones'),
-        // Delete is hidden for legacy (Valleymede safety) and for already-
-        // deleted tenants. The server also enforces both, but no point
-        // showing a button that's going to 403/409.
-        !isDeleted && !isLegacy && typeof onDelete === 'function' && React.createElement('button', {
-          onClick: () => onDelete(business),
-          className: 'text-red-600 hover:text-red-800 font-semibold',
-          title: 'Soft-delete this tenant'
+        !isDeleted && typeof onDelete === 'function' && React.createElement('button', {
+          onClick: () => { if (!isLegacy) onDelete(business); },
+          disabled: isLegacy,
+          className: isLegacy
+            ? 'text-gray-400 cursor-not-allowed font-semibold'
+            : 'text-red-600 hover:text-red-800 font-semibold',
+          title: isLegacy
+            ? 'Protected — legacy tenant (Valleymede safety lock). Change plan to soft-delete.'
+            : 'Soft-delete this tenant'
         }, '\ud83d\uddd1 Delete'),
         !isDeleted && React.createElement('button', {
           onClick: () => onActAs(business.id),

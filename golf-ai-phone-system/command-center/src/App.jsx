@@ -2614,7 +2614,13 @@ function MetricChip({ label, value, tone = 'default' }) {
 // operator flipping between tenants all day.
 function BusinessCard({ business, onActAs, onManagePhones, onManageVoice, onEdit, onDelete }) {
   const isDeleted = !!business.deleted_at;
-  const isLegacy = business.plan === 'legacy';
+  // Delete protection is anchored to the original Valleymede tenant (id=1),
+  // NOT the mutable `plan='legacy'` flag. Earlier code used the plan check,
+  // but `legacy` is also a selectable value in the Edit-tenant plan dropdown,
+  // so any tenant that happened to be saved with plan=legacy became
+  // un-deletable. The real invariant we care about is "this is the original
+  // pre-SaaS tenant" — that's always id=1.
+  const isLegacy = business.id === 1;
   return React.createElement('div', {
     className: `bg-white rounded-xl shadow-sm border hover:shadow-md transition-shadow overflow-hidden flex flex-col ${isDeleted ? 'opacity-60' : ''}`
   },
@@ -2678,7 +2684,7 @@ function BusinessCard({ business, onActAs, onManagePhones, onManageVoice, onEdit
             ? 'text-gray-400 cursor-not-allowed font-semibold'
             : 'text-red-600 hover:text-red-800 font-semibold',
           title: isLegacy
-            ? 'Protected — legacy tenant (Valleymede safety lock). Change plan to soft-delete.'
+            ? 'Protected — this is the original tenant (id=1) and cannot be deleted.'
             : 'Soft-delete this tenant'
         }, '\ud83d\uddd1 Delete'),
         !isDeleted && React.createElement('button', {
@@ -2810,9 +2816,14 @@ function EditTenantModal({ business, onClose, onSaved }) {
                 textField('Contact email', form.contact_email, v => set('contact_email', v)),
                 textField('Contact phone', form.contact_phone, v => set('contact_phone', v)),
                 textField('Timezone', form.timezone, v => set('timezone', v), 'America/Toronto'),
+                // `legacy` is deliberately omitted from this list. It's a
+                // grandfather flag for the original pre-SaaS tenant (id=1),
+                // not a plan an operator should pick from the UI — setting
+                // it on other tenants previously forced the golf sidebar +
+                // pages to render for them and locked the Delete button.
                 selectField('Plan', form.plan, v => set('plan', v), [
                   ['free', 'free'], ['starter', 'starter'], ['growth', 'growth'],
-                  ['pro', 'pro'], ['legacy', 'legacy']
+                  ['pro', 'pro'], ['trial', 'trial']
                 ])
               )
             ),

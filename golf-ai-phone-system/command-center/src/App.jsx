@@ -3745,14 +3745,16 @@ function OnboardingWizard({ onCancel, onCreated, onActAs, mode = 'business', ini
         { title: 'Account basics',   sub: 'Name, contact, look & feel' },
         { title: 'Phone number',     sub: 'Where your assistant answers calls' },
         { title: 'Confirm template', sub: 'Personal Assistant is pre-selected' },
+        { title: 'Voice tier',       sub: 'Pick the Grok voice the tenant pays per minute' },
         { title: 'Review & confirm', sub: 'What we\u2019re about to apply' },
         { title: 'Account owner',    sub: 'Invite yourself (or the owner)' },
         { title: 'All set',          sub: 'Share the magic link' }
       ]
     : [
-        { title: 'Business basics', sub: 'Name, contact, branding' },
-        { title: 'Phone numbers',   sub: 'Route inbound calls + SMS' },
-        { title: 'Choose template', sub: 'Pick a vertical to seed defaults' },
+        { title: 'Business basics',  sub: 'Name, contact, branding' },
+        { title: 'Phone numbers',    sub: 'Route inbound calls + SMS' },
+        { title: 'Choose template',  sub: 'Pick a vertical to seed defaults' },
+        { title: 'Voice tier',       sub: 'Pick the Grok voice the tenant pays per minute' },
         { title: 'Review & confirm', sub: 'What we\u2019re about to apply' },
         { title: 'First admin',      sub: 'Invite the business owner' },
         { title: 'All set',          sub: 'Share the magic link' }
@@ -3778,8 +3780,12 @@ function OnboardingWizard({ onCancel, onCreated, onActAs, mode = 'business', ini
       return true;
     }
     if (step === 2) return !!form.template_key;
-    if (step === 3) return true;
-    if (step === 4) {
+    // Step 3 (voice tier): always advanceable — the form starts with a valid
+    // default ('standard') and the plan-vs-tier useEffect keeps that in sync,
+    // so there's no invalid state a super-admin could wedge themselves into.
+    if (step === 3) return !!form.voice_tier;
+    if (step === 4) return true;                     // review
+    if (step === 5) {
       if (!form.admin_email) return true;           // optional — "skip invite"
       return isValidEmail(form.admin_email);
     }
@@ -3822,7 +3828,10 @@ function OnboardingWizard({ onCancel, onCreated, onActAs, mode = 'business', ini
         })
       });
       setResult(resp);
-      setStep(5);
+      // Success step: 7-step flow → index 6 ('All set'). Keep in sync with
+      // `steps` / `stepBodies`; off-by-one here means the success card never
+      // renders and the wizard looks frozen after a successful POST.
+      setStep(6);
     } catch (err) {
       setError(err.message || 'Failed to create business');
     } finally {
@@ -4116,58 +4125,67 @@ function OnboardingWizard({ onCancel, onCreated, onActAs, mode = 'business', ini
         value: form.assistant_name || '',
         onChange: (e) => set('assistant_name', e.target.value)
       })
-    ),
-    // ─── Voice tier picker ───────────────────────────────────────────────
-    //
-    // Three cards: Economy / Standard / Premium. Each card shows the tier
-    // label, tagline, and a small "$" cost indicator so the operator can
-    // eyeball relative cost. Tiers the selected plan doesn't unlock render
-    // disabled with a padlock and "Upgrade plan to unlock" copy.
-    voiceTiers.length > 0 && React.createElement('div', { className: 'mt-6' },
-      React.createElement('h4', { className: 'text-sm font-semibold text-gray-800 mb-1' }, 'Voice tier'),
-      React.createElement('p', { className: 'text-xs text-gray-500 mb-3' },
-        'Pick the Grok voice the tenant pays for per minute of conversation. You can change this later from the super-admin panel.'),
-      React.createElement('div', { className: 'grid grid-cols-1 md:grid-cols-3 gap-3' },
-        voiceTiers.map(tier => {
-          const allowed = (voicePlanAccess[form.plan] || voicePlanAccess.free || ['standard']).includes(tier.key);
-          const selected = form.voice_tier === tier.key;
-          const costDots = '$'.repeat(tier.cost_tier || 1);
-          return React.createElement('button', {
-            key: tier.key,
-            type: 'button',
-            disabled: !allowed,
-            onClick: () => allowed && set('voice_tier', tier.key),
-            className: `text-left rounded-xl border-2 p-3 transition-colors ${
-              !allowed
-                ? 'border-gray-200 bg-gray-50 cursor-not-allowed opacity-60'
-                : selected
-                  ? 'border-golf-600 bg-golf-50 ring-2 ring-golf-200'
-                  : 'border-gray-200 hover:border-golf-400 bg-white'
-            }`
-          },
-            React.createElement('div', { className: 'flex items-start justify-between gap-2 mb-1' },
-              React.createElement('h5', { className: 'font-bold text-gray-800' }, tier.label),
-              React.createElement('span', {
-                className: `text-[11px] font-bold ${
-                  !allowed ? 'text-gray-400' : selected ? 'text-golf-700' : 'text-gray-500'
-                }`
-              }, costDots)
-            ),
-            React.createElement('p', { className: 'text-[11px] font-medium text-gray-700 mb-1' }, tier.tagline),
-            tier.description && React.createElement('p', { className: 'text-[11px] text-gray-500 leading-snug' }, tier.description),
-            !allowed && React.createElement('p', {
-              className: 'text-[11px] text-amber-700 font-semibold mt-2 flex items-center gap-1'
-            },
-              React.createElement('span', { 'aria-hidden': 'true' }, '\ud83d\udd12'),
-              `Upgrade plan to unlock`
-            ),
-            selected && allowed && React.createElement('span', {
-              className: 'inline-block text-[11px] font-bold text-golf-700 bg-golf-100 px-1.5 py-0.5 rounded mt-1'
-            }, 'Selected')
-          );
-        })
-      )
     )
+  );
+
+  // ─── Voice tier step ───────────────────────────────────────────────────────
+  //
+  // Dedicated step (was previously crammed at the bottom of renderTemplate,
+  // which meant operators who clicked Next without scrolling never saw it and
+  // silently shipped every tenant on the default Standard tier). Keeping it
+  // as its own step guarantees one deliberate decision per business.
+  //
+  // Three cards: Economy / Standard / Premium. Each card shows the tier
+  // label, tagline, and a small "$" cost indicator so the operator can
+  // eyeball relative cost. Tiers the selected plan doesn't unlock render
+  // disabled with a padlock and "Upgrade plan to unlock" copy.
+  const renderVoice = () => React.createElement('div', { className: 'space-y-4' },
+    React.createElement('p', { className: 'text-xs text-gray-500' },
+      'Pick the Grok voice the tenant pays for per minute of conversation. You can change this later from the super-admin panel.'),
+    voiceTiers.length === 0
+      ? React.createElement('p', { className: 'text-sm text-gray-500' }, 'Loading voice tiers\u2026')
+      : React.createElement('div', { className: 'grid grid-cols-1 md:grid-cols-3 gap-3' },
+          voiceTiers.map(tier => {
+            const allowed = (voicePlanAccess[form.plan] || voicePlanAccess.free || ['standard']).includes(tier.key);
+            const selected = form.voice_tier === tier.key;
+            const costDots = '$'.repeat(tier.cost_tier || 1);
+            return React.createElement('button', {
+              key: tier.key,
+              type: 'button',
+              disabled: !allowed,
+              onClick: () => allowed && set('voice_tier', tier.key),
+              className: `text-left rounded-xl border-2 p-3 transition-colors ${
+                !allowed
+                  ? 'border-gray-200 bg-gray-50 cursor-not-allowed opacity-60'
+                  : selected
+                    ? 'border-golf-600 bg-golf-50 ring-2 ring-golf-200'
+                    : 'border-gray-200 hover:border-golf-400 bg-white'
+              }`
+            },
+              React.createElement('div', { className: 'flex items-start justify-between gap-2 mb-1' },
+                React.createElement('h5', { className: 'font-bold text-gray-800' }, tier.label),
+                React.createElement('span', {
+                  className: `text-[11px] font-bold ${
+                    !allowed ? 'text-gray-400' : selected ? 'text-golf-700' : 'text-gray-500'
+                  }`
+                }, costDots)
+              ),
+              React.createElement('p', { className: 'text-[11px] font-medium text-gray-700 mb-1' }, tier.tagline),
+              tier.description && React.createElement('p', { className: 'text-[11px] text-gray-500 leading-snug' }, tier.description),
+              !allowed && React.createElement('p', {
+                className: 'text-[11px] text-amber-700 font-semibold mt-2 flex items-center gap-1'
+              },
+                React.createElement('span', { 'aria-hidden': 'true' }, '\ud83d\udd12'),
+                `Upgrade plan to unlock`
+              ),
+              selected && allowed && React.createElement('span', {
+                className: 'inline-block text-[11px] font-bold text-golf-700 bg-golf-100 px-1.5 py-0.5 rounded mt-1'
+              }, 'Selected')
+            );
+          })
+        ),
+    React.createElement('p', { className: 'text-[11px] text-gray-400 italic' },
+      'Tier is gated by the plan you picked on step 1. Greyed-out tiers unlock when the plan is upgraded.')
   );
 
   const renderReview = () => React.createElement('div', { className: 'space-y-4 text-sm' },
@@ -4305,6 +4323,7 @@ function OnboardingWizard({ onCancel, onCreated, onActAs, mode = 'business', ini
     renderBasics,
     renderPhones,
     renderTemplate,
+    renderVoice,
     renderReview,
     renderInvite,
     renderSuccess
@@ -4345,28 +4364,35 @@ function OnboardingWizard({ onCancel, onCreated, onActAs, mode = 'business', ini
       ),
 
       // ---------- Footer / navigation ----------
+      //
+      // Step index map (7-step flow):
+      //   0 basics · 1 phones · 2 template · 3 voice · 4 review · 5 invite · 6 success
+      //
+      // Anything that used to key on "3 = review" / "4 = invite" / "5 = success"
+      // was shifted by one after voice tier was promoted to its own step. If
+      // you add or remove a step, update every comparison below in lockstep.
       React.createElement('div', { className: 'px-6 py-4 border-t bg-gray-50 flex items-center justify-between' },
-        step < 5
+        step < 6
           ? React.createElement('button', {
               type: 'button',
               onClick: () => step === 0 ? onCancel() : setStep(step - 1),
               className: 'px-4 py-2 rounded-lg bg-white border border-gray-300 hover:bg-gray-100 text-sm font-medium text-gray-700'
             }, step === 0 ? 'Cancel' : 'Back')
           : React.createElement('span', null),
-        step < 3 && React.createElement('button', {
+        step < 4 && React.createElement('button', {
           type: 'button',
           disabled: !canAdvance(),
           onClick: () => setStep(step + 1),
           className: 'px-5 py-2 rounded-lg bg-golf-600 hover:bg-golf-700 text-white text-sm font-semibold disabled:opacity-40'
         }, 'Next \u2192'),
-        step === 3 && React.createElement('button', {
+        step === 4 && React.createElement('button', {
           type: 'button',
-          onClick: () => setStep(4),
+          onClick: () => setStep(5),
           className: 'px-5 py-2 rounded-lg bg-golf-600 hover:bg-golf-700 text-white text-sm font-semibold'
         }, 'Looks good \u2192'),
-        // Step 4 footer: the operator either fills an admin_email and creates
+        // Step 5 footer: the operator either fills an admin_email and creates
         // with an invite, or explicitly skips the invite (with a clear hint).
-        step === 4 && React.createElement('div', { className: 'flex items-center gap-2' },
+        step === 5 && React.createElement('div', { className: 'flex items-center gap-2' },
           !form.admin_email.trim() && React.createElement('span', { className: 'text-[11px] text-gray-500' },
             isPersonal
               ? 'You can invite the account owner later from the card.'
@@ -4384,10 +4410,11 @@ function OnboardingWizard({ onCancel, onCreated, onActAs, mode = 'business', ini
                 : (isPersonal ? 'Skip invite & create account' : 'Skip invite & create business'))
           )
         ),
-        // Step 5 footer: offer to switch into the new tenant or return to
-        // the super-admin dashboard. The Act-as button is only visible if the
-        // wizard was handed an onActAs handler (wired in SuperAdminDashboard).
-        step === 5 && React.createElement('div', { className: 'flex items-center gap-2' },
+        // Step 6 footer (success): offer to switch into the new tenant or
+        // return to the super-admin dashboard. The Act-as button is only
+        // visible if the wizard was handed an onActAs handler (wired in
+        // SuperAdminDashboard).
+        step === 6 && React.createElement('div', { className: 'flex items-center gap-2' },
           typeof onActAs === 'function' && result?.business?.id && React.createElement('button', {
             type: 'button',
             // Pass the fresh business object as a hint. Parent handleSelectBusiness

@@ -778,6 +778,14 @@ router.delete('/businesses/:id', async (req, res) => {
       });
     }
 
+    // Rename the slug on soft-delete so the original frees up for a new
+    // tenant. The `businesses.slug` column is globally UNIQUE (not partial
+    // on deleted_at IS NULL), so a soft-deleted row still hoards its slug
+    // otherwise. Format `deleted-<id>` is unambiguously unique (id is PK)
+    // and the original slug is preserved in the audit meta below for
+    // restore. Fits comfortably in the VARCHAR(80) column.
+    const deletedSlug = `deleted-${id}`;
+
     // Audit FIRST so the event is attached to a live business_id
     // (audit_log FKs to businesses with ON DELETE CASCADE — not an issue
     // for soft delete, but this ordering matches the pattern we'd need
@@ -794,6 +802,11 @@ router.delete('/businesses/:id', async (req, res) => {
         template_key: biz.template_key,
         soft: true,
         actor_super_admin_id: actorId,
+        // Original slug is captured here — the row's `slug` column is
+        // renamed to `deleted-<id>` below so the original is free for
+        // reuse on a new tenant. Restore reads this back.
+        original_slug: biz.slug,
+        renamed_slug: deletedSlug,
         // Phone numbers are released on soft-delete (see below) so the
         // operator can reuse the DIDs on a new tenant. Archiving them here
         // preserves the routing history for forensics / accidental-delete
@@ -808,6 +821,10 @@ router.delete('/businesses/:id', async (req, res) => {
               deleted_by_user_id = $1,
               is_active = FALSE,
               status = 'deleted',
+              -- Rename the slug so the original frees up for reuse. The
+              -- globally-unique index on businesses.slug would otherwise
+              -- keep the deleted tenant's name permanently locked.
+              slug = $3,
               -- Null out the denormalized primary number so the unique
               -- index on businesses.twilio_phone_number frees that DID up
               -- for the next tenant. The original value is captured in
@@ -817,7 +834,7 @@ router.delete('/businesses/:id', async (req, res) => {
         WHERE id = $2
           AND deleted_at IS NULL
       RETURNING id, slug, deleted_at, deleted_by_user_id`,
-      [actorId, id]
+      [actorId, id, deletedSlug]
     );
 
     if (rows.length === 0) {
@@ -838,10 +855,11 @@ router.delete('/businesses/:id', async (req, res) => {
       );
     }
 
-    console.log(`[super] Soft-deleted business ${id} (${biz.slug}) by user=${actorId}; released ${releasedNumbers.length} phone number(s)`);
+    console.log(`[super] Soft-deleted business ${id} (${biz.slug}) by user=${actorId}; released slug=${biz.slug} and ${releasedNumbers.length} phone number(s)`);
     res.json({
       business: rows[0],
       deleted: true,
+      released_slug: biz.slug,
       released_phone_numbers: releasedNumbers
     });
   } catch (err) {
@@ -853,14 +871,18 @@ router.delete('/businesses/:id', async (req, res) => {
 // -------------- POST /api/super/phone-numbers/reclaim-orphaned --------------
 //
 // One-time cleanup for tenants soft-deleted BEFORE the delete handler
-// learned to release their phone numbers (see the DELETE /businesses/:id
-// handler above). Finds every business_phone_numbers row (and every
-// businesses.twilio_phone_number value) still attached to a deleted_at
-// tenant and clears them so the DIDs can be reused.
+// learned to release their phone numbers AND their slugs (see the
+// DELETE /businesses/:id handler above). Finds every stranded identifier
+// attached to a deleted_at tenant and releases it so the operator can
+// reuse the slug + DIDs on a new tenant:
 //
-// Idempotent — if run again, the second call sees nothing to reclaim and
-// returns an empty list. Writes one audit event per tenant it touches so
-// the history is reconstructable.
+//   - business_phone_numbers rows     → deleted
+//   - businesses.twilio_phone_number  → NULL
+//   - businesses.slug (non-prefixed)  → renamed to `deleted-<id>`
+//
+// Idempotent — a second run sees nothing to reclaim and returns an empty
+// list. Writes one audit event per tenant it touches so the history is
+// reconstructable.
 router.post('/phone-numbers/reclaim-orphaned', async (req, res) => {
   try {
     // Dry-run support: pass ?dry_run=1 to preview what would be reclaimed
@@ -887,36 +909,58 @@ router.post('/phone-numbers/reclaim-orphaned', async (req, res) => {
         WHERE deleted_at IS NOT NULL
           AND twilio_phone_number IS NOT NULL`
     );
+    // Slugs on deleted tenants that haven't been renamed to `deleted-<id>`
+    // yet. The LIKE filter specifically excludes rows already migrated by
+    // either the delete handler or a previous reclaim run so this is safe
+    // to call repeatedly.
+    const slugOrphans = await query(
+      `SELECT id, slug, name
+         FROM businesses
+        WHERE deleted_at IS NOT NULL
+          AND slug NOT LIKE 'deleted-%'`
+    );
 
     if (dryRun) {
       return res.json({
         dry_run: true,
         orphan_phone_rows: orphans.rows,
         orphan_denormalized_twilio_numbers: denormalized.rows,
-        total: orphans.rows.length + denormalized.rows.length
+        orphan_slugs: slugOrphans.rows,
+        total:
+          orphans.rows.length +
+          denormalized.rows.length +
+          slugOrphans.rows.length
       });
     }
 
     // Group orphans by business so the audit log gets one event per tenant
     // (rather than one event per phone number).
     const byBiz = new Map();
+    const ensureEntry = (bizId, slug, name) => {
+      if (!byBiz.has(bizId)) byBiz.set(bizId, { slug, name, numbers: [], released_slug: null });
+      return byBiz.get(bizId);
+    };
     for (const r of orphans.rows) {
-      if (!byBiz.has(r.business_id)) byBiz.set(r.business_id, { slug: r.slug, name: r.name, numbers: [] });
-      byBiz.get(r.business_id).numbers.push({
+      ensureEntry(r.business_id, r.slug, r.name).numbers.push({
         phone_number: r.phone_number,
         label: r.label,
         is_primary: r.is_primary
       });
     }
     for (const r of denormalized.rows) {
-      if (!byBiz.has(r.id)) byBiz.set(r.id, { slug: r.slug, name: r.name, numbers: [] });
-      if (!byBiz.get(r.id).numbers.some(n => n.phone_number === r.twilio_phone_number)) {
-        byBiz.get(r.id).numbers.push({
+      const entry = ensureEntry(r.id, r.slug, r.name);
+      if (!entry.numbers.some(n => n.phone_number === r.twilio_phone_number)) {
+        entry.numbers.push({
           phone_number: r.twilio_phone_number,
           label: 'Main Line (denormalized on businesses row)',
           is_primary: true
         });
       }
+    }
+    for (const r of slugOrphans.rows) {
+      // Record the original slug before we rename; audit meta will carry it
+      // so a later restore can put it back if still free.
+      ensureEntry(r.id, r.slug, r.name).released_slug = r.slug;
     }
 
     if (orphans.rows.length > 0) {
@@ -935,6 +979,18 @@ router.post('/phone-numbers/reclaim-orphaned', async (req, res) => {
             AND twilio_phone_number IS NOT NULL`
       );
     }
+    // Rename orphaned slugs one at a time — the unique constraint forces
+    // sequential updates, and the per-id target (`deleted-<id>`) means no
+    // two updates can collide.
+    for (const r of slugOrphans.rows) {
+      await query(
+        `UPDATE businesses
+            SET slug = $1, updated_at = NOW()
+          WHERE id = $2
+            AND deleted_at IS NOT NULL`,
+        [`deleted-${r.id}`, r.id]
+      );
+    }
 
     for (const [businessId, info] of byBiz.entries()) {
       await logEventFromReq(req, {
@@ -946,6 +1002,9 @@ router.post('/phone-numbers/reclaim-orphaned', async (req, res) => {
           slug: info.slug,
           name: info.name,
           reclaimed_numbers: info.numbers,
+          // Surfacing the released slug (if any) so `business.restored`
+          // can look it up the same way it reads `business.deleted` meta.
+          released_slug: info.released_slug,
           source: 'reclaim-orphaned endpoint'
         }
       });
@@ -955,8 +1014,13 @@ router.post('/phone-numbers/reclaim-orphaned', async (req, res) => {
       reclaimed: true,
       tenants_touched: byBiz.size,
       total_numbers: orphans.rows.length + denormalized.rows.length,
+      total_slugs_released: slugOrphans.rows.length,
       by_tenant: Array.from(byBiz.entries()).map(([id, v]) => ({
-        business_id: id, slug: v.slug, name: v.name, numbers: v.numbers
+        business_id: id,
+        slug: v.slug,
+        name: v.name,
+        numbers: v.numbers,
+        released_slug: v.released_slug
       }))
     });
   } catch (err) {
@@ -989,16 +1053,53 @@ router.post('/businesses/:id/restore', async (req, res) => {
         ? req.body.status.trim().slice(0, 40)
         : 'active';
 
+    // Look up the original slug from the most recent business.deleted audit
+    // event for this tenant. If it's still free (nobody has claimed it on a
+    // new tenant since), restore it; otherwise fall back to the current
+    // `deleted-<id>` placeholder and surface a note so the operator knows
+    // the name needs to be picked anew.
+    let targetSlug = biz.slug;
+    let originalSlugFree = null;
+    try {
+      const auditRows = await query(
+        `SELECT meta
+           FROM audit_log
+          WHERE business_id = $1
+            AND action = 'business.deleted'
+          ORDER BY created_at DESC
+          LIMIT 1`,
+        [id]
+      );
+      const meta = auditRows.rows[0]?.meta || null;
+      const original = meta?.original_slug || meta?.slug;
+      if (original && typeof original === 'string' && original !== biz.slug) {
+        const clash = await query(
+          'SELECT id FROM businesses WHERE slug = $1 AND id <> $2 LIMIT 1',
+          [original, id]
+        );
+        if (clash.rows.length === 0) {
+          targetSlug = original;
+          originalSlugFree = true;
+        } else {
+          originalSlugFree = false;
+        }
+      }
+    } catch (auditErr) {
+      // Audit lookup is best-effort — if it fails, restore without renaming.
+      console.warn('[super] restore: audit lookup failed, keeping current slug:', auditErr.message);
+    }
+
     const { rows } = await query(
       `UPDATE businesses
           SET deleted_at = NULL,
               deleted_by_user_id = NULL,
               is_active = TRUE,
               status = $1,
+              slug = $3,
               updated_at = NOW()
         WHERE id = $2
       RETURNING *`,
-      [statusOnRestore, id]
+      [statusOnRestore, id, targetSlug]
     );
 
     await logEventFromReq(req, {
@@ -1007,14 +1108,25 @@ router.post('/businesses/:id/restore', async (req, res) => {
       targetType: 'business',
       targetId: id,
       meta: {
-        slug: biz.slug,
+        slug: targetSlug,
+        previous_slug: biz.slug,
+        original_slug_restored: originalSlugFree === true,
+        original_slug_taken: originalSlugFree === false,
         previous_deleted_at: biz.deleted_at,
         restored_status: statusOnRestore
       }
     });
 
-    console.log(`[super] Restored business ${id} (${biz.slug}) — status=${statusOnRestore}`);
-    res.json({ business: rows[0], restored: true });
+    console.log(
+      `[super] Restored business ${id} (was=${biz.slug}, now=${targetSlug}) — ` +
+      `status=${statusOnRestore}, original_slug_restored=${originalSlugFree === true}`
+    );
+    res.json({
+      business: rows[0],
+      restored: true,
+      slug_restored: targetSlug !== biz.slug,
+      original_slug_taken: originalSlugFree === false
+    });
   } catch (err) {
     console.error('[super] restore business error:', err.message);
     res.status(500).json({ error: err.message || 'Failed to restore business' });
@@ -1039,8 +1151,14 @@ router.get('/slug-check', async (req, res) => {
     if (!normalized) {
       return res.status(400).json({ error: 'slug cannot be empty after normalisation' });
     }
+    // Only live tenants block reuse. Soft-deleted tenants have their slug
+    // renamed to `deleted-<id>` on delete (and pre-patch stragglers are
+    // handled by the reclaim-orphaned endpoint), so a query against the
+    // current slug should never find a deleted row — but the filter is
+    // cheap belt-and-suspenders in case a delete path is added later that
+    // skips the rename.
     const { rows } = await query(
-      'SELECT id, name FROM businesses WHERE slug = $1 LIMIT 1',
+      'SELECT id, name FROM businesses WHERE slug = $1 AND deleted_at IS NULL LIMIT 1',
       [normalized]
     );
     if (rows.length === 0) {

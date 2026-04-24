@@ -4382,6 +4382,259 @@ function MyInfoPage() {
   );
 }
 
+// Personal-assistant Settings page.
+//
+// Mirrors the shape of SettingsPage but drops every golf-course-shaped tab
+// (Daily, Course Info, Knowledge, Pricing, Hours) — personal tenants handle
+// name/hours/bio through MyInfoPage. What remains is universally applicable
+// to a solo-operator voice assistant: the phone numbers that ring, how the
+// AI greets callers, where call recaps go, AI personality, prompt tweaks,
+// and test mode. Shares the same settings KV store + PhoneNumbersManager
+// component as SettingsPage — only the UI surface is template-specific.
+function PersonalSettingsPage() {
+  const [settings, setSettings] = useState({});
+  const [greetings, setGreetings] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState('');
+  const [newGreeting, setNewGreeting] = useState('');
+  const [newGreetingKnown, setNewGreetingKnown] = useState(false);
+  const [activeTab, setActiveTab] = useState('phones');
+
+  useEffect(() => {
+    Promise.all([
+      api('/api/settings').catch(() => ({})),
+      api('/api/greetings').catch(() => [])
+    ]).then(([s, g]) => { setSettings(s || {}); setGreetings(Array.isArray(g) ? g : []); })
+      .catch(console.error).finally(() => setLoading(false));
+  }, []);
+
+  const saveSetting = async (key, value) => {
+    setSaving(key);
+    try {
+      await api(`/api/settings/${key}`, { method: 'PUT', body: JSON.stringify({ value }) });
+      setSettings(prev => ({ ...prev, [key]: { ...prev[key], value } }));
+    } catch (err) { alert('Failed to save: ' + err.message); }
+    finally { setSaving(''); }
+  };
+
+  const addGreeting = async () => {
+    if (!newGreeting.trim()) return;
+    try {
+      const g = await api('/api/greetings', { method: 'POST', body: JSON.stringify({ message: newGreeting, for_known_caller: newGreetingKnown }) });
+      setGreetings(prev => [...prev, g]);
+      setNewGreeting('');
+    } catch (err) { alert('Failed: ' + err.message); }
+  };
+
+  const deleteGreeting = async (id) => {
+    try {
+      await api(`/api/greetings/${id}`, { method: 'DELETE' });
+      setGreetings(prev => prev.filter(g => g.id !== id));
+    } catch (err) { alert('Failed: ' + err.message); }
+  };
+
+  if (loading) return React.createElement('div', { className: 'p-8 text-gray-500' }, 'Loading settings\u2026');
+
+  const tabs = [
+    { id: 'phones',        label: '\uD83D\uDCDE Phones' },
+    { id: 'greetings',     label: 'Greetings' },
+    { id: 'prompt',        label: 'Prompt' },
+    { id: 'notifications', label: 'Notifications' },
+    { id: 'ai',            label: 'AI Behavior' },
+    { id: 'test',          label: 'Test Mode' }
+  ];
+
+  const val = (key) => settings[key]?.value;
+
+  return React.createElement('div', null,
+    React.createElement('h1', { className: 'text-2xl font-bold text-gray-800 mb-2' }, 'Settings'),
+    React.createElement('p', { className: 'text-sm text-gray-500 mb-6' },
+      'Control how your personal assistant handles calls. For personal details your assistant needs to know about you (name, schedule, preferences), use My Info.'
+    ),
+
+    React.createElement('div', { className: 'flex gap-1 mb-6 bg-gray-100 rounded-lg p-1 overflow-x-auto' },
+      tabs.map(t =>
+        React.createElement('button', {
+          key: t.id, onClick: () => setActiveTab(t.id),
+          className: `px-4 py-2 rounded-md text-sm font-medium whitespace-nowrap transition-colors ${activeTab === t.id ? 'bg-white shadow text-golf-700' : 'text-gray-500 hover:text-gray-700'}`
+        }, t.label)
+      )
+    ),
+
+    React.createElement('div', { className: 'bg-white rounded-xl shadow-sm border p-6' },
+
+      // PHONES
+      activeTab === 'phones' && React.createElement('div', null,
+        React.createElement('p', { className: 'text-sm text-gray-500 mb-4' },
+          'The phone numbers your assistant answers. Disable a number to stop taking calls on it without losing history.'
+        ),
+        React.createElement(PhoneNumbersManager, {
+          endpointBase: '/api/phone-numbers',
+          title: 'Your Phone Numbers'
+        })
+      ),
+
+      // GREETINGS
+      activeTab === 'greetings' && React.createElement('div', null,
+        React.createElement('p', { className: 'text-sm text-gray-500 mb-4' },
+          'Your assistant picks a random greeting each time. Use {name} as a placeholder so returning callers hear their own name.'
+        ),
+
+        React.createElement('h3', { className: 'font-semibold mb-2' }, 'New caller greetings'),
+        greetings.filter(g => !g.for_known_caller).length === 0
+          ? React.createElement('p', { className: 'text-sm text-gray-400 mb-3' }, 'No new-caller greetings yet.')
+          : greetings.filter(g => !g.for_known_caller).map(g =>
+              React.createElement('div', { key: g.id, className: 'flex items-center gap-2 mb-2 bg-gray-50 rounded-lg p-3' },
+                React.createElement('span', { className: 'flex-1 text-sm' }, g.message),
+                React.createElement('button', { onClick: () => deleteGreeting(g.id), className: 'text-red-400 hover:text-red-600 text-sm' }, 'Remove')
+              )
+            ),
+
+        React.createElement('h3', { className: 'font-semibold mb-2 mt-4' }, 'Returning caller greetings'),
+        greetings.filter(g => g.for_known_caller).length === 0
+          ? React.createElement('p', { className: 'text-sm text-gray-400 mb-3' }, 'No returning-caller greetings yet.')
+          : greetings.filter(g => g.for_known_caller).map(g =>
+              React.createElement('div', { key: g.id, className: 'flex items-center gap-2 mb-2 bg-green-50 rounded-lg p-3' },
+                React.createElement('span', { className: 'flex-1 text-sm' }, g.message),
+                React.createElement('button', { onClick: () => deleteGreeting(g.id), className: 'text-red-400 hover:text-red-600 text-sm' }, 'Remove')
+              )
+            ),
+
+        React.createElement('div', { className: 'mt-4 border-t pt-4' },
+          React.createElement('h3', { className: 'font-semibold mb-2' }, 'Add a greeting'),
+          React.createElement('input', {
+            type: 'text', value: newGreeting, onChange: e => setNewGreeting(e.target.value),
+            placeholder: 'e.g., Hi there! Thanks for calling. How can I help?',
+            className: 'w-full border rounded-lg px-3 py-2 mb-2 text-sm'
+          }),
+          React.createElement('div', { className: 'flex items-center gap-4' },
+            React.createElement('label', { className: 'flex items-center gap-2 text-sm' },
+              React.createElement('input', { type: 'checkbox', checked: newGreetingKnown, onChange: e => setNewGreetingKnown(e.target.checked) }),
+              'For returning callers (use {name} placeholder)'
+            ),
+            React.createElement('button', { onClick: addGreeting, className: 'bg-golf-600 hover:bg-golf-700 text-white px-4 py-2 rounded-lg text-sm' }, 'Add greeting')
+          )
+        )
+      ),
+
+      // PROMPT
+      activeTab === 'prompt' && React.createElement('div', null,
+        React.createElement('p', { className: 'text-sm text-gray-500 mb-4' },
+          'Fine-tune how your assistant behaves. These instructions are layered on top of the built-in personal assistant prompt.'
+        ),
+        React.createElement(SettingField, {
+          label: 'Assistant name',
+          description: 'The name your assistant uses when answering ("Hi, I\u2019m Sam\u2026"). You can also set this on the My Info page.',
+          value: val('ai_personality')?.name || '',
+          onSave: v => saveSetting('ai_personality', { ...val('ai_personality'), name: v }),
+          saving: saving === 'ai_personality'
+        }),
+        React.createElement(SettingField, {
+          label: 'Language handling',
+          description: 'How the assistant decides which language to respond in. E.g., "Match the caller\u2019s language; default to English."',
+          value: val('ai_personality')?.language || '',
+          onSave: v => saveSetting('ai_personality', { ...val('ai_personality'), language: v }),
+          saving: saving === 'ai_personality'
+        }),
+        React.createElement(SettingTextarea, {
+          label: 'Custom prompt additions',
+          description: 'Extra instructions layered on the base personal assistant prompt. Keep it short and specific \u2014 e.g., "Always take a message if it\u2019s about my kids\u2019 school."',
+          value: val('custom_prompt') || '',
+          rows: 10,
+          onSave: v => saveSetting('custom_prompt', v),
+          saving: saving === 'custom_prompt'
+        })
+      ),
+
+      // NOTIFICATIONS
+      activeTab === 'notifications' && React.createElement('div', null,
+        React.createElement('p', { className: 'text-sm text-gray-500 mb-4' },
+          'Where to send call recaps. You get a concise summary after each call so you never miss anything.'
+        ),
+        React.createElement(SettingField, {
+          label: 'Recap email',
+          description: 'Email address for call recaps.',
+          value: val('notifications')?.email_to || '',
+          onSave: v => saveSetting('notifications', { ...val('notifications'), email_to: v }),
+          saving: saving === 'notifications'
+        }),
+        React.createElement(SettingField, {
+          label: 'Recap SMS number',
+          description: 'Phone number for SMS recaps.',
+          value: val('notifications')?.sms_to || '',
+          onSave: v => saveSetting('notifications', { ...val('notifications'), sms_to: v }),
+          saving: saving === 'notifications'
+        }),
+        React.createElement('div', { className: 'flex gap-6 mt-4' },
+          React.createElement('label', { className: 'flex items-center gap-2' },
+            React.createElement('input', {
+              type: 'checkbox', checked: val('notifications')?.email_enabled ?? true,
+              onChange: e => saveSetting('notifications', { ...val('notifications'), email_enabled: e.target.checked })
+            }),
+            'Email recaps'
+          ),
+          React.createElement('label', { className: 'flex items-center gap-2' },
+            React.createElement('input', {
+              type: 'checkbox', checked: val('notifications')?.sms_enabled ?? true,
+              onChange: e => saveSetting('notifications', { ...val('notifications'), sms_enabled: e.target.checked })
+            }),
+            'SMS recaps'
+          )
+        )
+      ),
+
+      // AI BEHAVIOR
+      activeTab === 'ai' && React.createElement('div', null,
+        React.createElement('p', { className: 'text-sm text-gray-500 mb-4' },
+          'How the assistant speaks and handles edge cases.'
+        ),
+        React.createElement(SettingTextarea, {
+          label: 'Personality & style',
+          description: 'How the assistant should sound on calls. E.g., "Warm, brief, professional. Never over-apologize."',
+          value: val('ai_personality')?.style || '',
+          onSave: v => saveSetting('ai_personality', { ...val('ai_personality'), style: v }),
+          saving: saving === 'ai_personality'
+        }),
+        React.createElement(SettingField, {
+          label: 'After-hours message',
+          description: 'What the assistant says if someone calls outside your typical hours and asks to reach you directly.',
+          value: val('ai_personality')?.after_hours_message || '',
+          onSave: v => saveSetting('ai_personality', { ...val('ai_personality'), after_hours_message: v }),
+          saving: saving === 'ai_personality'
+        }),
+        React.createElement(SettingField, {
+          label: 'Transfer number (optional)',
+          description: 'If you want the assistant to transfer urgent calls to a human, put that number here.',
+          value: typeof val('transfer_number') === 'string' ? val('transfer_number') : '',
+          onSave: v => saveSetting('transfer_number', v),
+          saving: saving === 'transfer_number'
+        })
+      ),
+
+      // TEST MODE
+      activeTab === 'test' && React.createElement('div', null,
+        React.createElement('p', { className: 'text-sm text-gray-500 mb-4' },
+          'While test mode is on, only the test number reaches your assistant. Every other caller hears a short temporary message.'
+        ),
+        React.createElement('label', { className: 'flex items-center gap-2 mb-4' },
+          React.createElement('input', {
+            type: 'checkbox', checked: val('test_mode')?.enabled ?? false,
+            onChange: e => saveSetting('test_mode', { ...val('test_mode'), enabled: e.target.checked })
+          }),
+          React.createElement('span', { className: 'font-medium' }, 'Enable test mode')
+        ),
+        React.createElement(SettingField, {
+          label: 'Test phone number',
+          description: 'Only this number reaches the assistant while test mode is on.',
+          value: val('test_mode')?.test_phone || '',
+          onSave: v => saveSetting('test_mode', { ...val('test_mode'), test_phone: v }),
+          saving: saving === 'test_mode'
+        })
+      )
+    )
+  );
+}
+
 // Shared golf page map — used by the plan='legacy' safety lock and by
 // the regular golf_course / driving_range path so dispatch stays in
 // lockstep with the sidebar.
@@ -4406,7 +4659,7 @@ function tenantPagesFor(templateKey, plan) {
       dashboard: PersonalAssistantPage,
       calls:     CallLogsPage,
       my_info:   MyInfoPage,
-      settings:  SettingsPage
+      settings:  PersonalSettingsPage
     };
   }
   // Golf (also the implicit default) — keep Valleymede's shape exactly.

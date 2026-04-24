@@ -697,10 +697,15 @@ router.delete('/businesses/:id', async (req, res) => {
       return res.status(409).json({ error: 'Business is already deleted', deleted_at: biz.deleted_at });
     }
 
-    // Rail #1: legacy tenants are never deletable. Valleymede safety.
-    if (biz.plan === 'legacy') {
+    // Rail #1: the original pre-SaaS tenant (id=1) is never deletable.
+    // This used to key on `plan === 'legacy'`, but 'legacy' was selectable
+    // from the Edit-tenant plan dropdown, which meant any tenant saved
+    // with plan='legacy' inherited the Valleymede safety lock and couldn't
+    // be deleted. The real invariant is "this is the grandfather tenant",
+    // which is always id=1.
+    if (biz.id === 1) {
       return res.status(403).json({
-        error: 'Legacy tenants cannot be deleted (plan=\'legacy\'). Change plan first if this is intentional.'
+        error: 'The original tenant (id=1) cannot be deleted — it is the platform\'s grandfather account.'
       });
     }
 

@@ -43,6 +43,14 @@ const {
   DEFAULT_TEMPLATE_KEY
 } = require('../services/templates');
 const { logEventFromReq, listAuditEvents } = require('../services/audit-log');
+const {
+  grantTrial,
+  adminAdjust,
+  getBalance,
+  listLedger,
+  TRIAL_SECONDS,
+  TRIAL_DAYS
+} = require('../services/credits');
 
 // All /api/super/* routes require a super-admin JWT.
 router.use(requireAuth);
@@ -131,12 +139,18 @@ async function seedTenantDefaults(client, businessId) {
 }
 
 // -------------- GET /api/super/businesses --------------
+// `?include_deleted=1` flips the filter so the UI can show soft-deleted
+// tenants in a "Deleted" tab. Default hides them.
 router.get('/businesses', async (req, res) => {
   try {
+    const includeDeleted = req.query.include_deleted === '1' || req.query.include_deleted === 'true';
+    const deletedClause = includeDeleted ? '' : 'WHERE b.deleted_at IS NULL';
     const { rows } = await query(
       `SELECT b.id, b.slug, b.name, b.twilio_phone_number, b.transfer_number,
               b.timezone, b.status, b.is_active, b.plan, b.setup_complete,
               b.template_key,
+              b.credit_seconds_remaining, b.trial_granted_at, b.trial_expires_at,
+              b.deleted_at, b.deleted_by_user_id,
               b.created_at, b.updated_at, b.contact_email, b.contact_phone,
               (SELECT COUNT(*)::int FROM business_users bu
                  WHERE bu.business_id = b.id AND bu.active = TRUE) AS active_user_count,
@@ -147,9 +161,10 @@ router.get('/businesses', async (req, res) => {
                  WHERE br.business_id = b.id
                    AND br.created_at > NOW() - INTERVAL '30 days') AS bookings_last_30d
          FROM businesses b
+         ${deletedClause}
         ORDER BY b.id ASC`
     );
-    res.json({ businesses: rows, count: rows.length });
+    res.json({ businesses: rows, count: rows.length, include_deleted: includeDeleted });
   } catch (err) {
     console.error('[super] list businesses error:', err.message);
     res.status(500).json({ error: 'Failed to list businesses' });
@@ -157,13 +172,19 @@ router.get('/businesses', async (req, res) => {
 });
 
 // -------------- GET /api/super/businesses/:id --------------
+//
+// Returns everything the Edit Tenant screen needs to pre-fill the wizard:
+// the business row, users, phone numbers, and the settings map keyed by
+// setting key. `?include_deleted=1` allows looking up soft-deleted
+// tenants so the UI can present them on the Restore flow.
 router.get('/businesses/:id', async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
-    const biz = await getBusinessById(id);
+    const includeDeleted = req.query.include_deleted === '1' || req.query.include_deleted === 'true';
+    const biz = await getBusinessById(id, { includeDeleted });
     if (!biz) return res.status(404).json({ error: 'Business not found' });
 
-    const [usersRes, phonesRes] = await Promise.all([
+    const [usersRes, phonesRes, settingsRes] = await Promise.all([
       query(
         `SELECT id, email, name, role, active, created_at, last_login_at
            FROM business_users
@@ -177,12 +198,27 @@ router.get('/businesses/:id', async (req, res) => {
           WHERE business_id = $1
           ORDER BY is_primary DESC, status ASC, id ASC`,
         [id]
+      ),
+      query(
+        `SELECT key, value, description, updated_at
+           FROM settings
+          WHERE business_id = $1
+          ORDER BY key ASC`,
+        [id]
       )
     ]);
+
+    // Reshape settings rows into a map for easy UI prefill.
+    const settings = {};
+    for (const row of settingsRes.rows) {
+      settings[row.key] = row.value;
+    }
+
     res.json({
       business: biz,
       users: usersRes.rows,
-      phone_numbers: phonesRes.rows
+      phone_numbers: phonesRes.rows,
+      settings
     });
   } catch (err) {
     console.error('[super] get business error:', err.message);
@@ -273,6 +309,7 @@ router.post('/businesses', async (req, res) => {
   let inviteRow = null;
   let templateSummary = null;
   let phoneRows = [];
+  let trialGrant = null;
 
   try {
     await client.query('BEGIN');
@@ -318,6 +355,26 @@ router.post('/businesses', async (req, res) => {
           WHERE business_id = $2 AND key = 'owner_profile'`,
         [assistantName, business.id]
       );
+    }
+
+    // 2c. Phase 7a — free trial grant. Every new tenant starts with
+    //     TRIAL_SECONDS (1h) of credit + a TRIAL_DAYS (14d) wall-clock
+    //     expiry, whichever runs out first. Legacy tenants aren't eligible
+    //     (they should be created with plan='legacy' up front), but the
+    //     guard is belt-and-braces because a mis-configured onboarding
+    //     shouldn't spill a trial grant onto a legacy tenant either.
+    //     grantTrial runs inside our transaction (we hand it the client)
+    //     so a commit failure rolls the trial grant back along with the
+    //     rest of the creation.
+    if (business.plan !== 'legacy') {
+      try {
+        trialGrant = await grantTrial(business.id, { client });
+      } catch (err) {
+        // Non-fatal — if the trial grant fails we still want the tenant
+        // record to land. Ops can run a manual adminAdjust afterwards.
+        console.warn(`[super] business ${business.id} created but trial grant failed: ${err.message}`);
+        trialGrant = { granted: false, error: err.message };
+      }
     }
 
     // 3. Register phone numbers. Primary first (if supplied), then extras.
@@ -376,6 +433,13 @@ router.post('/businesses', async (req, res) => {
             token: inviteRow.token,
             invite_url: buildInviteUrl(req, inviteRow.token)
           }
+        : null,
+      trial: trialGrant
+        ? {
+            granted: !!trialGrant.granted,
+            seconds: trialGrant.granted ? (trialGrant.balanceAfter || TRIAL_SECONDS) : 0,
+            expires_at: trialGrant.trialExpiresAt || null
+          }
         : null
     };
     console.log(
@@ -396,7 +460,9 @@ router.post('/businesses', async (req, res) => {
         template_key: templateSummary?.template_key,
         phones: phoneRows.length,
         invite_created: !!inviteRow,
-        invite_email: inviteRow ? inviteRow.email : null
+        invite_email: inviteRow ? inviteRow.email : null,
+        trial_granted: !!(trialGrant && trialGrant.granted),
+        trial_expires_at: trialGrant && trialGrant.trialExpiresAt ? trialGrant.trialExpiresAt : null
       }
     });
     if (inviteRow) {
@@ -428,51 +494,283 @@ router.post('/businesses', async (req, res) => {
 });
 
 // -------------- PATCH /api/super/businesses/:id --------------
+//
+// Full tenant edit. Body shape:
+//   {
+//     // --- Business columns (optional, only supplied keys are updated)
+//     name, slug, twilio_phone_number, transfer_number, timezone,
+//     contact_email, contact_phone, status, is_active, plan,
+//     primary_color, logo_url, internal_notes, setup_complete,
+//     billing_notes,
+//
+//     // --- Per-tenant settings map (optional)
+//     // { owner_profile: {...}, ai_personality: {...}, voice: {...}, ... }
+//     // Each entry upserts into settings(business_id, key) with value
+//     // replaced wholesale. Passing a NULL-ish value for a key is ignored
+//     // (use POST /api/settings/:key with DELETE semantics if we ever
+//     // add one; for now there's no way to remove a settings row from
+//     // this endpoint — intentional, avoids wiping everything on a typo).
+//     settings: { key1: {...}, key2: {...} }
+//   }
+//
+// Safety rails:
+//   * `template_key` is intentionally NOT editable. Switching vertical
+//     post-creation would require re-running applyTemplate, which would
+//     overwrite per-tenant customisation. If someone wants a different
+//     vertical, delete the tenant and create a new one.
+//   * Soft-deleted tenants cannot be edited — restore them first.
 router.patch('/businesses/:id', async (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (!Number.isInteger(id) || id <= 0) {
     return res.status(400).json({ error: 'invalid business id' });
   }
+
+  // Block edits on soft-deleted tenants. The UI should surface "Restore
+  // to edit" instead; editing a deleted row would silently resurrect it
+  // via the updated_at write, which is surprising behaviour.
+  const existing = await getBusinessById(id, { includeDeleted: true });
+  if (!existing) return res.status(404).json({ error: 'Business not found' });
+  if (existing.deleted_at) {
+    return res.status(409).json({ error: 'Business is soft-deleted — restore before editing' });
+  }
+
+  // Editable business columns. template_key deliberately omitted (see above).
   const allowed = [
     'name', 'slug', 'twilio_phone_number', 'transfer_number', 'timezone',
     'contact_email', 'contact_phone', 'status', 'is_active', 'plan',
     'primary_color', 'logo_url', 'internal_notes', 'setup_complete',
-    'template_key'
+    'billing_notes'
   ];
+  const body = req.body || {};
   const patches = {};
   for (const k of allowed) {
-    if (k in (req.body || {})) patches[k] = req.body[k];
+    if (k in body) patches[k] = body[k];
   }
-  if (Object.keys(patches).length === 0) {
+
+  // Settings map. Every entry upserts into settings(business_id, key).
+  const settingsMap =
+    body.settings && typeof body.settings === 'object' && !Array.isArray(body.settings)
+      ? body.settings
+      : null;
+  const settingKeys = settingsMap ? Object.keys(settingsMap).filter(k => typeof k === 'string' && k.length > 0 && k.length <= 100) : [];
+
+  if (Object.keys(patches).length === 0 && settingKeys.length === 0) {
     return res.status(400).json({ error: 'no recognised fields to update' });
   }
 
+  const client = await pool.connect();
   try {
-    const sets = [];
-    const params = [];
-    Object.entries(patches).forEach(([k, v], i) => {
-      sets.push(`${k} = $${i + 1}`);
-      params.push(v);
-    });
-    params.push(id);
-    const sql = `UPDATE businesses SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $${params.length} RETURNING *`;
-    const { rows } = await query(sql, params);
-    if (rows.length === 0) return res.status(404).json({ error: 'Business not found' });
-    console.log(`[super] Updated business ${id}: ${Object.keys(patches).join(', ')}`);
+    await client.query('BEGIN');
+
+    let updatedBusiness = existing;
+    if (Object.keys(patches).length > 0) {
+      const sets = [];
+      const params = [];
+      Object.entries(patches).forEach(([k, v], i) => {
+        sets.push(`${k} = $${i + 1}`);
+        params.push(v);
+      });
+      params.push(id);
+      const sql = `UPDATE businesses SET ${sets.join(', ')}, updated_at = NOW()
+                    WHERE id = $${params.length}
+                      AND deleted_at IS NULL
+                RETURNING *`;
+      const { rows } = await client.query(sql, params);
+      if (rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Business not found or was deleted concurrently' });
+      }
+      updatedBusiness = rows[0];
+    }
+
+    // Settings upsert — per-key, wholesale value replace. We don't try
+    // to deep-merge: the UI always sends the full object for a key, so
+    // partial shape drift is impossible.
+    for (const key of settingKeys) {
+      const value = settingsMap[key];
+      await client.query(
+        `INSERT INTO settings (business_id, key, value, updated_at)
+         VALUES ($1, $2, $3, NOW())
+         ON CONFLICT (business_id, key) DO UPDATE
+           SET value = EXCLUDED.value,
+               updated_at = NOW()`,
+        [id, key, JSON.stringify(value)]
+      );
+    }
+
+    await client.query('COMMIT');
+
+    console.log(
+      `[super] Updated business ${id}: cols=[${Object.keys(patches).join(',')}] ` +
+      `settings=[${settingKeys.join(',')}]`
+    );
     await logEventFromReq(req, {
       businessId: id,
       action: 'business.updated',
       targetType: 'business',
       targetId: id,
-      meta: { fields: Object.keys(patches), patches }
+      meta: {
+        fields: Object.keys(patches),
+        setting_keys: settingKeys,
+        patches
+      }
     });
-    res.json({ business: rows[0] });
+    res.json({
+      business: updatedBusiness,
+      settings_updated: settingKeys
+    });
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error('[super] patch business error:', err.message);
     if (err.code === '23505') {
       return res.status(409).json({ error: 'slug or twilio_phone_number already in use' });
     }
     res.status(500).json({ error: err.message || 'Failed to update business' });
+  } finally {
+    client.release();
+  }
+});
+
+// -------------- DELETE /api/super/businesses/:id --------------
+//
+// Soft delete. Requires `?confirm=<slug>` in the query string so a
+// mis-aimed click can't wipe a tenant — the operator must copy-paste
+// the slug from the UI. plan='legacy' tenants (Valleymede) cannot be
+// deleted; they return 409. Setting `deleted_at` cascades visibility
+// but keeps every row (call_logs, credit_ledger, settings) intact for
+// restore.
+router.delete('/businesses/:id', async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ error: 'invalid business id' });
+  }
+
+  // Super admins often have a user_id on req.auth; fall back gracefully.
+  const actorId = Number.isInteger(req.auth?.user_id) ? req.auth.user_id : null;
+
+  try {
+    const biz = await getBusinessById(id, { includeDeleted: true });
+    if (!biz) return res.status(404).json({ error: 'Business not found' });
+    if (biz.deleted_at) {
+      return res.status(409).json({ error: 'Business is already deleted', deleted_at: biz.deleted_at });
+    }
+
+    // Rail #1: legacy tenants are never deletable. Valleymede safety.
+    if (biz.plan === 'legacy') {
+      return res.status(403).json({
+        error: 'Legacy tenants cannot be deleted (plan=\'legacy\'). Change plan first if this is intentional.'
+      });
+    }
+
+    // Rail #2: the operator must type the slug to confirm. Case-sensitive
+    // — the UI copy-pastes it, so a near-miss here means the operator
+    // typed the wrong tenant's slug.
+    const confirm = String(req.query.confirm || '').trim();
+    if (confirm !== biz.slug) {
+      return res.status(400).json({
+        error: 'Confirmation slug does not match',
+        hint: `Pass ?confirm=${biz.slug} to confirm this delete.`
+      });
+    }
+
+    // Audit FIRST so the event is attached to a live business_id
+    // (audit_log FKs to businesses with ON DELETE CASCADE — not an issue
+    // for soft delete, but this ordering matches the pattern we'd need
+    // for a future hard-delete endpoint too).
+    await logEventFromReq(req, {
+      businessId: id,
+      action: 'business.deleted',
+      targetType: 'business',
+      targetId: id,
+      meta: {
+        slug: biz.slug,
+        name: biz.name,
+        plan: biz.plan,
+        template_key: biz.template_key,
+        soft: true,
+        actor_super_admin_id: actorId
+      }
+    });
+
+    const { rows } = await query(
+      `UPDATE businesses
+          SET deleted_at = NOW(),
+              deleted_by_user_id = $1,
+              is_active = FALSE,
+              status = 'deleted',
+              updated_at = NOW()
+        WHERE id = $2
+          AND deleted_at IS NULL
+      RETURNING id, slug, deleted_at, deleted_by_user_id`,
+      [actorId, id]
+    );
+
+    if (rows.length === 0) {
+      // Race: someone else deleted it between the check and the UPDATE.
+      return res.status(409).json({ error: 'Business was deleted concurrently' });
+    }
+
+    console.log(`[super] Soft-deleted business ${id} (${biz.slug}) by user=${actorId}`);
+    res.json({ business: rows[0], deleted: true });
+  } catch (err) {
+    console.error('[super] delete business error:', err.message);
+    res.status(500).json({ error: err.message || 'Failed to delete business' });
+  }
+});
+
+// -------------- POST /api/super/businesses/:id/restore --------------
+//
+// Un-delete a soft-deleted tenant. Clears deleted_at + deleted_by_user_id
+// and flips is_active back on. Status is set back to 'active' unless
+// the operator passes an explicit `status` in the body (for the "restore
+// but keep paused" case).
+router.post('/businesses/:id/restore', async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ error: 'invalid business id' });
+  }
+
+  try {
+    const biz = await getBusinessById(id, { includeDeleted: true });
+    if (!biz) return res.status(404).json({ error: 'Business not found' });
+    if (!biz.deleted_at) {
+      return res.status(409).json({ error: 'Business is not deleted; nothing to restore' });
+    }
+
+    const statusOnRestore =
+      typeof req.body?.status === 'string' && req.body.status.trim()
+        ? req.body.status.trim().slice(0, 40)
+        : 'active';
+
+    const { rows } = await query(
+      `UPDATE businesses
+          SET deleted_at = NULL,
+              deleted_by_user_id = NULL,
+              is_active = TRUE,
+              status = $1,
+              updated_at = NOW()
+        WHERE id = $2
+      RETURNING *`,
+      [statusOnRestore, id]
+    );
+
+    await logEventFromReq(req, {
+      businessId: id,
+      action: 'business.restored',
+      targetType: 'business',
+      targetId: id,
+      meta: {
+        slug: biz.slug,
+        previous_deleted_at: biz.deleted_at,
+        restored_status: statusOnRestore
+      }
+    });
+
+    console.log(`[super] Restored business ${id} (${biz.slug}) — status=${statusOnRestore}`);
+    res.json({ business: rows[0], restored: true });
+  } catch (err) {
+    console.error('[super] restore business error:', err.message);
+    res.status(500).json({ error: err.message || 'Failed to restore business' });
   }
 });
 

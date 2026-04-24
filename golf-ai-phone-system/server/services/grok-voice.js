@@ -27,6 +27,7 @@ const { getLineType } = require('./phone-lookup');
 const { getCurrentWeather, getForecast } = require('./weather');
 const { query, getSetting, getBusinessById } = require('../config/database');
 const { requireBusinessId } = require('../context/tenant-context');
+const { recordCallUsage } = require('./credits');
 const teeon = require('./teeon-automation');
 require('dotenv').config();
 
@@ -553,6 +554,24 @@ ${callerLine}
     } catch (err) {
       console.error(`[tenant:${businessId}] Failed to update call log:`, err.message);
     }
+
+    // Phase 7a — credit usage. Fire-and-forget so a billing blip never holds
+    // the WebSocket cleanup path open. `recordCallUsage` swallows its own
+    // errors and returns null on failure; it never throws.
+    // Legacy tenants (Valleymede, plan='legacy') accumulate call_usage ledger
+    // rows for visibility but bypass the enforcement gate — billing is
+    // decoupled from the ability to answer calls for them by design.
+    recordCallUsage(businessId, { durationSeconds: duration, callLogId })
+      .then((balanceAfter) => {
+        if (balanceAfter != null) {
+          console.log(`[tenant:${businessId}][${callLogId}] Credits: -${duration}s, remaining ${balanceAfter}s`);
+        }
+      })
+      .catch((err) => {
+        // Belt-and-braces — recordCallUsage already catches, but a .catch here
+        // guards against a future refactor accidentally letting one through.
+        console.error(`[tenant:${businessId}] recordCallUsage unexpected throw:`, err.message);
+      });
 
     // Personal Assistant post-call recap — owner gets a concise SMS summary
     // of every call. Gated on the tenant's template so golf courses are

@@ -177,7 +177,25 @@ function LoginPage({ onLogin }) {
 // tenantPagesFor() below.
 const DEFAULT_SIDEBAR_ICON = '\ud83c\udfe0'; // fallback emoji
 
-function sidebarItemsFor(templateKey) {
+// Shared golf sidebar — used by the plan='legacy' safety lock and by the
+// regular golf_course / driving_range path so they stay in lockstep.
+const GOLF_SIDEBAR_ITEMS = [
+  { id: 'dashboard', label: 'Dashboard', icon: '\ud83d\udcca' },
+  { id: 'teesheet',  label: 'Tee Sheet', icon: '\u26f3' },
+  { id: 'bookings',  label: 'Bookings',  icon: '\ud83d\udcc5' },
+  { id: 'customers', label: 'Customers', icon: '\ud83d\udc65' },
+  { id: 'calls',     label: 'Call Logs', icon: '\ud83d\udcde' },
+  { id: 'settings',  label: 'Settings',  icon: '\u2699\ufe0f' }
+];
+
+function sidebarItemsFor(templateKey, plan) {
+  // Valleymede-safety lock. `plan='legacy'` means this is the original
+  // single-tenant bootstrap row (Valleymede); keep the historical golf
+  // sidebar no matter what template_key resolves to. If ops or a DB
+  // drift sets the column to 'other' / NULL / 'restaurant', the tenant
+  // still sees Tee Sheet + Bookings.
+  if (plan === 'legacy') return GOLF_SIDEBAR_ITEMS;
+
   if (templateKey === 'personal_assistant') {
     return [
       { id: 'dashboard', label: 'Personal Assistant', icon: '\ud83d\udc64' },
@@ -187,20 +205,15 @@ function sidebarItemsFor(templateKey) {
     ];
   }
   // Golf-style (driving_range reuses this shape for now) — keep the exact
-  // menu Valleymede has been running on.
+  // menu Valleymede has been running on. `!templateKey` keeps pre-Phase-7
+  // rows (before migration 005 backfilled the column) on the golf path
+  // rather than stripping them down.
   if (templateKey === 'golf_course' || templateKey === 'driving_range' || !templateKey) {
-    return [
-      { id: 'dashboard', label: 'Dashboard', icon: '\ud83d\udcca' },
-      { id: 'teesheet',  label: 'Tee Sheet', icon: '\u26f3' },
-      { id: 'bookings',  label: 'Bookings',  icon: '\ud83d\udcc5' },
-      { id: 'customers', label: 'Customers', icon: '\ud83d\udc65' },
-      { id: 'calls',     label: 'Call Logs', icon: '\ud83d\udcde' },
-      { id: 'settings',  label: 'Settings',  icon: '\u2699\ufe0f' }
-    ];
+    return GOLF_SIDEBAR_ITEMS;
   }
-  // Neutral baseline for "other" / "restaurant" until Phase 7. No
-  // golf-specific pages are exposed, but the essentials (calls, settings)
-  // are always available.
+  // Neutral baseline for "other" / "restaurant" until Phase 7 fleshes
+  // those verticals out. No golf-specific pages, but the essentials
+  // (calls, settings) are always available.
   return [
     { id: 'dashboard', label: 'Dashboard', icon: '\ud83d\udcca' },
     { id: 'calls',     label: 'Call Logs', icon: '\ud83d\udcde' },
@@ -209,8 +222,10 @@ function sidebarItemsFor(templateKey) {
   ];
 }
 
-function Sidebar({ currentPage, onNavigate, onLogout, tenantName, templateKey }) {
-  const menuItems = sidebarItemsFor(templateKey);
+function Sidebar({ currentPage, onNavigate, onLogout, tenantName, templateKey, plan }) {
+  // plan is threaded through so sidebarItemsFor can short-circuit to the
+  // golf menu for legacy tenants (Valleymede).
+  const menuItems = sidebarItemsFor(templateKey, plan);
 
   return React.createElement('aside', { className: 'w-64 bg-golf-800 text-white min-h-screen flex flex-col' },
     React.createElement('div', { className: 'p-6 border-b border-golf-700' },
@@ -2597,9 +2612,11 @@ function MetricChip({ label, value, tone = 'default' }) {
 // Card rendered in the super-admin grid. Same information density as the
 // old table row, but scannable at a glance and prettier for a platform
 // operator flipping between tenants all day.
-function BusinessCard({ business, onActAs, onManagePhones }) {
+function BusinessCard({ business, onActAs, onManagePhones, onEdit, onDelete }) {
+  const isDeleted = !!business.deleted_at;
+  const isLegacy = business.plan === 'legacy';
   return React.createElement('div', {
-    className: 'bg-white rounded-xl shadow-sm border hover:shadow-md transition-shadow overflow-hidden flex flex-col'
+    className: `bg-white rounded-xl shadow-sm border hover:shadow-md transition-shadow overflow-hidden flex flex-col ${isDeleted ? 'opacity-60' : ''}`
   },
     React.createElement('div', { className: 'p-5 flex items-start gap-3 border-b bg-gradient-to-br from-gray-50 to-white' },
       React.createElement(BusinessInitials, {
@@ -2612,7 +2629,11 @@ function BusinessCard({ business, onActAs, onManagePhones }) {
       React.createElement('div', { className: 'flex-1 min-w-0' },
         React.createElement('div', { className: 'flex items-center gap-2 flex-wrap' },
           React.createElement('h3', { className: 'text-base font-bold text-gray-800 truncate' }, business.name),
-          React.createElement(StatusPill, { status: business.status })
+          isDeleted
+            ? React.createElement('span', {
+                className: 'inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold bg-red-100 text-red-700 uppercase tracking-wide'
+              }, 'Deleted')
+            : React.createElement(StatusPill, { status: business.status })
         ),
         React.createElement('p', { className: 'text-xs text-gray-500 font-mono mt-1 truncate' }, business.slug),
         React.createElement('p', { className: 'text-xs text-gray-500 mt-1 truncate' },
@@ -2627,18 +2648,369 @@ function BusinessCard({ business, onActAs, onManagePhones }) {
     ),
     React.createElement('div', { className: 'px-4 py-3 bg-gray-50 border-t flex items-center justify-between text-xs gap-3' },
       React.createElement('span', { className: 'text-gray-500 truncate' },
-        business.plan ? `Plan: ${business.plan}` : 'Plan: —',
+        business.plan ? `Plan: ${business.plan}` : 'Plan: \u2014',
         business.setup_complete ? '' : ' \u2022 setup pending'
       ),
       React.createElement('div', { className: 'flex items-center gap-3 flex-shrink-0' },
-        typeof onManagePhones === 'function' && React.createElement('button', {
+        !isDeleted && typeof onEdit === 'function' && React.createElement('button', {
+          onClick: () => onEdit(business),
+          className: 'text-gray-600 hover:text-gray-900 font-semibold'
+        }, '\u270f\ufe0f Edit'),
+        !isDeleted && typeof onManagePhones === 'function' && React.createElement('button', {
           onClick: () => onManagePhones(business),
           className: 'text-gray-600 hover:text-gray-900 font-semibold'
         }, '\ud83d\udcde Phones'),
-        React.createElement('button', {
+        // Delete is hidden for legacy (Valleymede safety) and for already-
+        // deleted tenants. The server also enforces both, but no point
+        // showing a button that's going to 403/409.
+        !isDeleted && !isLegacy && typeof onDelete === 'function' && React.createElement('button', {
+          onClick: () => onDelete(business),
+          className: 'text-red-600 hover:text-red-800 font-semibold',
+          title: 'Soft-delete this tenant'
+        }, '\ud83d\uddd1 Delete'),
+        !isDeleted && React.createElement('button', {
           onClick: () => onActAs(business.id),
           className: 'text-golf-700 hover:text-golf-900 font-semibold'
         }, 'Act as \u2192')
+      )
+    )
+  );
+}
+
+// ============================================
+// EDIT TENANT MODAL (super admin)
+// ============================================
+// Loads the full tenant via GET /api/super/businesses/:id, shows a form
+// pre-populated with every editable field, and submits the diff via PATCH.
+// Template is intentionally read-only (see PATCH comment in server/routes/
+// super-admin.js) — switching vertical post-creation would overwrite
+// per-tenant customisation, so the path is "delete + create new" instead.
+function EditTenantModal({ business, onClose, onSaved }) {
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const [form, setForm] = useState(null);
+  const [ownerProfile, setOwnerProfile] = useState(null);
+  const [originalOwnerProfile, setOriginalOwnerProfile] = useState(null);
+
+  useEffect(() => {
+    if (!business) return;
+    setLoading(true);
+    api(`/api/super/businesses/${business.id}`)
+      .then(resp => {
+        const b = resp.business;
+        setForm({
+          name: b.name || '',
+          slug: b.slug || '',
+          twilio_phone_number: b.twilio_phone_number || '',
+          transfer_number: b.transfer_number || '',
+          timezone: b.timezone || '',
+          contact_email: b.contact_email || '',
+          contact_phone: b.contact_phone || '',
+          status: b.status || 'active',
+          is_active: b.is_active !== false,
+          plan: b.plan || 'free',
+          primary_color: b.primary_color || '',
+          logo_url: b.logo_url || '',
+          internal_notes: b.internal_notes || '',
+          billing_notes: b.billing_notes || ''
+        });
+        // Only surface owner_profile if the tenant has a settings row for
+        // it. The PA wizard seeds assistant_name into this object; we
+        // expose just that field (plus any raw JSON for power users).
+        const op = resp.settings?.owner_profile || null;
+        setOwnerProfile(op);
+        setOriginalOwnerProfile(op ? JSON.parse(JSON.stringify(op)) : null);
+      })
+      .catch(err => setError(err.message || 'Failed to load tenant'))
+      .finally(() => setLoading(false));
+  }, [business]);
+
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  const save = async () => {
+    setSaving(true);
+    setError('');
+    try {
+      const payload = { ...form };
+      // Only include settings.owner_profile if it actually changed —
+      // avoids bumping updated_at on settings rows the operator didn't
+      // touch, which keeps the audit log tidy.
+      const settingsPatch = {};
+      if (ownerProfile && JSON.stringify(ownerProfile) !== JSON.stringify(originalOwnerProfile)) {
+        settingsPatch.owner_profile = ownerProfile;
+      }
+      if (Object.keys(settingsPatch).length > 0) {
+        payload.settings = settingsPatch;
+      }
+      const resp = await api(`/api/super/businesses/${business.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify(payload)
+      });
+      if (typeof onSaved === 'function') onSaved(resp.business);
+      onClose();
+    } catch (err) {
+      setError(err.message || 'Save failed');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!business) return null;
+
+  return React.createElement('div', {
+    className: 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4',
+    onClick: onClose
+  },
+    React.createElement('div', {
+      className: 'bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[92vh] overflow-hidden flex flex-col',
+      onClick: e => e.stopPropagation()
+    },
+      React.createElement('div', { className: 'px-6 py-4 border-b flex items-center justify-between bg-gray-50' },
+        React.createElement('div', null,
+          React.createElement('h2', { className: 'text-lg font-bold text-gray-800' }, '\u270f\ufe0f Edit tenant'),
+          React.createElement('p', { className: 'text-xs text-gray-500 mt-0.5' },
+            `${business.name} (${business.slug}) \u2022 template: ${business.template_key || '\u2014'} (locked)`
+          )
+        ),
+        React.createElement('button', {
+          onClick: onClose,
+          className: 'text-gray-400 hover:text-gray-600 text-2xl leading-none'
+        }, '\u00d7')
+      ),
+
+      loading
+        ? React.createElement('div', { className: 'p-10 text-center text-gray-500 text-sm' }, 'Loading\u2026')
+        : !form
+          ? React.createElement('div', { className: 'p-10 text-center text-red-600 text-sm' }, error || 'Unable to load tenant')
+          : React.createElement('div', { className: 'p-6 overflow-y-auto space-y-5' },
+            error && React.createElement('div', {
+              className: 'bg-red-50 border border-red-200 text-red-800 text-sm rounded-lg px-4 py-2'
+            }, error),
+
+            // ---------- Basics ----------
+            React.createElement('section', null,
+              React.createElement('h3', { className: 'text-xs font-bold uppercase tracking-wide text-gray-500 mb-2' }, 'Basics'),
+              React.createElement('div', { className: 'grid grid-cols-2 gap-3' },
+                textField('Name', form.name, v => set('name', v)),
+                textField('Slug', form.slug, v => set('slug', v), 'lowercase-hyphens'),
+                textField('Contact email', form.contact_email, v => set('contact_email', v)),
+                textField('Contact phone', form.contact_phone, v => set('contact_phone', v)),
+                textField('Timezone', form.timezone, v => set('timezone', v), 'America/Toronto'),
+                selectField('Plan', form.plan, v => set('plan', v), [
+                  ['free', 'free'], ['starter', 'starter'], ['growth', 'growth'],
+                  ['pro', 'pro'], ['legacy', 'legacy']
+                ])
+              )
+            ),
+
+            // ---------- Telephony ----------
+            React.createElement('section', null,
+              React.createElement('h3', { className: 'text-xs font-bold uppercase tracking-wide text-gray-500 mb-2' }, 'Telephony'),
+              React.createElement('div', { className: 'grid grid-cols-2 gap-3' },
+                textField('Primary Twilio number', form.twilio_phone_number, v => set('twilio_phone_number', v), '+1\u2026'),
+                textField('Transfer number', form.transfer_number, v => set('transfer_number', v), '+1\u2026')
+              ),
+              React.createElement('p', { className: 'text-[11px] text-gray-500 mt-2' },
+                'Additional DIDs are managed via the \ud83d\udcde Phones button on the tenant card.'
+              )
+            ),
+
+            // ---------- Branding ----------
+            React.createElement('section', null,
+              React.createElement('h3', { className: 'text-xs font-bold uppercase tracking-wide text-gray-500 mb-2' }, 'Branding'),
+              React.createElement('div', { className: 'grid grid-cols-2 gap-3' },
+                textField('Primary color', form.primary_color, v => set('primary_color', v), '#2E7D32'),
+                textField('Logo URL', form.logo_url, v => set('logo_url', v), 'https://\u2026')
+              )
+            ),
+
+            // ---------- Status ----------
+            React.createElement('section', null,
+              React.createElement('h3', { className: 'text-xs font-bold uppercase tracking-wide text-gray-500 mb-2' }, 'Status'),
+              React.createElement('div', { className: 'grid grid-cols-2 gap-3' },
+                selectField('Status', form.status, v => set('status', v), [
+                  ['active', 'active'], ['trial', 'trial'], ['paused', 'paused'], ['setup', 'setup']
+                ]),
+                React.createElement('label', { className: 'flex items-center gap-2 text-sm mt-5' },
+                  React.createElement('input', {
+                    type: 'checkbox',
+                    checked: !!form.is_active,
+                    onChange: e => set('is_active', e.target.checked),
+                    className: 'rounded'
+                  }),
+                  React.createElement('span', null, 'Is active (inbound calls accepted)')
+                )
+              )
+            ),
+
+            // ---------- Personal Assistant (only if applicable) ----------
+            business.template_key === 'personal_assistant' && ownerProfile && React.createElement('section', null,
+              React.createElement('h3', { className: 'text-xs font-bold uppercase tracking-wide text-gray-500 mb-2' }, 'Personal assistant'),
+              textField(
+                'Assistant name',
+                ownerProfile.assistant_name || '',
+                v => setOwnerProfile(op => ({ ...op, assistant_name: v })),
+                'e.g. Alex'
+              ),
+              React.createElement('p', { className: 'text-[11px] text-gray-500 mt-2' },
+                'This is the name the AI will introduce itself as on calls. Other owner profile fields are edited from the tenant\u2019s My Info page.'
+              )
+            ),
+
+            // ---------- Notes ----------
+            React.createElement('section', null,
+              React.createElement('h3', { className: 'text-xs font-bold uppercase tracking-wide text-gray-500 mb-2' }, 'Internal notes'),
+              React.createElement('div', { className: 'grid grid-cols-1 gap-3' },
+                textareaField('Internal notes (ops-only)', form.internal_notes, v => set('internal_notes', v)),
+                textareaField('Billing notes (ops-only)', form.billing_notes, v => set('billing_notes', v))
+              )
+            )
+          ),
+
+      React.createElement('div', { className: 'px-6 py-3 border-t bg-gray-50 flex justify-end gap-2' },
+        React.createElement('button', {
+          onClick: onClose,
+          className: 'bg-gray-200 hover:bg-gray-300 text-gray-800 px-4 py-2 rounded-lg text-sm font-semibold',
+          disabled: saving
+        }, 'Cancel'),
+        React.createElement('button', {
+          onClick: save,
+          className: 'bg-golf-600 hover:bg-golf-700 text-white px-4 py-2 rounded-lg text-sm font-semibold disabled:opacity-60',
+          disabled: saving || loading || !form
+        }, saving ? 'Saving\u2026' : 'Save changes')
+      )
+    )
+  );
+}
+
+// Tiny form-field helpers — co-located with the edit modal because that's
+// the only caller today. If another screen needs them, promote to a shared
+// util.
+function textField(label, value, onChange, placeholder) {
+  return React.createElement('label', { className: 'block' },
+    React.createElement('span', { className: 'block text-xs font-semibold text-gray-700 mb-1' }, label),
+    React.createElement('input', {
+      type: 'text',
+      value: value ?? '',
+      placeholder: placeholder || '',
+      onChange: e => onChange(e.target.value),
+      className: 'w-full border rounded-lg px-3 py-2 text-sm'
+    })
+  );
+}
+function textareaField(label, value, onChange) {
+  return React.createElement('label', { className: 'block' },
+    React.createElement('span', { className: 'block text-xs font-semibold text-gray-700 mb-1' }, label),
+    React.createElement('textarea', {
+      value: value ?? '',
+      onChange: e => onChange(e.target.value),
+      rows: 3,
+      className: 'w-full border rounded-lg px-3 py-2 text-sm'
+    })
+  );
+}
+function selectField(label, value, onChange, options) {
+  return React.createElement('label', { className: 'block' },
+    React.createElement('span', { className: 'block text-xs font-semibold text-gray-700 mb-1' }, label),
+    React.createElement('select', {
+      value: value ?? '',
+      onChange: e => onChange(e.target.value),
+      className: 'w-full border rounded-lg px-3 py-2 text-sm bg-white'
+    },
+      options.map(([val, lbl]) => React.createElement('option', { key: val, value: val }, lbl))
+    )
+  );
+}
+
+// ============================================
+// DELETE TENANT MODAL (super admin)
+// ============================================
+// Soft delete with slug-typing confirmation. The server also requires
+// the slug as a query param — this mirror prevents an accidental submit.
+function DeleteTenantModal({ business, onClose, onDeleted }) {
+  const [typed, setTyped] = useState('');
+  const [working, setWorking] = useState(false);
+  const [error, setError] = useState('');
+  if (!business) return null;
+
+  const matches = typed.trim() === business.slug;
+
+  const confirmDelete = async () => {
+    if (!matches) return;
+    setWorking(true);
+    setError('');
+    try {
+      await api(`/api/super/businesses/${business.id}?confirm=${encodeURIComponent(business.slug)}`, {
+        method: 'DELETE'
+      });
+      if (typeof onDeleted === 'function') onDeleted(business);
+      onClose();
+    } catch (err) {
+      setError(err.message || 'Delete failed');
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  return React.createElement('div', {
+    className: 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4',
+    onClick: onClose
+  },
+    React.createElement('div', {
+      className: 'bg-white rounded-2xl shadow-2xl max-w-md w-full overflow-hidden',
+      onClick: e => e.stopPropagation()
+    },
+      React.createElement('div', { className: 'px-6 py-4 border-b flex items-center justify-between bg-red-50' },
+        React.createElement('h2', { className: 'text-lg font-bold text-red-800' }, '\ud83d\uddd1 Delete tenant?'),
+        React.createElement('button', {
+          onClick: onClose,
+          className: 'text-gray-400 hover:text-gray-600 text-2xl leading-none'
+        }, '\u00d7')
+      ),
+      React.createElement('div', { className: 'p-6 space-y-4' },
+        React.createElement('div', { className: 'text-sm text-gray-700' },
+          React.createElement('p', { className: 'mb-2' },
+            'You\u2019re about to soft-delete ',
+            React.createElement('strong', null, business.name),
+            '.'
+          ),
+          React.createElement('ul', { className: 'list-disc ml-5 text-xs text-gray-600 space-y-1' },
+            React.createElement('li', null, 'Inbound calls to this tenant\u2019s DIDs will stop routing.'),
+            React.createElement('li', null, 'All data is preserved — call logs, credits, settings. It can be restored.'),
+            React.createElement('li', null, 'Any logged-in users will be kicked out of the tenant on next request.')
+          )
+        ),
+        React.createElement('div', null,
+          React.createElement('label', { className: 'block text-xs font-semibold text-gray-700 mb-1' },
+            'Type the slug ',
+            React.createElement('code', { className: 'font-mono bg-gray-100 px-1 rounded' }, business.slug),
+            ' to confirm:'
+          ),
+          React.createElement('input', {
+            type: 'text',
+            value: typed,
+            onChange: e => setTyped(e.target.value),
+            autoFocus: true,
+            placeholder: business.slug,
+            className: `w-full border rounded-lg px-3 py-2 text-sm font-mono ${matches ? 'border-red-500 focus:ring-red-500' : ''}`
+          })
+        ),
+        error && React.createElement('div', {
+          className: 'bg-red-50 border border-red-200 text-red-800 text-xs rounded-lg px-3 py-2'
+        }, error)
+      ),
+      React.createElement('div', { className: 'px-6 py-3 border-t bg-gray-50 flex justify-end gap-2' },
+        React.createElement('button', {
+          onClick: onClose,
+          className: 'bg-gray-200 hover:bg-gray-300 text-gray-800 px-4 py-2 rounded-lg text-sm font-semibold',
+          disabled: working
+        }, 'Cancel'),
+        React.createElement('button', {
+          onClick: confirmDelete,
+          disabled: !matches || working,
+          className: 'bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg text-sm font-semibold disabled:opacity-40'
+        }, working ? 'Deleting\u2026' : 'Delete tenant')
       )
     )
   );
@@ -2698,6 +3070,8 @@ function SuperAdminDashboard({ onSwitchInto, onBusinessCreated }) {
   const [lastCreated, setLastCreated] = useState(null);
   const [search, setSearch] = useState('');
   const [phoneModalBiz, setPhoneModalBiz] = useState(null);
+  const [editBiz, setEditBiz] = useState(null);
+  const [deleteBiz, setDeleteBiz] = useState(null);
   const [analytics, setAnalytics] = useState(null);
   const [auditEvents, setAuditEvents] = useState([]);
   const [showAudit, setShowAudit] = useState(false);
@@ -2943,7 +3317,9 @@ function SuperAdminDashboard({ onSwitchInto, onBusinessCreated }) {
             key: b.id,
             business: b,
             onActAs: onSwitchInto,
-            onManagePhones: setPhoneModalBiz
+            onManagePhones: setPhoneModalBiz,
+            onEdit: setEditBiz,
+            onDelete: setDeleteBiz
           })
         )
       )
@@ -2964,6 +3340,18 @@ function SuperAdminDashboard({ onSwitchInto, onBusinessCreated }) {
       // card without a page reload.
       onSaved: refresh,
       onClose: () => setPhoneModalBiz(null)
+    }),
+
+    editBiz && React.createElement(EditTenantModal, {
+      business: editBiz,
+      onClose: () => setEditBiz(null),
+      onSaved: () => { refresh(); }
+    }),
+
+    deleteBiz && React.createElement(DeleteTenantModal, {
+      business: deleteBiz,
+      onClose: () => setDeleteBiz(null),
+      onDeleted: () => { refresh(); }
     })
   );
 }
@@ -3926,10 +4314,25 @@ function MyInfoPage() {
   );
 }
 
+// Shared golf page map — used by the plan='legacy' safety lock and by
+// the regular golf_course / driving_range path so dispatch stays in
+// lockstep with the sidebar.
+const GOLF_PAGES = {
+  dashboard: DashboardPage,
+  teesheet:  TeeSheetPage,
+  bookings:  BookingsPage,
+  customers: CustomersPage,
+  calls:     CallLogsPage,
+  settings:  SettingsPage
+};
+
 // Page router per template. Always falls back to the existing golf maps so
 // unknown keys keep working — we never want a wiring bug here to black-hole
-// Valleymede's UI.
-function tenantPagesFor(templateKey) {
+// Valleymede's UI. `plan='legacy'` short-circuits to the golf map so
+// Valleymede keeps Tee Sheet + Bookings even if template_key drifts.
+function tenantPagesFor(templateKey, plan) {
+  if (plan === 'legacy') return GOLF_PAGES;
+
   if (templateKey === 'personal_assistant') {
     return {
       dashboard: PersonalAssistantPage,
@@ -3940,14 +4343,7 @@ function tenantPagesFor(templateKey) {
   }
   // Golf (also the implicit default) — keep Valleymede's shape exactly.
   if (templateKey === 'golf_course' || templateKey === 'driving_range' || !templateKey) {
-    return {
-      dashboard: DashboardPage,
-      teesheet:  TeeSheetPage,
-      bookings:  BookingsPage,
-      customers: CustomersPage,
-      calls:     CallLogsPage,
-      settings:  SettingsPage
-    };
+    return GOLF_PAGES;
   }
   // Minimal "other" baseline until Phase 7 adds dedicated verticals.
   return {
@@ -3983,11 +4379,15 @@ function App() {
           const s = {
             role: d.user.role,
             business_id: d.user.business_id,
-            // /auth/verify now echoes the tenant's template_key + name so
-            // the sidebar and page router can branch without a second
-            // network round-trip on first render.
+            // /auth/verify now echoes the tenant's template_key + plan +
+            // name so the sidebar and page router can branch without a
+            // second network round-trip on first render. `plan` is the
+            // Valleymede-safety lock: legacy tenants always get the full
+            // golf sidebar regardless of template_key drift (see
+            // sidebarItemsFor / tenantPagesFor).
             business_name: d.user.business_name || null,
             template_key: d.user.template_key || null,
+            plan: d.user.plan || null,
             username: d.user.username
           };
           setSession(s);
@@ -4029,6 +4429,10 @@ function App() {
       business_id: data.business_id,
       business_name: data.business_name || null,
       template_key: data.template_key || null,
+      // `plan` drives the legacy-tenant safety lock in sidebarItemsFor /
+      // tenantPagesFor — Valleymede (plan='legacy') always keeps the full
+      // golf sidebar even if template_key drifts.
+      plan: data.plan || null,
       username: data.username,
       name: data.name
     });
@@ -4059,16 +4463,24 @@ function App() {
 
   const isSuper = session.role === 'super_admin';
 
-  // Template resolution — tenant users get it from their JWT-issued session
-  // blob (populated by /auth/verify + /auth/login). Super-admins acting-as
-  // another business pick it up from the cached business list, because their
-  // JWT's template_key belongs to *their own* row (if any), not the tenant
-  // they're impersonating.
+  // Template + plan resolution — tenant users get it from their JWT-issued
+  // session blob (populated by /auth/verify + /auth/login). Super-admins
+  // acting-as another business pick it up from the cached business list,
+  // because their JWT's template_key belongs to *their own* row (if any),
+  // not the tenant they're impersonating. `plan` is the safety lock for
+  // legacy (Valleymede) — sidebarItemsFor / tenantPagesFor force the full
+  // golf shape whenever plan='legacy', regardless of template_key drift.
+  const actingBusiness = isSuper
+    ? (businesses.find(b => b.id === selectedBusinessId) || {})
+    : {};
   const effectiveTemplateKey = isSuper
-    ? (businesses.find(b => b.id === selectedBusinessId) || {}).template_key || null
+    ? actingBusiness.template_key || null
     : session.template_key || null;
+  const effectivePlan = isSuper
+    ? actingBusiness.plan || null
+    : session.plan || null;
 
-  const tenantPages = tenantPagesFor(effectiveTemplateKey);
+  const tenantPages = tenantPagesFor(effectiveTemplateKey, effectivePlan);
 
   // Super admin with no selected business → platform dashboard only.
   if (isSuper && !selectedBusinessId) {
@@ -4110,7 +4522,8 @@ function App() {
         // lookup hasn't resolved yet (first render after act-as).
         tenantName: (businesses.find(b => b.id === selectedBusinessId) || {}).name
           || session.business_name,
-        templateKey: effectiveTemplateKey
+        templateKey: effectiveTemplateKey,
+        plan: effectivePlan
       }),
       React.createElement('main', { className: 'flex-1 p-8 overflow-auto bg-gray-50' },
         React.createElement(PageComponent)

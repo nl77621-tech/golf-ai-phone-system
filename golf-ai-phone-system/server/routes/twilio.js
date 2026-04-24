@@ -17,6 +17,7 @@ const router = express.Router();
 const { normalizePhone } = require('../services/caller-lookup');
 const { getSetting } = require('../config/database');
 const { findActiveBookingByPhone, updateBookingStatus } = require('../services/booking-manager');
+const { canAcceptCall } = require('../services/credits');
 const {
   attachTenantFromTwilioTo,
   attachTenantFromCallSid,
@@ -86,6 +87,39 @@ router.post('/voice', attachTenantFromTwilioTo, async (req, res) => {
     `[tenant:${businessId}] Incoming call from ${callerPhone} to ${req.body.To} ` +
     `(SID: ${callSid}) — routed via ${phoneSource}`
   );
+
+  // Phase 7a — credit gate. canAcceptCall never throws; on an internal
+  // error it fails OPEN ({ reason: 'error_open' }) because the right
+  // behaviour for a DB hiccup is "let the call through" rather than
+  // "hang up a paying customer". Legacy tenants (Valleymede) short-
+  // circuit inside the service with reason: 'legacy' before the balance
+  // is even read. Only 'no_credit' → polite hangup.
+  try {
+    const gate = await canAcceptCall(businessId);
+    if (!gate.allowed) {
+      console.warn(
+        `[tenant:${businessId}] Call blocked: reason=${gate.reason}, ` +
+        `secondsRemaining=${gate.seconds_remaining ?? 'n/a'}`
+      );
+      res.type('text/xml');
+      res.send(`
+        <Response>
+          <Say voice="alice">Thank you for calling ${xmlEscape(businessName)}. Our phone service is temporarily paused. Please contact us directly and we'll get back to you shortly.</Say>
+          <Hangup/>
+        </Response>
+      `);
+      return;
+    }
+    if (gate.reason === 'trial') {
+      console.log(`[tenant:${businessId}] Trial call — ${gate.seconds_remaining}s left, trial expires ${gate.trial_expires_at}`);
+    } else if (gate.reason === 'error_open') {
+      console.error(`[tenant:${businessId}] Credit gate failed open — allowing call through`);
+    }
+  } catch (err) {
+    // Belt-and-braces. canAcceptCall shouldn't throw, but if a future
+    // refactor lets something escape we fail open.
+    console.error(`[tenant:${businessId}] Credit gate unexpected throw (failing open):`, err.message);
+  }
 
   // Optional per-tenant test mode — only let the configured test phone through.
   try {

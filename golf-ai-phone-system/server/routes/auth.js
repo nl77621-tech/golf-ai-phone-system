@@ -74,14 +74,19 @@ router.post('/login', async (req, res) => {
     }
     const result = await login(username, password);
 
-    // Attach the tenant's template_key + business_name so the Command
-    // Center can pick the right sidebar / dashboard on first render
-    // without an extra /auth/verify round-trip. Non-fatal on failure.
+    // Attach the tenant's template_key + plan + business_name so the
+    // Command Center can pick the right sidebar / dashboard on first
+    // render without an extra /auth/verify round-trip. `plan` is the
+    // Valleymede safety lock — the UI forces the full golf sidebar when
+    // plan='legacy' regardless of template_key, so a DB drift that sets
+    // template_key to 'other' never hides Tee Sheet / Bookings from the
+    // original tenant. Non-fatal on failure.
     if (Number.isInteger(result.business_id)) {
       try {
         const biz = await getBusinessById(result.business_id);
         if (biz) {
           result.template_key = biz.template_key || null;
+          result.plan = biz.plan || null;
           result.business_name = biz.name || null;
         }
       } catch (err) {
@@ -89,6 +94,7 @@ router.post('/login', async (req, res) => {
       }
     } else {
       result.template_key = null;
+      result.plan = null;
     }
 
     // Audit — fire-and-forget. The login result contains the role +
@@ -122,12 +128,14 @@ router.post('/login', async (req, res) => {
 // Super admins get template_key = null (they aren't bound to a tenant).
 router.get('/verify', requireAuth, async (req, res) => {
   let template_key = null;
+  let plan = null;
   let business_name = null;
   if (Number.isInteger(req.auth.business_id) && req.auth.business_id > 0) {
     try {
       const biz = await getBusinessById(req.auth.business_id);
       if (biz) {
         template_key = biz.template_key || null;
+        plan = biz.plan || null;
         business_name = biz.name || null;
       }
     } catch (err) {
@@ -144,6 +152,7 @@ router.get('/verify', requireAuth, async (req, res) => {
       role: req.auth.role,
       username: req.auth.username,
       template_key,
+      plan,
       business_name
     }
   });

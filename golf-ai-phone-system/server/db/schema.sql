@@ -211,6 +211,50 @@ ALTER TABLE IF EXISTS greetings             ADD COLUMN IF NOT EXISTS business_id
 -- just ensures the column exists.
 ALTER TABLE IF EXISTS businesses            ADD COLUMN IF NOT EXISTS template_key VARCHAR(40);
 
+-- VALLEYMEDE SAFETY — run on every boot.
+-- The Command Center sidebar branches on template_key. Any drift (ops
+-- mis-edit, partial migration, manual UPDATE) that leaves a legacy
+-- tenant with template_key NULL or something other than 'golf_course'
+-- would hide Tee Sheet / Bookings from Valleymede. This UPDATE is
+-- idempotent and narrowly scoped to plan='legacy' rows, so it won't
+-- touch onboarded SaaS tenants. Wrapped in a DO block so the column
+-- existence check is enforced at runtime — on a fresh DB the plan
+-- column is always present (CREATE TABLE above), but defensive against
+-- any unforeseen partial-migration state.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_name = 'businesses' AND column_name = 'plan'
+    ) AND EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_name = 'businesses' AND column_name = 'template_key'
+    ) THEN
+        UPDATE businesses
+           SET template_key = 'golf_course'
+         WHERE plan = 'legacy'
+           AND (template_key IS NULL OR template_key <> 'golf_course');
+    END IF;
+END $$;
+
+-- Credit/billing columns introduced in migration 006 (Phase 7a).
+-- Same reasoning as template_key: on a legacy DB the businesses CREATE
+-- TABLE below is a no-op, so we pre-emptively add the columns here so
+-- indexes / code that SELECTs them never trips. Migration 006 then
+-- performs the courtesy backfill.
+ALTER TABLE IF EXISTS businesses            ADD COLUMN IF NOT EXISTS credit_seconds_remaining BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE IF EXISTS businesses            ADD COLUMN IF NOT EXISTS trial_granted_at TIMESTAMP WITH TIME ZONE;
+ALTER TABLE IF EXISTS businesses            ADD COLUMN IF NOT EXISTS trial_expires_at TIMESTAMP WITH TIME ZONE;
+ALTER TABLE IF EXISTS businesses            ADD COLUMN IF NOT EXISTS billing_notes TEXT;
+
+-- Soft-delete (migration 007). Same self-heal reasoning: hot queries and
+-- super-admin list SELECT these columns, so they must exist even before
+-- migration 007 runs on a legacy DB.
+ALTER TABLE IF EXISTS businesses            ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE;
+ALTER TABLE IF EXISTS businesses            ADD COLUMN IF NOT EXISTS deleted_by_user_id INTEGER;
+CREATE INDEX IF NOT EXISTS idx_businesses_live       ON businesses (id)   WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_businesses_live_slug  ON businesses (slug) WHERE deleted_at IS NULL;
+
 -- ============================================
 -- Settings (key/value per tenant)
 -- ============================================
@@ -367,3 +411,51 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_action_created
     ON audit_log(action, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_log_actor
     ON audit_log(user_type, user_id, created_at DESC);
+
+-- ============================================
+-- Credit packages + ledger (Phase 7a — migration 006)
+-- ============================================
+-- credit_packages is the catalog of purchasable packs — seeded by
+-- migration 006 at 3 tiers (starter / growth / pro). Prices are in
+-- integer cents. Edit via UPDATE; a migration re-run won't clobber
+-- operator-tuned prices (ON CONFLICT DO NOTHING on the seed).
+CREATE TABLE IF NOT EXISTS credit_packages (
+    id               SERIAL PRIMARY KEY,
+    key              VARCHAR(40) UNIQUE NOT NULL,
+    label            VARCHAR(80) NOT NULL,
+    seconds_included BIGINT NOT NULL CHECK (seconds_included > 0),
+    price_cents      INT NOT NULL CHECK (price_cents >= 0),
+    currency         VARCHAR(8) NOT NULL DEFAULT 'USD',
+    active           BOOLEAN NOT NULL DEFAULT TRUE,
+    sort_order       INT NOT NULL DEFAULT 0,
+    description      TEXT,
+    created_at       TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+-- credit_ledger is an append-only log. Every grant, purchase, usage,
+-- admin adjustment, or refund is one row. Current balance = SUM of
+-- delta_seconds for a business (but the hot path reads the
+-- materialised `businesses.credit_seconds_remaining` column instead).
+CREATE TABLE IF NOT EXISTS credit_ledger (
+    id                 BIGSERIAL PRIMARY KEY,
+    business_id        INTEGER NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+    delta_seconds      BIGINT NOT NULL,
+    reason             VARCHAR(40) NOT NULL
+                          CHECK (reason IN (
+                              'trial_grant', 'purchase', 'admin_grant',
+                              'admin_deduction', 'call_usage', 'refund',
+                              'migration_grant'
+                          )),
+    source_type        VARCHAR(40),
+    source_id          BIGINT,
+    note               TEXT,
+    created_by_user_id INTEGER,
+    balance_after      BIGINT NOT NULL DEFAULT 0,
+    created_at         TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_credit_ledger_business_id
+    ON credit_ledger(business_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_credit_ledger_reason
+    ON credit_ledger(business_id, reason);

@@ -217,6 +217,9 @@ async function getBusinessByTwilioNumber(phoneNumber) {
   if (!phoneNumber) return null;
 
   // 1. Authoritative multi-DID lookup (Phase 5).
+  //    `b.deleted_at IS NULL` (migration 007) ensures soft-deleted
+  //    tenants never route calls — the DID effectively goes dark
+  //    until the tenant is restored.
   let res = await query(
     `SELECT b.*
        FROM business_phone_numbers bpn
@@ -224,6 +227,7 @@ async function getBusinessByTwilioNumber(phoneNumber) {
       WHERE bpn.phone_number = $1
         AND bpn.status = 'active'
         AND b.is_active = TRUE
+        AND b.deleted_at IS NULL
       LIMIT 1`,
     [phoneNumber]
   );
@@ -244,10 +248,13 @@ async function getBusinessByTwilioNumber(phoneNumber) {
   }
 
   // 2. Legacy fallback — the denormalized column on `businesses`.
+  //    Same soft-delete filter as path 1 so a deleted legacy tenant
+  //    doesn't keep routing via the fallback.
   res = await query(
     `SELECT * FROM businesses
      WHERE twilio_phone_number = $1
        AND is_active = TRUE
+       AND deleted_at IS NULL
      LIMIT 1`,
     [phoneNumber]
   );
@@ -525,28 +532,44 @@ async function deleteBusinessPhoneNumber(businessId, phoneId) {
   }
 }
 
-/** Fetch a business by id (returns null if not found). */
-async function getBusinessById(id) {
+/**
+ * Fetch a business by id (returns null if not found).
+ *
+ * Soft-deleted rows (deleted_at IS NOT NULL) are hidden by default so
+ * the application hot paths — Twilio routing, JWT-attached tenants,
+ * background jobs — can never accidentally operate on a deleted tenant.
+ * Super admin restore flows pass `{ includeDeleted: true }` to bypass.
+ */
+async function getBusinessById(id, { includeDeleted = false } = {}) {
   if (!Number.isInteger(id) || id <= 0) return null;
-  const res = await query('SELECT * FROM businesses WHERE id = $1', [id]);
+  const sql = includeDeleted
+    ? 'SELECT * FROM businesses WHERE id = $1'
+    : 'SELECT * FROM businesses WHERE id = $1 AND deleted_at IS NULL';
+  const res = await query(sql, [id]);
   return res.rows[0] || null;
 }
 
 /** Fetch a business by slug (URL key). Useful for admin UIs. */
-async function getBusinessBySlug(slug) {
+async function getBusinessBySlug(slug, { includeDeleted = false } = {}) {
   if (!slug) return null;
-  const res = await query('SELECT * FROM businesses WHERE slug = $1', [slug]);
+  const sql = includeDeleted
+    ? 'SELECT * FROM businesses WHERE slug = $1'
+    : 'SELECT * FROM businesses WHERE slug = $1 AND deleted_at IS NULL';
+  const res = await query(sql, [slug]);
   return res.rows[0] || null;
 }
 
 /**
  * Return all active businesses. Used by scheduled jobs that must iterate
- * every tenant (e.g. day-before reminders).
+ * every tenant (e.g. day-before reminders). Soft-deleted tenants are
+ * excluded so a restore-pending tenant doesn't fire reminder SMS etc.
  */
 async function listActiveBusinesses() {
   const res = await query(
     `SELECT * FROM businesses
-      WHERE is_active = TRUE AND status IN ('active', 'trial')
+      WHERE is_active = TRUE
+        AND deleted_at IS NULL
+        AND status IN ('active', 'trial')
       ORDER BY id`
   );
   return res.rows;

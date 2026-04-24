@@ -4120,7 +4120,12 @@ function OnboardingWizard({ onCancel, onCreated, onActAs, mode = 'business', ini
         step === 5 && React.createElement('div', { className: 'flex items-center gap-2' },
           typeof onActAs === 'function' && result?.business?.id && React.createElement('button', {
             type: 'button',
-            onClick: () => onActAs(result.business.id),
+            // Pass the fresh business object as a hint. Parent handleSelectBusiness
+            // merges it into the businesses[] cache synchronously so the first
+            // render after act-as knows template_key — otherwise a new
+            // personal_assistant / restaurant tenant renders the golf fallback
+            // for a frame while /api/super/businesses round-trips.
+            onClick: () => onActAs(result.business.id, result.business),
             className: 'px-4 py-2 rounded-lg bg-white border border-golf-300 hover:bg-golf-50 text-sm font-semibold text-golf-700'
           }, `Act as ${result.business.name || 'this business'}`),
           React.createElement('button', {
@@ -4510,7 +4515,21 @@ function App() {
     setAuthenticated(false);
   };
 
-  const handleSelectBusiness = (id) => {
+  // `businessHint` (optional) — the freshly-created business object handed
+  // back from the onboarding wizard. Without it, a super-admin clicking
+  // "Act as" on a brand-new tenant would hit a cache miss (the background
+  // refreshBusinessList() hasn't completed yet), `actingBusiness` would
+  // resolve to {}, effectiveTemplateKey would fall through to null, and
+  // the UI would render the null-fallback golf dashboard instead of the
+  // personal_assistant / restaurant / etc. pages the tenant should see.
+  // Merging the hint into the cache *before* setSelectedBusinessId closes
+  // that race so the first render already knows template_key + plan.
+  const handleSelectBusiness = (id, businessHint = null) => {
+    if (businessHint && businessHint.id === id) {
+      setBusinesses(prev =>
+        prev.some(b => b.id === id) ? prev : [...prev, businessHint]
+      );
+    }
     setSelectedBusinessId(id);
     setSelectedBusinessIdState(id);
     setCurrentPage(id ? 'dashboard' : 'super');

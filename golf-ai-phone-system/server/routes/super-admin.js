@@ -329,6 +329,150 @@ router.post('/businesses', async (req, res) => {
     }))
     .filter(p => p.phone_number && p.phone_number !== twilioNumber);
 
+  // --- Pre-flight: reclaim identifiers from soft-deleted tenants ---
+  //
+  // The DELETE handler learned to rename/clear these on soft-delete, but
+  // tenants deleted BEFORE that patch still hoard their slug + phone
+  // numbers in the globally-unique indexes. Without this block, the
+  // INSERT below 23505s and the operator would need to hit the
+  // reclaim-orphaned endpoint manually. We do the same reclaim inline,
+  // scoped only to the exact identifiers this request is trying to use —
+  // we never touch a deleted tenant whose identifier isn't being reclaimed
+  // by this request, so ops visibility of "deleted but not reclaimed" rows
+  // is preserved.
+  //
+  // Each reclaim is its own audit event with `source: 'wizard-preflight'`
+  // so it's distinguishable from the batch reclaim-orphaned endpoint.
+  const preflightReclaim = async () => {
+    // 1. Slug — if a soft-deleted tenant has this exact slug, rename theirs
+    //    to `deleted-<id>` so the INSERT below can claim the original.
+    const slugCollision = await query(
+      `SELECT id, slug, name FROM businesses
+        WHERE slug = $1 AND deleted_at IS NOT NULL
+        LIMIT 1`,
+      [slug]
+    );
+    if (slugCollision.rows.length > 0) {
+      const r = slugCollision.rows[0];
+      await query(
+        `UPDATE businesses
+            SET slug = $1, updated_at = NOW()
+          WHERE id = $2 AND deleted_at IS NOT NULL`,
+        [`deleted-${r.id}`, r.id]
+      );
+      await logEventFromReq(req, {
+        businessId: r.id,
+        action: 'phone_numbers.reclaimed_orphaned',
+        targetType: 'business',
+        targetId: r.id,
+        meta: {
+          slug: r.slug,
+          name: r.name,
+          released_slug: r.slug,
+          source: 'wizard-preflight'
+        }
+      });
+      console.log(`[super] Pre-flight: released slug "${r.slug}" from deleted tenant ${r.id} for new tenant creation`);
+    }
+
+    // 2. Phone numbers — same story for primary + extra numbers. Gather the
+    //    set of DIDs this request wants, then release any attached to a
+    //    soft-deleted tenant.
+    const wantedNumbers = new Set();
+    if (twilioNumber) wantedNumbers.add(twilioNumber);
+    for (const p of extraPhoneNumbers) wantedNumbers.add(p.phone_number);
+    if (wantedNumbers.size > 0) {
+      const numberArr = Array.from(wantedNumbers);
+      // 2a. business_phone_numbers rows pointing at deleted tenants.
+      const rowCollisions = await query(
+        `SELECT bpn.id            AS row_id,
+                bpn.business_id   AS business_id,
+                bpn.phone_number  AS phone_number,
+                bpn.label         AS label,
+                bpn.is_primary    AS is_primary,
+                b.slug            AS slug,
+                b.name            AS name
+           FROM business_phone_numbers bpn
+           JOIN businesses b ON b.id = bpn.business_id
+          WHERE b.deleted_at IS NOT NULL
+            AND bpn.phone_number = ANY($1::text[])`,
+        [numberArr]
+      );
+      // 2b. Denormalized businesses.twilio_phone_number.
+      const denormCollisions = await query(
+        `SELECT id, slug, name, twilio_phone_number
+           FROM businesses
+          WHERE deleted_at IS NOT NULL
+            AND twilio_phone_number = ANY($1::text[])`,
+        [numberArr]
+      );
+
+      if (rowCollisions.rows.length > 0) {
+        await query(
+          `DELETE FROM business_phone_numbers
+            WHERE id = ANY($1::int[])`,
+          [rowCollisions.rows.map(r => r.row_id)]
+        );
+      }
+      if (denormCollisions.rows.length > 0) {
+        await query(
+          `UPDATE businesses
+              SET twilio_phone_number = NULL, updated_at = NOW()
+            WHERE id = ANY($1::int[])
+              AND deleted_at IS NOT NULL`,
+          [denormCollisions.rows.map(r => r.id)]
+        );
+      }
+
+      // Group reclaimed numbers per deleted tenant for the audit event.
+      const byBiz = new Map();
+      const ensure = (id, slug, name) => {
+        if (!byBiz.has(id)) byBiz.set(id, { slug, name, numbers: [] });
+        return byBiz.get(id);
+      };
+      for (const r of rowCollisions.rows) {
+        ensure(r.business_id, r.slug, r.name).numbers.push({
+          phone_number: r.phone_number, label: r.label, is_primary: r.is_primary
+        });
+      }
+      for (const r of denormCollisions.rows) {
+        const entry = ensure(r.id, r.slug, r.name);
+        if (!entry.numbers.some(n => n.phone_number === r.twilio_phone_number)) {
+          entry.numbers.push({
+            phone_number: r.twilio_phone_number,
+            label: 'Main Line (denormalized on businesses row)',
+            is_primary: true
+          });
+        }
+      }
+      for (const [businessId, info] of byBiz.entries()) {
+        await logEventFromReq(req, {
+          businessId,
+          action: 'phone_numbers.reclaimed_orphaned',
+          targetType: 'business',
+          targetId: businessId,
+          meta: {
+            slug: info.slug,
+            name: info.name,
+            reclaimed_numbers: info.numbers,
+            source: 'wizard-preflight'
+          }
+        });
+        console.log(
+          `[super] Pre-flight: released ${info.numbers.length} phone number(s) from deleted tenant ${businessId} (${info.slug})`
+        );
+      }
+    }
+  };
+  try {
+    await preflightReclaim();
+  } catch (preflightErr) {
+    // Non-fatal — if the reclaim fails the INSERT below will 23505 and the
+    // targeted-error-UX handler will still tell the operator what collided.
+    // We'd rather attempt creation than block on a pre-flight hiccup.
+    console.warn('[super] preflight reclaim failed, proceeding to INSERT anyway:', preflightErr.message);
+  }
+
   const client = await pool.connect();
   let createdBusinessId = null;
   let inviteRow = null;

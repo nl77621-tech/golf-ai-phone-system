@@ -163,14 +163,37 @@ function resolveVoiceConfigFromSettings(voiceConfigValue) {
   return { tier: tierKey, model, voice, speed };
 }
 
+// ─── Known xAI voice names ───────────────────────────────────────────────────
+//
+// The Super Admin "override voice" dropdown lets an operator pin a tenant to a
+// specific xAI voice without going through the tier system (useful for
+// evaluating new voices or overriding on a per-customer basis). This list
+// is what the dropdown suggests; the field is still free-form so any new voice
+// xAI ships can be entered without a code deploy.
+//
+// `default_voice` is the one used when settings.voice_config is missing or
+// doesn't override `voice` — it matches LEGACY_FALLBACK.voice exactly so
+// Valleymede stays on its historical voice until an operator explicitly
+// changes it.
+const KNOWN_VOICES = Object.freeze([
+  Object.freeze({ name: 'eve',  label: 'Eve (default xAI voice)' }),
+  Object.freeze({ name: 'rock', label: 'Rock (newer, more expressive)' })
+]);
+
+function listKnownVoices() {
+  return KNOWN_VOICES.map(v => ({ name: v.name, label: v.label }));
+}
+
 module.exports = {
   VOICE_TIERS,
   DEFAULT_TIER,
   LEGACY_FALLBACK,
   PLAN_TIER_ACCESS,
+  KNOWN_VOICES,
   allowedTiersForPlan,
   isTierAllowedOnPlan,
   getTier,
   listTiers,
+  listKnownVoices,
   resolveVoiceConfigFromSettings
 };

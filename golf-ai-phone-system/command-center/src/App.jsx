@@ -2612,7 +2612,7 @@ function MetricChip({ label, value, tone = 'default' }) {
 // Card rendered in the super-admin grid. Same information density as the
 // old table row, but scannable at a glance and prettier for a platform
 // operator flipping between tenants all day.
-function BusinessCard({ business, onActAs, onManagePhones, onEdit, onDelete }) {
+function BusinessCard({ business, onActAs, onManagePhones, onManageVoice, onEdit, onDelete }) {
   const isDeleted = !!business.deleted_at;
   const isLegacy = business.plan === 'legacy';
   return React.createElement('div', {
@@ -2666,6 +2666,11 @@ function BusinessCard({ business, onActAs, onManagePhones, onEdit, onDelete }) {
           onClick: () => onManagePhones(business),
           className: 'text-gray-600 hover:text-gray-900 font-semibold'
         }, '\ud83d\udcde Phones'),
+        !isDeleted && typeof onManageVoice === 'function' && React.createElement('button', {
+          onClick: () => onManageVoice(business),
+          className: 'text-gray-600 hover:text-gray-900 font-semibold',
+          title: 'Override the xAI voice for this tenant'
+        }, '\ud83c\udf99\ufe0f Voice'),
         !isDeleted && typeof onDelete === 'function' && React.createElement('button', {
           onClick: () => { if (!isLegacy) onDelete(business); },
           disabled: isLegacy,
@@ -3065,6 +3070,143 @@ function PhoneNumbersModal({ business, onClose, onSaved }) {
 }
 
 // ============================================
+// VOICE OVERRIDE MODAL (super admin)
+// ============================================
+// Lets a super admin pin a specific xAI voice name (e.g. "eve", "rock") for
+// a tenant, independent of the wizard's tier selection. The field is
+// free-form with a datalist of known voices so a newly-released xAI voice
+// can be used without a code deploy.
+//
+// Writes merge into settings.voice_config on the server (POST/PATCH
+// preserves any existing tier key), so a tenant created on tier="standard"
+// with an explicit voice="rock" stays on tier="standard" for entitlement
+// purposes but answers calls in the Rock voice.
+function VoiceModal({ business, onClose, onSaved }) {
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const [data, setData] = useState(null); // { raw, resolved, known_voices }
+  const [draftVoice, setDraftVoice] = useState('');
+
+  useEffect(() => {
+    if (!business) return;
+    setLoading(true);
+    setError('');
+    api(`/api/super/businesses/${business.id}/voice`)
+      .then(resp => {
+        setData(resp);
+        setDraftVoice(resp?.raw?.voice || '');
+        setLoading(false);
+      })
+      .catch(err => {
+        setError(err?.message || 'Failed to load voice config');
+        setLoading(false);
+      });
+  }, [business]);
+
+  const handleSave = useCallback(async (clear) => {
+    setSaving(true);
+    setError('');
+    try {
+      const body = clear
+        ? { voice: null }
+        : { voice: (draftVoice || '').trim() };
+      const resp = await api(`/api/super/businesses/${business.id}/voice`, {
+        method: 'PATCH',
+        body: JSON.stringify(body)
+      });
+      setData(d => ({ ...(d || {}), raw: resp.raw, resolved: resp.resolved }));
+      setDraftVoice(resp?.raw?.voice || '');
+      if (typeof onSaved === 'function') onSaved();
+    } catch (err) {
+      setError(err?.message || 'Failed to save voice');
+    } finally {
+      setSaving(false);
+    }
+  }, [business, draftVoice, onSaved]);
+
+  if (!business) return null;
+
+  return React.createElement('div', {
+    className: 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4',
+    onClick: onClose
+  },
+    React.createElement('div', {
+      className: 'bg-white rounded-2xl shadow-2xl max-w-lg w-full max-h-[90vh] overflow-hidden flex flex-col',
+      onClick: e => e.stopPropagation()
+    },
+      React.createElement('div', { className: 'px-6 py-4 border-b flex items-center justify-between bg-gray-50' },
+        React.createElement('div', null,
+          React.createElement('h2', { className: 'text-lg font-bold text-gray-800' }, '\ud83c\udf99\ufe0f Voice Override'),
+          React.createElement('p', { className: 'text-xs text-gray-500 mt-0.5' }, `${business.name} (${business.slug})`)
+        ),
+        React.createElement('button', {
+          onClick: onClose,
+          className: 'text-gray-400 hover:text-gray-600 text-2xl leading-none'
+        }, '\u00d7')
+      ),
+      React.createElement('div', { className: 'p-6 overflow-y-auto space-y-4' },
+        loading
+          ? React.createElement('p', { className: 'text-sm text-gray-500' }, 'Loading\u2026')
+          : React.createElement(React.Fragment, null,
+              // Currently-active voice at the top, read-only.
+              React.createElement('div', { className: 'bg-gray-50 rounded-lg p-3 text-sm' },
+                React.createElement('div', { className: 'text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1' }, 'Currently using'),
+                React.createElement('div', { className: 'font-mono text-gray-800' }, data?.resolved?.voice || '\u2014'),
+                React.createElement('div', { className: 'text-xs text-gray-500 mt-1' },
+                  'Tier: ', React.createElement('span', { className: 'font-mono' }, data?.resolved?.tier || 'legacy'),
+                  ' \u00b7 Speed: ', React.createElement('span', { className: 'font-mono' }, String(data?.resolved?.speed ?? '-'))
+                )
+              ),
+              // The override input itself. Datalist suggests known voices
+              // but any string xAI accepts will work.
+              React.createElement('div', null,
+                React.createElement('label', { className: 'block text-sm font-semibold text-gray-700 mb-1' }, 'Override voice name'),
+                React.createElement('input', {
+                  type: 'text',
+                  list: 'voice-modal-known-voices',
+                  value: draftVoice,
+                  onChange: e => setDraftVoice(e.target.value),
+                  placeholder: 'e.g. eve, rock',
+                  className: 'w-full border border-gray-300 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-golf-500',
+                  maxLength: 64,
+                  disabled: saving
+                }),
+                React.createElement('datalist', { id: 'voice-modal-known-voices' },
+                  (data?.known_voices || []).map(v =>
+                    React.createElement('option', { key: v.name, value: v.name }, v.label)
+                  )
+                ),
+                React.createElement('p', { className: 'text-xs text-gray-500 mt-1' },
+                  'Leave the value untouched and press Clear override to fall back to the tier default.'
+                )
+              ),
+              error && React.createElement('div', { className: 'text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2' }, error)
+            )
+      ),
+      React.createElement('div', { className: 'px-6 py-3 border-t bg-gray-50 flex items-center justify-between gap-2' },
+        React.createElement('button', {
+          onClick: () => handleSave(true),
+          disabled: saving || loading || !data?.raw?.voice,
+          className: 'text-sm font-semibold text-gray-600 hover:text-gray-900 disabled:text-gray-300'
+        }, 'Clear override'),
+        React.createElement('div', { className: 'flex gap-2' },
+          React.createElement('button', {
+            onClick: onClose,
+            className: 'bg-gray-200 hover:bg-gray-300 text-gray-800 px-4 py-2 rounded-lg text-sm font-semibold'
+          }, 'Cancel'),
+          React.createElement('button', {
+            onClick: () => handleSave(false),
+            disabled: saving || loading || !(draftVoice || '').trim(),
+            className: 'bg-golf-700 hover:bg-golf-800 text-white px-4 py-2 rounded-lg text-sm font-semibold disabled:opacity-50'
+          }, saving ? 'Saving\u2026' : 'Save')
+        )
+      )
+    )
+  );
+}
+
+// ============================================
 // SUPER ADMIN DASHBOARD
 // ============================================
 // Cross-tenant overview for platform operators. Renders the business grid
@@ -3082,6 +3224,7 @@ function SuperAdminDashboard({ onSwitchInto, onBusinessCreated }) {
   const [lastCreated, setLastCreated] = useState(null);
   const [search, setSearch] = useState('');
   const [phoneModalBiz, setPhoneModalBiz] = useState(null);
+  const [voiceModalBiz, setVoiceModalBiz] = useState(null);
   const [editBiz, setEditBiz] = useState(null);
   const [deleteBiz, setDeleteBiz] = useState(null);
   const [analytics, setAnalytics] = useState(null);
@@ -3350,6 +3493,7 @@ function SuperAdminDashboard({ onSwitchInto, onBusinessCreated }) {
             business: b,
             onActAs: onSwitchInto,
             onManagePhones: setPhoneModalBiz,
+            onManageVoice: setVoiceModalBiz,
             onEdit: setEditBiz,
             onDelete: setDeleteBiz
           })
@@ -3377,6 +3521,12 @@ function SuperAdminDashboard({ onSwitchInto, onBusinessCreated }) {
       // card without a page reload.
       onSaved: refresh,
       onClose: () => setPhoneModalBiz(null)
+    }),
+
+    voiceModalBiz && React.createElement(VoiceModal, {
+      business: voiceModalBiz,
+      onSaved: refresh,
+      onClose: () => setVoiceModalBiz(null)
     }),
 
     editBiz && React.createElement(EditTenantModal, {

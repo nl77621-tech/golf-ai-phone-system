@@ -48,7 +48,9 @@ const {
   isTierAllowedOnPlan,
   getTier: getVoiceTier,
   DEFAULT_TIER: DEFAULT_VOICE_TIER,
-  PLAN_TIER_ACCESS
+  PLAN_TIER_ACCESS,
+  listKnownVoices,
+  resolveVoiceConfigFromSettings
 } = require('../services/voice-tiers');
 const { logEventFromReq, listAuditEvents } = require('../services/audit-log');
 const {
@@ -887,6 +889,114 @@ router.get('/voice-tiers', (req, res) => {
   } catch (err) {
     console.error('[super] list voice-tiers error:', err.message);
     res.status(500).json({ error: 'Failed to list voice tiers' });
+  }
+});
+
+// -------------- GET /api/super/businesses/:id/voice --------------
+//
+// Returns the tenant's resolved voice config (tier, model, voice, speed),
+// the raw settings.voice_config row (so the UI can tell a tier-based
+// selection apart from an explicit override), and the list of known xAI
+// voice names the dropdown should suggest.
+router.get('/businesses/:id/voice', async (req, res) => {
+  const businessId = Number(req.params.id);
+  if (!Number.isFinite(businessId) || businessId <= 0) {
+    return res.status(400).json({ error: 'Invalid business id' });
+  }
+  try {
+    const row = await query(
+      `SELECT value FROM settings WHERE business_id = $1 AND key = 'voice_config' LIMIT 1`,
+      [businessId]
+    );
+    const raw = row.rows[0]?.value || null;
+    const resolved = resolveVoiceConfigFromSettings(raw);
+    res.json({
+      raw,
+      resolved,
+      known_voices: listKnownVoices()
+    });
+  } catch (err) {
+    console.error(`[super] get voice for business ${businessId}:`, err.message);
+    res.status(500).json({ error: 'Failed to load voice config' });
+  }
+});
+
+// -------------- PATCH /api/super/businesses/:id/voice --------------
+//
+// Super-admin-only override for the xAI voice name. Merges into any existing
+// voice_config (so a tier selected at onboarding is preserved — only the
+// `voice` field is pinned). Pass `voice: null` to clear the override and
+// fall back to the tier's default voice or the legacy value.
+//
+// Body: { voice: string | null }
+//
+// We deliberately accept a free-form string rather than validating against
+// KNOWN_VOICES so that a new voice xAI ships tomorrow can be used today
+// without a code deploy. The dropdown on the UI side still suggests the
+// curated list.
+router.patch('/businesses/:id/voice', async (req, res) => {
+  const businessId = Number(req.params.id);
+  if (!Number.isFinite(businessId) || businessId <= 0) {
+    return res.status(400).json({ error: 'Invalid business id' });
+  }
+
+  const hasVoice = Object.prototype.hasOwnProperty.call(req.body || {}, 'voice');
+  if (!hasVoice) {
+    return res.status(400).json({ error: 'Missing `voice` field (pass a string or null)' });
+  }
+  const incoming = req.body.voice;
+  let nextVoice = null;
+  if (incoming !== null && incoming !== undefined && incoming !== '') {
+    if (typeof incoming !== 'string') {
+      return res.status(400).json({ error: '`voice` must be a string or null' });
+    }
+    const trimmed = incoming.trim();
+    if (!trimmed) {
+      return res.status(400).json({ error: '`voice` cannot be blank (pass null to clear)' });
+    }
+    if (trimmed.length > 64 || !/^[a-zA-Z0-9_\-. ]+$/.test(trimmed)) {
+      return res.status(400).json({
+        error: '`voice` must be <=64 chars and alphanumeric/underscore/hyphen/dot/space'
+      });
+    }
+    nextVoice = trimmed;
+  }
+
+  try {
+    // Read the existing voice_config so we can merge rather than overwrite.
+    const existing = await query(
+      `SELECT value FROM settings WHERE business_id = $1 AND key = 'voice_config' LIMIT 1`,
+      [businessId]
+    );
+    const prev = existing.rows[0]?.value || {};
+    const nextConfig = { ...(typeof prev === 'object' && prev ? prev : {}) };
+    if (nextVoice === null) {
+      delete nextConfig.voice;
+    } else {
+      nextConfig.voice = nextVoice;
+    }
+
+    await query(
+      `INSERT INTO settings (business_id, key, value, description)
+       VALUES ($1, 'voice_config', $2::jsonb,
+               'Voice tier + optional explicit overrides — managed by Super Admin')
+       ON CONFLICT (business_id, key) DO UPDATE
+       SET value = EXCLUDED.value, updated_at = NOW()`,
+      [businessId, JSON.stringify(nextConfig)]
+    );
+
+    const resolved = resolveVoiceConfigFromSettings(nextConfig);
+
+    logEventFromReq(req, 'voice.updated', {
+      business_id: businessId,
+      voice: nextVoice,
+      cleared: nextVoice === null
+    });
+
+    res.json({ raw: nextConfig, resolved });
+  } catch (err) {
+    console.error(`[super] patch voice for business ${businessId}:`, err.message);
+    res.status(500).json({ error: 'Failed to update voice' });
   }
 });
 

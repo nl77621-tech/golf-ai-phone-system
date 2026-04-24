@@ -85,7 +85,14 @@ async function api(path, options = {}) {
   }
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: 'Request failed' }));
-    throw new Error(err.error || 'Request failed');
+    // Surface the full server payload (status + JSON body) on the thrown
+    // Error so callers can read structured fields like `step`, `field`, or
+    // `constraint`. Existing callers that only read err.message are
+    // unaffected — the attached `status`/`body` properties are extras.
+    const thrown = new Error(err.error || 'Request failed');
+    thrown.status = res.status;
+    thrown.body = err;
+    throw thrown;
   }
   return res.json();
 }
@@ -3829,6 +3836,13 @@ function OnboardingWizard({ onCancel, onCreated, onActAs, mode = 'business', ini
       setStep(6);
     } catch (err) {
       setError(err.message || 'Failed to create business');
+      // When the server tells us which step to fix (slug collision → step 1,
+      // phone-number collision → step 2), jump there automatically so the
+      // operator isn't stuck clicking Back 4 times from the invite step.
+      const jumpTo = err?.body?.step;
+      if (Number.isInteger(jumpTo) && jumpTo >= 0 && jumpTo < 5) {
+        setStep(jumpTo);
+      }
     } finally {
       setSaving(false);
     }

@@ -525,8 +525,42 @@ router.post('/businesses', async (req, res) => {
     await client.query('ROLLBACK').catch(() => {});
     console.error('[super] create business error:', err.message);
     if (err.code === '23505') {
-      // slug / phone number unique violation
-      return res.status(409).json({ error: 'slug or one of the phone numbers is already in use' });
+      // Unique violation. Parse err.detail / err.constraint to tell the
+      // operator exactly which field collided — the generic "slug or one of
+      // the phone numbers is already in use" message leaves them with no
+      // idea where to go back and fix. err.detail from pg looks like:
+      //   "Key (slug)=(nelson-lopes-12) already exists."
+      //   "Key (phone_number)=(+12893011452) already exists."
+      const detail = typeof err.detail === 'string' ? err.detail : '';
+      const match = detail.match(/Key \(([^)]+)\)=\(([^)]+)\)/);
+      const col = match?.[1];
+      const value = match?.[2];
+
+      let friendly = 'Slug or one of the phone numbers is already in use.';
+      let field = null;
+      let step = null;
+      if (col === 'slug') {
+        friendly = `The slug "${value}" is already taken by another tenant. Go back to step 1 and pick a different one.`;
+        field = 'slug';
+        step = 0;
+      } else if (col === 'phone_number' || err.constraint === 'business_phone_numbers_phone_number_key' ||
+                 err.constraint === 'businesses_twilio_phone_number_key' || col === 'twilio_phone_number') {
+        friendly = value
+          ? `The phone number "${value}" is already assigned to another tenant. Go back to step 2 and remove it (or leave it blank and assign it later from the business card).`
+          : 'One of the phone numbers is already assigned to another tenant. Go back to step 2 and change it.';
+        field = 'phone_number';
+        step = 1;
+      } else if (col) {
+        friendly = `The value "${value}" collides with an existing tenant on column "${col}".`;
+      }
+
+      return res.status(409).json({
+        error: friendly,
+        field,
+        step,
+        constraint: err.constraint || null,
+        detail: detail || null
+      });
     }
     res.status(500).json({ error: err.message || 'Failed to create business' });
   } finally {
@@ -719,6 +753,31 @@ router.delete('/businesses/:id', async (req, res) => {
       });
     }
 
+    // Snapshot the phone numbers BEFORE we release them — they go into
+    // the audit-log meta so the `business.deleted` event is self-describing
+    // and a future "restore + reattach numbers" flow has something to read.
+    const phoneSnapshot = await query(
+      `SELECT id, phone_number, label, is_primary, status
+         FROM business_phone_numbers
+        WHERE business_id = $1
+        ORDER BY is_primary DESC, id`,
+      [id]
+    );
+    const releasedNumbers = phoneSnapshot.rows.map(r => ({
+      phone_number: r.phone_number,
+      label: r.label,
+      is_primary: r.is_primary,
+      status: r.status
+    }));
+    if (biz.twilio_phone_number && !releasedNumbers.some(n => n.phone_number === biz.twilio_phone_number)) {
+      releasedNumbers.push({
+        phone_number: biz.twilio_phone_number,
+        label: 'Main Line (denormalized on businesses row)',
+        is_primary: true,
+        status: 'active'
+      });
+    }
+
     // Audit FIRST so the event is attached to a live business_id
     // (audit_log FKs to businesses with ON DELETE CASCADE — not an issue
     // for soft delete, but this ordering matches the pattern we'd need
@@ -734,7 +793,12 @@ router.delete('/businesses/:id', async (req, res) => {
         plan: biz.plan,
         template_key: biz.template_key,
         soft: true,
-        actor_super_admin_id: actorId
+        actor_super_admin_id: actorId,
+        // Phone numbers are released on soft-delete (see below) so the
+        // operator can reuse the DIDs on a new tenant. Archiving them here
+        // preserves the routing history for forensics / accidental-delete
+        // recovery.
+        released_phone_numbers: releasedNumbers
       }
     });
 
@@ -744,6 +808,11 @@ router.delete('/businesses/:id', async (req, res) => {
               deleted_by_user_id = $1,
               is_active = FALSE,
               status = 'deleted',
+              -- Null out the denormalized primary number so the unique
+              -- index on businesses.twilio_phone_number frees that DID up
+              -- for the next tenant. The original value is captured in
+              -- the audit meta above for restore.
+              twilio_phone_number = NULL,
               updated_at = NOW()
         WHERE id = $2
           AND deleted_at IS NULL
@@ -756,11 +825,143 @@ router.delete('/businesses/:id', async (req, res) => {
       return res.status(409).json({ error: 'Business was deleted concurrently' });
     }
 
-    console.log(`[super] Soft-deleted business ${id} (${biz.slug}) by user=${actorId}`);
-    res.json({ business: rows[0], deleted: true });
+    // Release the phone numbers. business_phone_numbers has the globally
+    // unique constraint on phone_number that was blocking re-use; a hard
+    // DELETE here frees it up. If the operator restores the tenant, the
+    // phone numbers from the audit meta can be reattached via the existing
+    // phone-numbers endpoints (or re-entered manually — the history lives
+    // in the audit log either way).
+    if (releasedNumbers.length > 0) {
+      await query(
+        `DELETE FROM business_phone_numbers WHERE business_id = $1`,
+        [id]
+      );
+    }
+
+    console.log(`[super] Soft-deleted business ${id} (${biz.slug}) by user=${actorId}; released ${releasedNumbers.length} phone number(s)`);
+    res.json({
+      business: rows[0],
+      deleted: true,
+      released_phone_numbers: releasedNumbers
+    });
   } catch (err) {
     console.error('[super] delete business error:', err.message);
     res.status(500).json({ error: err.message || 'Failed to delete business' });
+  }
+});
+
+// -------------- POST /api/super/phone-numbers/reclaim-orphaned --------------
+//
+// One-time cleanup for tenants soft-deleted BEFORE the delete handler
+// learned to release their phone numbers (see the DELETE /businesses/:id
+// handler above). Finds every business_phone_numbers row (and every
+// businesses.twilio_phone_number value) still attached to a deleted_at
+// tenant and clears them so the DIDs can be reused.
+//
+// Idempotent — if run again, the second call sees nothing to reclaim and
+// returns an empty list. Writes one audit event per tenant it touches so
+// the history is reconstructable.
+router.post('/phone-numbers/reclaim-orphaned', async (req, res) => {
+  try {
+    // Dry-run support: pass ?dry_run=1 to preview what would be reclaimed
+    // without writing. Ops-only escape hatch; the UI can call it first to
+    // show a "this will free up X numbers on Y tenants" confirmation.
+    const dryRun = String(req.query.dry_run || '').trim() === '1';
+
+    const orphans = await query(
+      `SELECT bpn.id            AS row_id,
+              bpn.business_id   AS business_id,
+              bpn.phone_number  AS phone_number,
+              bpn.label         AS label,
+              bpn.is_primary    AS is_primary,
+              b.slug            AS slug,
+              b.name            AS name
+         FROM business_phone_numbers bpn
+         JOIN businesses b ON b.id = bpn.business_id
+        WHERE b.deleted_at IS NOT NULL
+        ORDER BY bpn.business_id, bpn.id`
+    );
+    const denormalized = await query(
+      `SELECT id, slug, name, twilio_phone_number
+         FROM businesses
+        WHERE deleted_at IS NOT NULL
+          AND twilio_phone_number IS NOT NULL`
+    );
+
+    if (dryRun) {
+      return res.json({
+        dry_run: true,
+        orphan_phone_rows: orphans.rows,
+        orphan_denormalized_twilio_numbers: denormalized.rows,
+        total: orphans.rows.length + denormalized.rows.length
+      });
+    }
+
+    // Group orphans by business so the audit log gets one event per tenant
+    // (rather than one event per phone number).
+    const byBiz = new Map();
+    for (const r of orphans.rows) {
+      if (!byBiz.has(r.business_id)) byBiz.set(r.business_id, { slug: r.slug, name: r.name, numbers: [] });
+      byBiz.get(r.business_id).numbers.push({
+        phone_number: r.phone_number,
+        label: r.label,
+        is_primary: r.is_primary
+      });
+    }
+    for (const r of denormalized.rows) {
+      if (!byBiz.has(r.id)) byBiz.set(r.id, { slug: r.slug, name: r.name, numbers: [] });
+      if (!byBiz.get(r.id).numbers.some(n => n.phone_number === r.twilio_phone_number)) {
+        byBiz.get(r.id).numbers.push({
+          phone_number: r.twilio_phone_number,
+          label: 'Main Line (denormalized on businesses row)',
+          is_primary: true
+        });
+      }
+    }
+
+    if (orphans.rows.length > 0) {
+      await query(
+        `DELETE FROM business_phone_numbers
+          WHERE business_id IN (
+            SELECT id FROM businesses WHERE deleted_at IS NOT NULL
+          )`
+      );
+    }
+    if (denormalized.rows.length > 0) {
+      await query(
+        `UPDATE businesses
+            SET twilio_phone_number = NULL, updated_at = NOW()
+          WHERE deleted_at IS NOT NULL
+            AND twilio_phone_number IS NOT NULL`
+      );
+    }
+
+    for (const [businessId, info] of byBiz.entries()) {
+      await logEventFromReq(req, {
+        businessId,
+        action: 'phone_numbers.reclaimed_orphaned',
+        targetType: 'business',
+        targetId: businessId,
+        meta: {
+          slug: info.slug,
+          name: info.name,
+          reclaimed_numbers: info.numbers,
+          source: 'reclaim-orphaned endpoint'
+        }
+      });
+    }
+
+    res.json({
+      reclaimed: true,
+      tenants_touched: byBiz.size,
+      total_numbers: orphans.rows.length + denormalized.rows.length,
+      by_tenant: Array.from(byBiz.entries()).map(([id, v]) => ({
+        business_id: id, slug: v.slug, name: v.name, numbers: v.numbers
+      }))
+    });
+  } catch (err) {
+    console.error('[super] reclaim-orphaned error:', err.message);
+    res.status(500).json({ error: err.message || 'Failed to reclaim orphaned phone numbers' });
   }
 });
 

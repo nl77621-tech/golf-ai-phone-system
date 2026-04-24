@@ -303,20 +303,19 @@ router.post('/businesses', async (req, res) => {
     ? b.assistant_name.trim().slice(0, 40)
     : '';
 
-  // Voice tier — per-tenant (model, voice, speed) choice. Plan-gated so a
-  // `free` tenant can't select premium. If the caller doesn't supply one, we
-  // fall back to the platform default (standard). Validation happens up-front
-  // so an invalid tier returns 400 before we open a DB connection.
+  // Voice tier — per-tenant (model, voice, speed) choice. This entire
+  // router is behind `requireSuperAdmin`, so plan-vs-tier gating here would
+  // only be checking the super-admin's choices against themselves — not a
+  // real authorisation boundary. The operator deliberately picking a
+  // premium voice for a starter-plan tenant is a legitimate provisioning
+  // action, so we only enforce the catalog check (unknown tier = 400).
+  // When self-serve ships, a customer-facing route will need its own
+  // plan-vs-tier check via isTierAllowedOnPlan; that helper stays exported
+  // from voice-tiers.js for exactly that purpose.
   const rawVoiceTier = typeof b.voice_tier === 'string' ? b.voice_tier.trim().toLowerCase() : '';
   const voiceTier = rawVoiceTier || DEFAULT_VOICE_TIER;
   if (!getVoiceTier(voiceTier)) {
     return res.status(400).json({ error: `Unknown voice tier '${voiceTier}'` });
-  }
-  if (!isTierAllowedOnPlan(plan, voiceTier)) {
-    return res.status(400).json({
-      error: `Voice tier '${voiceTier}' is not available on plan '${plan}'`,
-      allowed_tiers: allowedTiersForPlan(plan)
-    });
   }
 
   // Normalise optional `phone_numbers` array. We always dedupe against the

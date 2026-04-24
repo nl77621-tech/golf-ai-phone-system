@@ -3726,16 +3726,11 @@ function OnboardingWizard({ onCancel, onCreated, onActAs, mode = 'business', ini
       });
   }, []);
 
-  // If the selected plan changes and the current voice tier is no longer
-  // allowed, fall back to the first allowed tier automatically so the review
-  // screen never shows a forbidden combo that would 400 on submit.
-  useEffect(() => {
-    if (!voicePlanAccess || !form.plan) return;
-    const allowed = voicePlanAccess[form.plan] || voicePlanAccess.free || ['standard'];
-    if (!allowed.includes(form.voice_tier)) {
-      set('voice_tier', allowed[0] || 'standard');
-    }
-  }, [form.plan, voicePlanAccess]);
+  // Note: we used to auto-downgrade voice_tier when the plan changed so the
+  // review screen never showed a forbidden combo. With plan-tier gating
+  // dropped for super-admin (the wizard is super-admin-only and the server
+  // handler no longer enforces the combo for this endpoint), any tier is a
+  // valid choice regardless of plan, so the auto-downgrade was removed.
 
   const labelCls = 'block text-xs font-semibold text-gray-600 mb-1';
   const inputCls = 'w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-golf-500 focus:border-transparent outline-none';
@@ -4132,13 +4127,16 @@ function OnboardingWizard({ onCancel, onCreated, onActAs, mode = 'business', ini
   //
   // Dedicated step (was previously crammed at the bottom of renderTemplate,
   // which meant operators who clicked Next without scrolling never saw it and
-  // silently shipped every tenant on the default Standard tier). Keeping it
-  // as its own step guarantees one deliberate decision per business.
+  // silently shipped every tenant on the default Standard tier).
   //
-  // Three cards: Economy / Standard / Premium. Each card shows the tier
-  // label, tagline, and a small "$" cost indicator so the operator can
-  // eyeball relative cost. Tiers the selected plan doesn't unlock render
-  // disabled with a padlock and "Upgrade plan to unlock" copy.
+  // Plan gating was dropped for super-admin contexts: the entire wizard is
+  // behind `requireSuperAdmin`, so the operator deliberately choosing a
+  // premium tier for a starter-plan tenant is a legitimate action, not a
+  // permission escalation. We still render a subtle "self-serve requires
+  // plan X" hint per tier so the operator knows what plan a customer would
+  // need to pick this themselves when self-serve ships. The plan-tier map
+  // is still authoritative server-side for any future non-super-admin
+  // route that lets a customer change their own tier.
   const renderVoice = () => React.createElement('div', { className: 'space-y-4' },
     React.createElement('p', { className: 'text-xs text-gray-500' },
       'Pick the Grok voice the tenant pays for per minute of conversation. You can change this later from the super-admin panel.'),
@@ -4146,46 +4144,43 @@ function OnboardingWizard({ onCancel, onCreated, onActAs, mode = 'business', ini
       ? React.createElement('p', { className: 'text-sm text-gray-500' }, 'Loading voice tiers\u2026')
       : React.createElement('div', { className: 'grid grid-cols-1 md:grid-cols-3 gap-3' },
           voiceTiers.map(tier => {
-            const allowed = (voicePlanAccess[form.plan] || voicePlanAccess.free || ['standard']).includes(tier.key);
             const selected = form.voice_tier === tier.key;
             const costDots = '$'.repeat(tier.cost_tier || 1);
+            // Compute plan-reach purely for the informational badge — the
+            // button itself is never disabled for super-admin.
+            const plansThatInclude = Object.entries(voicePlanAccess || {})
+              .filter(([, tiers]) => Array.isArray(tiers) && tiers.includes(tier.key))
+              .map(([p]) => p)
+              .filter(p => p !== 'legacy'); // legacy = Valleymede-only, not meaningful to operators
             return React.createElement('button', {
               key: tier.key,
               type: 'button',
-              disabled: !allowed,
-              onClick: () => allowed && set('voice_tier', tier.key),
+              onClick: () => set('voice_tier', tier.key),
               className: `text-left rounded-xl border-2 p-3 transition-colors ${
-                !allowed
-                  ? 'border-gray-200 bg-gray-50 cursor-not-allowed opacity-60'
-                  : selected
-                    ? 'border-golf-600 bg-golf-50 ring-2 ring-golf-200'
-                    : 'border-gray-200 hover:border-golf-400 bg-white'
+                selected
+                  ? 'border-golf-600 bg-golf-50 ring-2 ring-golf-200'
+                  : 'border-gray-200 hover:border-golf-400 bg-white'
               }`
             },
               React.createElement('div', { className: 'flex items-start justify-between gap-2 mb-1' },
                 React.createElement('h5', { className: 'font-bold text-gray-800' }, tier.label),
                 React.createElement('span', {
-                  className: `text-[11px] font-bold ${
-                    !allowed ? 'text-gray-400' : selected ? 'text-golf-700' : 'text-gray-500'
-                  }`
+                  className: `text-[11px] font-bold ${selected ? 'text-golf-700' : 'text-gray-500'}`
                 }, costDots)
               ),
               React.createElement('p', { className: 'text-[11px] font-medium text-gray-700 mb-1' }, tier.tagline),
               tier.description && React.createElement('p', { className: 'text-[11px] text-gray-500 leading-snug' }, tier.description),
-              !allowed && React.createElement('p', {
-                className: 'text-[11px] text-amber-700 font-semibold mt-2 flex items-center gap-1'
-              },
-                React.createElement('span', { 'aria-hidden': 'true' }, '\ud83d\udd12'),
-                `Upgrade plan to unlock`
-              ),
-              selected && allowed && React.createElement('span', {
+              plansThatInclude.length > 0 && React.createElement('p', {
+                className: 'text-[11px] text-gray-400 italic mt-2'
+              }, `Self-serve: requires ${plansThatInclude.join(' / ')} plan`),
+              selected && React.createElement('span', {
                 className: 'inline-block text-[11px] font-bold text-golf-700 bg-golf-100 px-1.5 py-0.5 rounded mt-1'
               }, 'Selected')
             );
           })
         ),
     React.createElement('p', { className: 'text-[11px] text-gray-400 italic' },
-      'Tier is gated by the plan you picked on step 1. Greyed-out tiers unlock when the plan is upgraded.')
+      'As super-admin you can pick any tier regardless of plan. The per-plan labels are informational — they\u2019ll gate customer-facing self-serve when that ships.')
   );
 
   const renderReview = () => React.createElement('div', { className: 'space-y-4 text-sm' },

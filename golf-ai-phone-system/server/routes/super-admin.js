@@ -42,6 +42,14 @@ const {
   applyTemplate,
   DEFAULT_TEMPLATE_KEY
 } = require('../services/templates');
+const {
+  listTiers: listVoiceTiers,
+  allowedTiersForPlan,
+  isTierAllowedOnPlan,
+  getTier: getVoiceTier,
+  DEFAULT_TIER: DEFAULT_VOICE_TIER,
+  PLAN_TIER_ACCESS
+} = require('../services/voice-tiers');
 const { logEventFromReq, listAuditEvents } = require('../services/audit-log');
 const {
   grantTrial,
@@ -293,6 +301,22 @@ router.post('/businesses', async (req, res) => {
     ? b.assistant_name.trim().slice(0, 40)
     : '';
 
+  // Voice tier — per-tenant (model, voice, speed) choice. Plan-gated so a
+  // `free` tenant can't select premium. If the caller doesn't supply one, we
+  // fall back to the platform default (standard). Validation happens up-front
+  // so an invalid tier returns 400 before we open a DB connection.
+  const rawVoiceTier = typeof b.voice_tier === 'string' ? b.voice_tier.trim().toLowerCase() : '';
+  const voiceTier = rawVoiceTier || DEFAULT_VOICE_TIER;
+  if (!getVoiceTier(voiceTier)) {
+    return res.status(400).json({ error: `Unknown voice tier '${voiceTier}'` });
+  }
+  if (!isTierAllowedOnPlan(plan, voiceTier)) {
+    return res.status(400).json({
+      error: `Voice tier '${voiceTier}' is not available on plan '${plan}'`,
+      allowed_tiers: allowedTiersForPlan(plan)
+    });
+  }
+
   // Normalise optional `phone_numbers` array. We always dedupe against the
   // primary Twilio number so the caller can't accidentally register the same
   // DID twice.
@@ -356,6 +380,20 @@ router.post('/businesses', async (req, res) => {
         [assistantName, business.id]
       );
     }
+
+    // 2b2. Persist the wizard's voice-tier choice. applyTemplate seeded
+    //      `voice_config = { tier: 'standard' }` already; we overwrite it
+    //      with the caller-selected tier (already validated above). grok-voice.js
+    //      reads this row on every new call via resolveVoiceConfigFromSettings.
+    await client.query(
+      `INSERT INTO settings (business_id, key, value, description)
+       VALUES ($1, 'voice_config', $2::jsonb,
+               'Voice tier — economy | standard | premium')
+       ON CONFLICT (business_id, key) DO UPDATE
+         SET value = EXCLUDED.value,
+             updated_at = NOW()`,
+      [business.id, JSON.stringify({ tier: voiceTier })]
+    );
 
     // 2c. Phase 7a — free trial grant. Every new tenant starts with
     //     TRIAL_SECONDS (1h) of credit + a TRIAL_DAYS (14d) wall-clock
@@ -440,11 +478,12 @@ router.post('/businesses', async (req, res) => {
             seconds: trialGrant.granted ? (trialGrant.balanceAfter || TRIAL_SECONDS) : 0,
             expires_at: trialGrant.trialExpiresAt || null
           }
-        : null
+        : null,
+      voice: { tier: voiceTier }
     };
     console.log(
       `[super] Created business ${business.id} (${slug}) name="${name}" ` +
-      `template=${templateSummary?.template_key} phones=${phoneRows.length}`
+      `template=${templateSummary?.template_key} phones=${phoneRows.length} voice_tier=${voiceTier}`
     );
     // Audit — one event per created resource so the feed is useful at a glance.
     await logEventFromReq(req, {
@@ -462,7 +501,8 @@ router.post('/businesses', async (req, res) => {
         invite_created: !!inviteRow,
         invite_email: inviteRow ? inviteRow.email : null,
         trial_granted: !!(trialGrant && trialGrant.granted),
-        trial_expires_at: trialGrant && trialGrant.trialExpiresAt ? trialGrant.trialExpiresAt : null
+        trial_expires_at: trialGrant && trialGrant.trialExpiresAt ? trialGrant.trialExpiresAt : null,
+        voice_tier: voiceTier
       }
     });
     if (inviteRow) {
@@ -825,6 +865,28 @@ router.get('/templates', (req, res) => {
   } catch (err) {
     console.error('[super] list templates error:', err.message);
     res.status(500).json({ error: 'Failed to list templates' });
+  }
+});
+
+// -------------- GET /api/super/voice-tiers --------------
+// Catalog of voice tiers (Economy / Standard / Premium) plus the plan→tier
+// access map. The onboarding wizard uses this to render three cards — with
+// tiers the selected plan doesn't unlock grayed-out ("Upgrade plan to use").
+// `?include_hidden=1` lets the super-admin UI surface placeholder tiers
+// (ones whose model/voice IDs haven't been verified yet) so ops can still
+// pin them manually.
+router.get('/voice-tiers', (req, res) => {
+  try {
+    const includeHidden =
+      req.query.include_hidden === '1' || req.query.include_hidden === 'true';
+    res.json({
+      default_tier: DEFAULT_VOICE_TIER,
+      tiers: listVoiceTiers({ includeHidden }),
+      plan_access: PLAN_TIER_ACCESS
+    });
+  } catch (err) {
+    console.error('[super] list voice-tiers error:', err.message);
+    res.status(500).json({ error: 'Failed to list voice tiers' });
   }
 });
 

@@ -28,11 +28,11 @@ const { getCurrentWeather, getForecast } = require('./weather');
 const { query, getSetting, getBusinessById } = require('../config/database');
 const { requireBusinessId } = require('../context/tenant-context');
 const { recordCallUsage } = require('./credits');
+const { resolveVoiceConfigFromSettings } = require('./voice-tiers');
 const teeon = require('./teeon-automation');
 require('dotenv').config();
 
 const GROK_REALTIME_URL = 'wss://api.x.ai/v1/realtime';
-const GROK_MODEL = 'grok-4.20-latest';
 
 // ─── Audio conversion ────────────────────────────────────────────────────────
 
@@ -272,8 +272,28 @@ ${callerLine}
 
   const tools = buildToolDefinitions();
 
+  // ─── Per-tenant voice tier resolution ──────────────────────────────────────
+  //
+  // Resolve the (model, voice, speed) triple this tenant should use. If the
+  // `voice_config` settings row is missing (e.g. Valleymede during rollout)
+  // resolveVoiceConfigFromSettings returns LEGACY_FALLBACK exactly — same
+  // model/voice/speed as the hard-coded values prior to this file.
+  let voiceCfg;
+  try {
+    const rawVoiceConfig = await getSetting(businessId, 'voice_config').catch(() => null);
+    voiceCfg = resolveVoiceConfigFromSettings(rawVoiceConfig);
+  } catch (err) {
+    console.warn(`[tenant:${businessId}][${callSid}] voice_config lookup failed, using legacy fallback:`, err.message);
+    voiceCfg = resolveVoiceConfigFromSettings(null);
+  }
+  console.log(`[tenant:${businessId}][${callSid}] Voice tier: ${voiceCfg.tier || 'legacy'} | model=${voiceCfg.model} voice=${voiceCfg.voice} speed=${voiceCfg.speed}`);
+
+  // xAI realtime mirrors the OpenAI realtime convention of taking `model` as a
+  // query string on the WebSocket URL. Encode defensively.
+  const grokUrl = `${GROK_REALTIME_URL}?model=${encodeURIComponent(voiceCfg.model)}`;
+
   // Connect to Grok Real-time Voice API
-  const grokWs = new WebSocket(GROK_REALTIME_URL, {
+  const grokWs = new WebSocket(grokUrl, {
     headers: {
       'Authorization': `Bearer ${process.env.XAI_API_KEY}`,
       'Content-Type': 'application/json'
@@ -311,8 +331,8 @@ ${callerLine}
       session: {
         modalities: ['text', 'audio'],
         instructions: systemPrompt,
-        voice: 'eve',
-        speed: 1.15,
+        voice: voiceCfg.voice,
+        speed: voiceCfg.speed,
         input_audio_format: 'pcm16',
         output_audio_format: 'pcm16',
         turn_detection: {

@@ -121,7 +121,8 @@ const GOLF_COURSE = {
     }), 'AI voice agent personality and behavior settings'],
     ['announcements', [], 'Active announcements the AI should mention'],
     ['booking_settings', { require_credit_card: false }, 'Booking behavior settings'],
-    ['test_mode', { enabled: false, test_phone: '' }, 'Test phone number configuration']
+    ['test_mode', { enabled: false, test_phone: '' }, 'Test phone number configuration'],
+    ['voice_config', { tier: 'standard' }, 'Voice tier — economy | standard | premium (wizard overrides this)']
   ],
   greetings: [
     ['Thanks for calling! How can I help you today?', false],
@@ -191,7 +192,8 @@ const DRIVING_RANGE = {
     }), 'AI voice agent personality and behavior settings'],
     ['announcements', [], 'Active announcements the AI should mention'],
     ['booking_settings', { require_credit_card: false }, 'Booking behavior settings'],
-    ['test_mode', { enabled: false, test_phone: '' }, 'Test phone number configuration']
+    ['test_mode', { enabled: false, test_phone: '' }, 'Test phone number configuration'],
+    ['voice_config', { tier: 'standard' }, 'Voice tier — economy | standard | premium (wizard overrides this)']
   ],
   greetings: [
     ['Thanks for calling! How can I help you today?', false],
@@ -252,7 +254,8 @@ const RESTAURANT = {
     }), 'AI voice agent personality and behavior settings'],
     ['announcements', [], 'Active announcements the AI should mention'],
     ['booking_settings', { require_credit_card: false }, 'Reservation behavior settings'],
-    ['test_mode', { enabled: false, test_phone: '' }, 'Test phone number configuration']
+    ['test_mode', { enabled: false, test_phone: '' }, 'Test phone number configuration'],
+    ['voice_config', { tier: 'standard' }, 'Voice tier — economy | standard | premium (wizard overrides this)']
   ],
   greetings: [
     ['Thanks for calling! Would you like to make a reservation?', false],
@@ -366,7 +369,8 @@ const PERSONAL_ASSISTANT = {
     }), 'AI voice agent personality \u2014 `name` is customizable per-tenant'],
     ['announcements', [], 'Active announcements the assistant should mention'],
     ['booking_settings', { require_credit_card: false }, 'Appointment booking behavior'],
-    ['test_mode', { enabled: false, test_phone: '' }, 'Test phone number configuration']
+    ['test_mode', { enabled: false, test_phone: '' }, 'Test phone number configuration'],
+    ['voice_config', { tier: 'standard' }, 'Voice tier — economy | standard | premium (wizard overrides this)']
   ],
   greetings: [
     ['Hi, thanks for calling. How can I help?', false],
@@ -399,7 +403,8 @@ const GENERIC = {
     ['ai_personality', personality(), 'AI voice agent personality and behavior settings'],
     ['announcements', [], 'Active announcements the AI should mention'],
     ['booking_settings', { require_credit_card: false }, 'Booking behavior settings'],
-    ['test_mode', { enabled: false, test_phone: '' }, 'Test phone number configuration']
+    ['test_mode', { enabled: false, test_phone: '' }, 'Test phone number configuration'],
+    ['voice_config', { tier: 'standard' }, 'Voice tier — economy | standard | premium (wizard overrides this)']
   ],
   greetings: [
     ['Hi there! Thanks for calling. How can I help you today?', false],

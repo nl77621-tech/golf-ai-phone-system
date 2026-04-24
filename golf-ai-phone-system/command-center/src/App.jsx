@@ -3441,6 +3441,11 @@ function OnboardingWizard({ onCancel, onCreated, onActAs, mode = 'business', ini
   const [error, setError] = useState('');
   const [templates, setTemplates] = useState([]);
   const [loadingTemplates, setLoadingTemplates] = useState(true);
+  // Voice tier catalog — loaded alongside templates. The picker rendered in
+  // the Template step reads from `voiceTiers` and greys out anything that
+  // isn't in `voicePlanAccess[form.plan]`.
+  const [voiceTiers, setVoiceTiers] = useState([]);
+  const [voicePlanAccess, setVoicePlanAccess] = useState({});
   const [result, setResult] = useState(null);
   const [form, setForm] = useState({
     name: '',
@@ -3460,7 +3465,13 @@ function OnboardingWizard({ onCancel, onCreated, onActAs, mode = 'business', ini
     // Personal Assistant-only: the voice-facing name of the assistant.
     // Harmless empty string for other templates — the backend ignores
     // assistant_name unless template_key === 'personal_assistant'.
-    assistant_name: ''
+    assistant_name: '',
+    // Per-tenant voice tier. Defaults to 'standard' — the wizard offers
+    // Economy/Standard/Premium cards on the Template step. Plan-gated:
+    // `free`/`starter` only unlock economy+standard; `pro`/`trial` unlock
+    // premium as well. The server validates on POST, so a stale UI state
+    // can't slip through.
+    voice_tier: 'standard'
   });
 
   // Live slug-availability state, driven by /api/super/slug-check.
@@ -3532,7 +3543,38 @@ function OnboardingWizard({ onCancel, onCreated, onActAs, mode = 'business', ini
         ]);
       })
       .finally(() => setLoadingTemplates(false));
+    // Fetch voice tier catalog. If the endpoint is unreachable (older server,
+    // offline preview) we still render the picker with a minimal hardcoded
+    // list so the wizard never hard-fails — the server-side validator is
+    // always the source of truth.
+    api('/api/super/voice-tiers')
+      .then(d => {
+        setVoiceTiers(Array.isArray(d.tiers) ? d.tiers : []);
+        setVoicePlanAccess(d.plan_access || {});
+      })
+      .catch(() => {
+        setVoiceTiers([
+          { key: 'standard', label: 'Standard', tagline: 'Balanced quality and cost.', description: 'Natural-sounding voice, fast responses, predictable cost.', cost_tier: 2, placeholder: false },
+          { key: 'premium', label: 'Premium', tagline: 'xAI\u2019s newest voice — richer, more expressive.', description: 'Grok Think Fast 1.0 with the new Rock voice.', cost_tier: 3, placeholder: false }
+        ]);
+        setVoicePlanAccess({
+          free: ['standard'], starter: ['standard'],
+          pro: ['standard', 'premium'], trial: ['standard', 'premium'],
+          legacy: ['standard', 'premium']
+        });
+      });
   }, []);
+
+  // If the selected plan changes and the current voice tier is no longer
+  // allowed, fall back to the first allowed tier automatically so the review
+  // screen never shows a forbidden combo that would 400 on submit.
+  useEffect(() => {
+    if (!voicePlanAccess || !form.plan) return;
+    const allowed = voicePlanAccess[form.plan] || voicePlanAccess.free || ['standard'];
+    if (!allowed.includes(form.voice_tier)) {
+      set('voice_tier', allowed[0] || 'standard');
+    }
+  }, [form.plan, voicePlanAccess]);
 
   const labelCls = 'block text-xs font-semibold text-gray-600 mb-1';
   const inputCls = 'w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-golf-500 focus:border-transparent outline-none';
@@ -3611,7 +3653,11 @@ function OnboardingWizard({ onCancel, onCreated, onActAs, mode = 'business', ini
           // Only meaningful when template_key === 'personal_assistant'; the
           // backend defensively ignores it otherwise. Empty string is fine —
           // the server treats blanks as "use template default".
-          assistant_name: (form.assistant_name || '').trim()
+          assistant_name: (form.assistant_name || '').trim(),
+          // Voice tier — validated server-side against the plan. The useEffect
+          // above keeps this in sync with the selected plan so a premium tier
+          // never goes out on a plan that doesn't allow it.
+          voice_tier: form.voice_tier || 'standard'
         })
       });
       setResult(resp);
@@ -3909,6 +3955,57 @@ function OnboardingWizard({ onCancel, onCreated, onActAs, mode = 'business', ini
         value: form.assistant_name || '',
         onChange: (e) => set('assistant_name', e.target.value)
       })
+    ),
+    // ─── Voice tier picker ───────────────────────────────────────────────
+    //
+    // Three cards: Economy / Standard / Premium. Each card shows the tier
+    // label, tagline, and a small "$" cost indicator so the operator can
+    // eyeball relative cost. Tiers the selected plan doesn't unlock render
+    // disabled with a padlock and "Upgrade plan to unlock" copy.
+    voiceTiers.length > 0 && React.createElement('div', { className: 'mt-6' },
+      React.createElement('h4', { className: 'text-sm font-semibold text-gray-800 mb-1' }, 'Voice tier'),
+      React.createElement('p', { className: 'text-xs text-gray-500 mb-3' },
+        'Pick the Grok voice the tenant pays for per minute of conversation. You can change this later from the super-admin panel.'),
+      React.createElement('div', { className: 'grid grid-cols-1 md:grid-cols-3 gap-3' },
+        voiceTiers.map(tier => {
+          const allowed = (voicePlanAccess[form.plan] || voicePlanAccess.free || ['standard']).includes(tier.key);
+          const selected = form.voice_tier === tier.key;
+          const costDots = '$'.repeat(tier.cost_tier || 1);
+          return React.createElement('button', {
+            key: tier.key,
+            type: 'button',
+            disabled: !allowed,
+            onClick: () => allowed && set('voice_tier', tier.key),
+            className: `text-left rounded-xl border-2 p-3 transition-colors ${
+              !allowed
+                ? 'border-gray-200 bg-gray-50 cursor-not-allowed opacity-60'
+                : selected
+                  ? 'border-golf-600 bg-golf-50 ring-2 ring-golf-200'
+                  : 'border-gray-200 hover:border-golf-400 bg-white'
+            }`
+          },
+            React.createElement('div', { className: 'flex items-start justify-between gap-2 mb-1' },
+              React.createElement('h5', { className: 'font-bold text-gray-800' }, tier.label),
+              React.createElement('span', {
+                className: `text-[11px] font-bold ${
+                  !allowed ? 'text-gray-400' : selected ? 'text-golf-700' : 'text-gray-500'
+                }`
+              }, costDots)
+            ),
+            React.createElement('p', { className: 'text-[11px] font-medium text-gray-700 mb-1' }, tier.tagline),
+            tier.description && React.createElement('p', { className: 'text-[11px] text-gray-500 leading-snug' }, tier.description),
+            !allowed && React.createElement('p', {
+              className: 'text-[11px] text-amber-700 font-semibold mt-2 flex items-center gap-1'
+            },
+              React.createElement('span', { 'aria-hidden': 'true' }, '\ud83d\udd12'),
+              `Upgrade plan to unlock`
+            ),
+            selected && allowed && React.createElement('span', {
+              className: 'inline-block text-[11px] font-bold text-golf-700 bg-golf-100 px-1.5 py-0.5 rounded mt-1'
+            }, 'Selected')
+          );
+        })
+      )
     )
   );
 
@@ -3962,6 +4059,15 @@ function OnboardingWizard({ onCancel, onCreated, onActAs, mode = 'business', ini
               )
           )
         : React.createElement('p', { className: 'text-xs text-gray-500' }, 'None selected.')
+    ),
+    React.createElement('div', { className: 'bg-gray-50 border rounded-xl p-4' },
+      React.createElement('h4', { className: 'font-semibold text-gray-800 mb-2' }, 'Voice tier'),
+      React.createElement('p', { className: 'text-sm text-gray-800 capitalize' },
+        (voiceTiers.find(t => t.key === form.voice_tier)?.label) || form.voice_tier || 'Standard'
+      ),
+      React.createElement('p', { className: 'text-xs text-gray-500' },
+        voiceTiers.find(t => t.key === form.voice_tier)?.tagline || ''
+      )
     )
   );
 
@@ -4000,6 +4106,9 @@ function OnboardingWizard({ onCancel, onCreated, onActAs, mode = 'business', ini
       result?.template
         ? `Seeded ${result.template.settings_applied} settings + ${result.template.greetings_applied} greetings from the ${result.template.template_key} template.`
         : 'Tenant created.'
+    ),
+    result?.voice?.tier && React.createElement('p', { className: 'text-xs text-gray-500 mb-4 -mt-3 capitalize' },
+      `Voice tier: ${result.voice.tier}`
     ),
     result?.invite && React.createElement('div', { className: 'bg-green-50 border border-green-200 rounded-xl p-4 text-left mb-4' },
       React.createElement('p', { className: 'text-sm font-semibold text-green-800 mb-2' },

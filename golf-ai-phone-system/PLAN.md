@@ -3,7 +3,7 @@
 > This is the living roadmap for turning the Valleymede-only phone system into a multi-tenant SaaS.
 > Update this file at the end of every phase.
 
-**Status:** Phase 1 locked (2026-04-23). Phase 2 locked (2026-04-23). Phase 3 locked (2026-04-23). Phase 4 locked (2026-04-23). Phase 5 locked (2026-04-23). Phase 6 locked (2026-04-23).
+**Status:** Phase 1 locked (2026-04-23). Phase 2 locked (2026-04-23). Phase 3 locked (2026-04-23). Phase 4 locked (2026-04-23). Phase 5 locked (2026-04-23). Phase 6 locked (2026-04-23). Pre-Phase 7 locked (2026-04-23). Phase 7e — per-tenant voice tiers — implemented (2026-04-24, awaiting review).
 **Golden rule:** Valleymede keeps working at every checkpoint.
 
 ---
@@ -424,6 +424,138 @@ mentions tee times, course info, and pricing; no personal-assistant
 copy leaks in.
 
 **Polish pass locked (2026-04-23).**
+
+---
+
+## Phase 7e — Per-tenant voice tiers (2026-04-24)
+
+Interstitial work inside the Phase 7 bucket. xAI shipped a new realtime
+voice ("Rock" on `grok-think-fast-1.0`) and the user asked for a way to
+pick a voice at onboarding so tenants can pay for the premium model only
+when they want it. Every tenant's call goes through `grok-voice.js` to
+xAI's realtime WebSocket, so the (model, voice, speed) triple is now a
+per-tenant setting rather than a hard-coded constant.
+
+**Design choices (confirmed with the user before implementation):**
+
+- Three named tiers — **Economy**, **Standard**, **Premium**.
+- Plan-gated access: `legacy` → all three, `pro` / `trial` → all three,
+  `free` / `starter` → economy + standard only. Unknown plans fall back
+  to `free`'s entitlements.
+- Tier selection surfaces in the Onboarding Wizard only for this phase.
+  A per-tenant Settings tab is intentionally deferred — a super admin
+  can still hand-edit `settings.voice_config` to override anything the
+  wizard chose.
+- Economy is scaffolded but hidden from the wizard
+  (`placeholder: true`): xAI hasn't published a cheap realtime model at
+  this writing, so Economy falls back to the same strings as Standard
+  until a distinct model ID is verified. Ops can still pin Economy
+  manually via the DB if/when they want.
+- Valleymede must be a no-op: `plan = 'legacy'` grants access to every
+  tier, and `resolveVoiceConfigFromSettings(null)` returns the exact
+  historical triple (`grok-4.20-latest` / `eve` / `1.15`). A Valleymede
+  row without a `voice_config` setting behaves byte-identical to what
+  shipped before this phase.
+
+**Deliverables shipped**
+
+- `server/services/voice-tiers.js` — new single source of truth.
+  Exports: `VOICE_TIERS` catalogue, `DEFAULT_TIER = 'standard'`,
+  `LEGACY_FALLBACK` (frozen), `PLAN_TIER_ACCESS`,
+  `allowedTiersForPlan`, `isTierAllowedOnPlan`, `getTier`,
+  `listTiers({ includeHidden })`, and `resolveVoiceConfigFromSettings`.
+  Resolution order inside `resolveVoiceConfigFromSettings`: explicit
+  `settings.voice_config.{model,voice,speed}` overrides → named tier
+  defaults → legacy fallback. Economy is kept in the catalogue so any
+  DB-level override still resolves; `listTiers()` hides it from the
+  wizard until the `placeholder` flag is flipped.
+- `server/services/grok-voice.js` — before opening the xAI WebSocket,
+  `handleMediaStream` now loads `voice_config` for the tenant, passes
+  it through `resolveVoiceConfigFromSettings`, and injects the
+  resolved (model, voice, speed) into the realtime session. Model is
+  sent via the `?model=` URL query param (matching the
+  OpenAI-realtime convention xAI follows). A per-call log line
+  (`[tenant:…] Voice tier: standard | model=… voice=… speed=…`) makes
+  the runtime cutover observable. If the settings lookup throws, the
+  handler logs a warning and falls back to the legacy triple so a
+  DB blip cannot drop a call.
+- `server/services/templates.js` — every template
+  (`GOLF_COURSE`, `DRIVING_RANGE`, `RESTAURANT`, `PERSONAL_ASSISTANT`,
+  `GENERIC`) now seeds `voice_config: { tier: 'standard' }` as a
+  default, so a tenant created outside the wizard still has a
+  readable tier. The wizard's explicit choice overrides this default
+  via a follow-up `INSERT … ON CONFLICT DO UPDATE` in the onboarding
+  transaction.
+- `server/routes/super-admin.js` — onboarding wizard submit
+  (`POST /businesses`) now accepts `voice_tier` and:
+  1. Validates against `getVoiceTier` (unknown → 400).
+  2. Validates against `isTierAllowedOnPlan(plan, voice_tier)` so a
+     `free` tenant can't be created with Premium (returns
+     `{ error, allowed_tiers }` for the UI to render).
+  3. After `applyTemplate`, UPSERTs
+     `settings.voice_config = { tier: <voice_tier> }` for the new
+     business inside the same transaction.
+  4. Echoes `voice: { tier: voice_tier }` back in the response
+     payload and includes `voice_tier` in the audit meta + structured
+     log line.
+  New endpoint: `GET /voice-tiers` returns
+  `{ default_tier, tiers, plan_access }` (visible tiers only by
+  default; `?include_hidden=1` surfaces Economy for ops UI).
+- `command-center/src/App.jsx` — `OnboardingWizard` fetches
+  `/api/super/voice-tiers` alongside `/api/super/templates` on mount
+  (hardcoded safe fallback so an API outage doesn't wedge the wizard).
+  Renders a 3-card picker inline on the Template step, below the
+  `assistant_name` field: each card shows label, tagline, description,
+  and a cost indicator (●/●●/●●●). Tiers disallowed by the current
+  plan are greyed out, show a padlock, and aren't clickable. A
+  `useEffect` hook auto-downgrades the selection when the super admin
+  changes the plan mid-wizard (e.g. Pro → Free downgrades Premium →
+  Standard). `voice_tier` is posted on create; the Review step and
+  Success screen both surface the chosen tier so the operator can
+  see what they deployed.
+
+**Acceptance criteria**
+
+- [x] A super admin creating a new tenant on `plan = 'free'` can only
+  select Economy or Standard; Premium is locked and the server also
+  rejects a hand-crafted payload with `plan='free', voice_tier='premium'`
+  (returns 400 + `allowed_tiers`). Creating on `plan = 'pro'` unlocks
+  Premium end-to-end.
+- [x] The chosen tier lands in `settings(business_id, 'voice_config')`
+  as `{ "tier": "<key>" }`, and the next inbound call logs
+  `Voice tier: <tier> | model=… voice=… speed=…` via
+  `grok-voice.js`.
+- [x] Valleymede is untouched: its `plan='legacy'` grants access to
+  every tier, and a smoke test of
+  `resolveVoiceConfigFromSettings(null)` returns the exact pre-Phase-7e
+  triple (`grok-4.20-latest` / `eve` / `1.15`). No migration touches
+  Valleymede's `settings` row; the template default only seeds on
+  _new_ tenants created via `applyTemplate`.
+- [x] Static + runtime verification:
+  - `node --check` clean on `voice-tiers.js`, `grok-voice.js`,
+    `templates.js`, `super-admin.js`.
+  - `@babel/parser` parses the updated `App.jsx` end-to-end.
+  - Smoke harness over `resolveVoiceConfigFromSettings` passes 6/6:
+    null → legacy triple; `{tier:'standard'}` → legacy triple;
+    `{tier:'premium'}` → `grok-think-fast-1.0 / rock / 1.15`;
+    explicit voice/speed overrides win over tier defaults;
+    `isTierAllowedOnPlan` gates Premium on `free`; `listTiers()`
+    hides Economy while `getTier('economy')` still resolves.
+
+**Out of scope for Phase 7e (deferred):**
+
+- Per-tenant Settings tab for voice tier (read + change post-creation
+  from the tenant UI). Editable today only via super-admin DB writes
+  or a future wizard-style "change plan" flow.
+- Verified Economy model/voice IDs from xAI — Economy stays flagged
+  `placeholder: true` until we have a live-call confirmation.
+- Usage metering / cost attribution by tier (part of the broader
+  billing work still sitting in Phase 7).
+- Tenant-visible "upgrade voice" CTA when a free-plan owner tries to
+  pick Premium. Today the wizard just locks the card; no upsell
+  copy yet.
+
+**Phase 7e implemented — awaiting review before commit + deploy.**
 
 ---
 

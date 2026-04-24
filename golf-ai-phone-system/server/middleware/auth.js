@@ -154,6 +154,12 @@ async function login(usernameOrEmail, password) {
   const identity = String(usernameOrEmail || '').trim().toLowerCase();
 
   // 1. business_users
+  //
+  // If the email matches a business_user but the password doesn't, we
+  // intentionally fall through instead of failing — the same email may
+  // legitimately exist as a super_admin (or legacy env admin) with a
+  // different password. Each row still requires its own password to
+  // match, so this doesn't weaken the auth model.
   try {
     const res = await query(
       `SELECT id, business_id, email, password_hash, role, name, active
@@ -167,29 +173,33 @@ async function login(usernameOrEmail, password) {
       const ok = u.password_hash.startsWith('$2')
         ? await bcrypt.compare(password, u.password_hash)
         : password === u.password_hash;
-      if (!ok) throw new Error('Invalid credentials');
+      if (ok) {
+        await query('UPDATE business_users SET last_login_at = NOW() WHERE id = $1', [u.id])
+          .catch(err => console.warn('Could not record last_login_at:', err.message));
 
-      await query('UPDATE business_users SET last_login_at = NOW() WHERE id = $1', [u.id])
-        .catch(err => console.warn('Could not record last_login_at:', err.message));
-
-      const role = normalizeRole(u.role);
-      const token = signBusinessUser({ ...u, role });
-      return {
-        token,
-        username: u.email,
-        name: u.name,
-        role,
-        business_id: u.business_id
-      };
+        const role = normalizeRole(u.role);
+        const token = signBusinessUser({ ...u, role });
+        return {
+          token,
+          username: u.email,
+          name: u.name,
+          role,
+          business_id: u.business_id
+        };
+      }
+      // Password mismatch — intentional fall-through. See comment above.
     }
   } catch (err) {
-    if (err.message === 'Invalid credentials') throw err;
     if (!/does not exist|relation|undefined/i.test(err.message)) {
       console.warn('business_users lookup failed:', err.message);
     }
   }
 
   // 2. super_admins
+  //
+  // Same fall-through rule as business_users above — a super_admin email
+  // that doesn't match on password continues to the legacy env-admin
+  // check rather than hard-failing.
   try {
     const res = await query(
       `SELECT id, email, password_hash, name, active
@@ -203,22 +213,22 @@ async function login(usernameOrEmail, password) {
       const ok = sa.password_hash.startsWith('$2')
         ? await bcrypt.compare(password, sa.password_hash)
         : password === sa.password_hash;
-      if (!ok) throw new Error('Invalid credentials');
+      if (ok) {
+        await query('UPDATE super_admins SET last_login_at = NOW() WHERE id = $1', [sa.id])
+          .catch(err => console.warn('Could not record last_login_at:', err.message));
 
-      await query('UPDATE super_admins SET last_login_at = NOW() WHERE id = $1', [sa.id])
-        .catch(err => console.warn('Could not record last_login_at:', err.message));
-
-      const token = signSuperAdmin(sa);
-      return {
-        token,
-        username: sa.email,
-        name: sa.name,
-        role: SUPER_ADMIN_ROLE,
-        business_id: null
-      };
+        const token = signSuperAdmin(sa);
+        return {
+          token,
+          username: sa.email,
+          name: sa.name,
+          role: SUPER_ADMIN_ROLE,
+          business_id: null
+        };
+      }
+      // Password mismatch — intentional fall-through. See comment above.
     }
   } catch (err) {
-    if (err.message === 'Invalid credentials') throw err;
     if (!/does not exist|relation|undefined/i.test(err.message)) {
       console.warn('super_admins lookup failed:', err.message);
     }

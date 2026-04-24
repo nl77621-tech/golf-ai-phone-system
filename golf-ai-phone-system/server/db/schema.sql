@@ -74,6 +74,12 @@ CREATE TABLE IF NOT EXISTS businesses (
     -- ready for staff logins. Used by the super-admin UI to flag
     -- "newly created, awaiting first admin" rows.
     setup_complete BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Vertical template the tenant was provisioned with. Drives the
+    -- sidebar/dashboard branching in the Command Center and the
+    -- prompt builder in services/system-prompt.js. Nullable because
+    -- the single-tenant-bootstrap Valleymede row predates this column;
+    -- migration 005 backfills existing rows.
+    template_key VARCHAR(40),
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
@@ -197,6 +203,13 @@ ALTER TABLE IF EXISTS booking_requests      ADD COLUMN IF NOT EXISTS business_id
 ALTER TABLE IF EXISTS modification_requests ADD COLUMN IF NOT EXISTS business_id INTEGER;
 ALTER TABLE IF EXISTS call_logs             ADD COLUMN IF NOT EXISTS business_id INTEGER;
 ALTER TABLE IF EXISTS greetings             ADD COLUMN IF NOT EXISTS business_id INTEGER;
+
+-- template_key was introduced in migration 005. On a legacy DB the
+-- `businesses` CREATE TABLE above is a no-op (the table exists) so we
+-- must add the column here too, before any code that SELECTs it runs.
+-- Migration 005 also backfills the values — the bare ADD COLUMN here
+-- just ensures the column exists.
+ALTER TABLE IF EXISTS businesses            ADD COLUMN IF NOT EXISTS template_key VARCHAR(40);
 
 -- ============================================
 -- Settings (key/value per tenant)

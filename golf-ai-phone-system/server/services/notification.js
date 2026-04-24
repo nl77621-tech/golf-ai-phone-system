@@ -429,6 +429,133 @@ async function sendBookingRejectedToCustomer(businessId, booking, reason) {
   }
 }
 
+/**
+ * Send a concise post-call recap SMS to the owner — used by the
+ * Personal Assistant template after every inbound call.
+ *
+ * The Personal Assistant vertical sits on top of tenants where a single
+ * human ("the owner") wants the AI to handle their calls and report back.
+ * After each call we text the owner a short summary so they can triage
+ * without listening to recordings.
+ *
+ * Shape of the SMS (example):
+ *   "Alex called at 2:15pm - wants to reschedule Thursday meeting.
+ *    Left message: Can we move to Friday 3pm?"
+ *
+ * Controls read from the `post_call_sms` setting on the tenant:
+ *   - enabled (bool)            — master switch
+ *   - to_number (string)        — where to text. Falls back to the business
+ *                                 row's transfer_number, then the tenant's
+ *                                 notifications.sms_to.
+ *   - include_transcript_preview (bool) — append a short preview of the
+ *                                 final caller turn when true (default true).
+ *
+ * Returns the Twilio message object on success, or null when the feature
+ * is disabled / misconfigured / no recipient is known. Never throws — a
+ * failure here must not kill the call-cleanup path.
+ */
+async function sendPostCallSummary(businessId, details = {}) {
+  requireBusinessId(businessId, 'sendPostCallSummary');
+  try {
+    const cfg = (await getSetting(businessId, 'post_call_sms').catch(() => null)) || {};
+    if (cfg.enabled === false) {
+      console.log(`[tenant:${businessId}] post_call_sms disabled — skipping owner recap`);
+      return null;
+    }
+
+    // Recipient resolution: explicit owner number > business transfer > staff sms_to.
+    let to = cfg.to_number;
+    if (!to) {
+      const business = await safeGetBusiness(businessId);
+      to = business?.transfer_number || null;
+    }
+    if (!to) {
+      const notif = await getTenantNotifications(businessId);
+      to = notif?.sms_to || null;
+    }
+    if (!to) {
+      console.warn(`[tenant:${businessId}] Post-call SMS skipped — no owner number configured.`);
+      return null;
+    }
+
+    const {
+      transcript,
+      summary,
+      callerName,
+      callerPhone,
+      startedAt
+    } = details;
+
+    const { timezone } = await getTenantDisplay(businessId);
+
+    // Caller label: prefer a known name, fall back to the raw number, then "Someone".
+    const who = callerName && callerName.trim()
+      ? callerName.trim()
+      : (callerPhone ? callerPhone : 'Someone');
+
+    // Local time-of-call. "2:15pm" reads more naturally than "14:15".
+    let when = '';
+    try {
+      const t = startedAt ? new Date(startedAt) : new Date();
+      when = t.toLocaleTimeString('en-US', {
+        timeZone: timezone || 'America/Toronto',
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true
+      }).replace(/\s?(AM|PM)/, (m) => m.trim().toLowerCase());
+    } catch (_) {
+      when = '';
+    }
+
+    const lead = when ? `${who} called at ${when}` : `${who} called`;
+
+    // ------------------------------------------------------------------
+    // Body shape — deliberately TWO lines max (user-requested).
+    //   Line 1: "{Who} called at {time} — {summary}."
+    //   Line 2: "Left message: {short preview}."   (omitted if no preview
+    //                                               or include_transcript_preview=false)
+    // No business tag, no duration — owner knows who they are, and the
+    // duration just adds noise to a glance-able text.
+    // ------------------------------------------------------------------
+    const summaryText = (summary && String(summary).trim()) || 'No details captured.';
+
+    // Preview — pull the LAST caller line from the transcript (owner cares
+    // about how the call ended, not how it opened). Short-circuit to a
+    // trimmed tail when the transcript doesn't have "caller:" markers. We
+    // strip the "caller:" / "user:" speaker tag itself before including the
+    // text — the owner reading the SMS doesn't care about the label.
+    let preview = '';
+    if (cfg.include_transcript_preview !== false && transcript) {
+      const flat = String(transcript);
+      const speakerRe = /(?:^|\n)\s*(?:caller|user)\s*:\s*([^\n]+)/gi;
+      let lastMatch = null;
+      let m;
+      while ((m = speakerRe.exec(flat)) !== null) {
+        lastMatch = m[1];
+      }
+      let raw = lastMatch
+        ? lastMatch.trim()
+        : flat.replace(/\s+/g, ' ').trim();
+      if (raw && raw.length > 90) raw = raw.slice(0, 87) + '\u2026';
+      preview = raw;
+    }
+
+    const line1 = `${lead} \u2014 ${summaryText}`.replace(/\s+$/, '');
+    const line2 = preview ? `Left message: ${preview}` : '';
+
+    let body = line2 ? `${line1}\n${line2}` : line1;
+    // Trim any accidental end punctuation dupes, then hard-cap so a runaway
+    // summary from the model doesn't turn into a multi-segment SMS charge.
+    body = body.replace(/([.!?])\.$/g, '$1');
+    if (body.length > 320) body = body.slice(0, 317) + '\u2026';
+
+    return await sendSMS(businessId, to, body);
+  } catch (err) {
+    console.error(`[tenant:${businessId}] Post-call recap SMS failed:`, err.message);
+    return null;
+  }
+}
+
 module.exports = {
   sendEmail,
   sendSMS,
@@ -438,6 +565,7 @@ module.exports = {
   sendBookingConfirmedToCustomer,
   sendBookingCancelledToCustomer,
   sendBookingRejectedToCustomer,
+  sendPostCallSummary,
   getSmsPhoneForCustomer,
   formatShortDateTime
 };

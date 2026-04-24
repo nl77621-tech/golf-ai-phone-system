@@ -8,9 +8,25 @@
  */
 const { getSetting, getBusinessById } = require('../config/database');
 const { requireBusinessId } = require('../context/tenant-context');
+const { buildPersonalAssistantPrompt } = require('./personal-assistant-prompt');
 
 async function buildSystemPrompt(businessId, callerContext = {}) {
   requireBusinessId(businessId, 'buildSystemPrompt');
+
+  // ----------------------------------------------------------------
+  // Template dispatcher
+  // ----------------------------------------------------------------
+  // Each vertical has its own prompt shape. The default path below is
+  // the golf-oriented prompt (Valleymede's single-tenant bootstrap).
+  // Non-golf verticals delegate to their own builder so we never
+  // bolt personal-assistant / restaurant / other semantics onto the
+  // golf prompt (which talks about tee times, carts, memberships…).
+  const businessRow = await getBusinessById(businessId);
+  const templateKey = businessRow?.template_key;
+
+  if (templateKey === 'personal_assistant') {
+    return buildPersonalAssistantPrompt(businessId, callerContext);
+  }
 
   const [
     business,

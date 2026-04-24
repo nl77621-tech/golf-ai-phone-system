@@ -136,6 +136,7 @@ router.get('/businesses', async (req, res) => {
     const { rows } = await query(
       `SELECT b.id, b.slug, b.name, b.twilio_phone_number, b.transfer_number,
               b.timezone, b.status, b.is_active, b.plan, b.setup_complete,
+              b.template_key,
               b.created_at, b.updated_at, b.contact_email, b.contact_phone,
               (SELECT COUNT(*)::int FROM business_users bu
                  WHERE bu.business_id = b.id AND bu.active = TRUE) AS active_user_count,
@@ -247,6 +248,15 @@ router.post('/businesses', async (req, res) => {
   const logoUrl = b.logo_url?.trim() || null;
   const adminEmail = b.admin_email?.trim().toLowerCase() || null;
 
+  // Optional per-template one-off fields. For now only personal_assistant
+  // exposes a wizard-customizable field (the assistant's voice-facing name);
+  // add new entries here as other verticals grow their own onboarding
+  // prompts. Trim + length-cap so a rogue wizard payload can't blow out the
+  // JSONB column or the prompt.
+  const assistantName = typeof b.assistant_name === 'string'
+    ? b.assistant_name.trim().slice(0, 40)
+    : '';
+
   // Normalise optional `phone_numbers` array. We always dedupe against the
   // primary Twilio number so the caller can't accidentally register the same
   // DID twice.
@@ -267,16 +277,18 @@ router.post('/businesses', async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // 1. Insert the tenant row.
+    // 1. Insert the tenant row. template_key is persisted so downstream
+    //    code (sidebar/page-map branching, system-prompt dispatcher) can
+    //    read it from the business row without replaying the wizard.
     const ins = await client.query(
       `INSERT INTO businesses
          (slug, name, twilio_phone_number, transfer_number, timezone,
           contact_email, contact_phone, status, is_active, plan,
-          primary_color, logo_url, created_by, setup_complete)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 'trial', TRUE, $8, $9, $10, $11, FALSE)
+          primary_color, logo_url, created_by, setup_complete, template_key)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'trial', TRUE, $8, $9, $10, $11, FALSE, $12)
        RETURNING *`,
       [slug, name, twilioNumber, transferNumber, timezone, contactEmail,
-       contactPhone, plan, primaryColor, logoUrl, req.auth.user_id]
+       contactPhone, plan, primaryColor, logoUrl, req.auth.user_id, template.key]
     );
     const business = ins.rows[0];
     createdBusinessId = business.id;
@@ -286,6 +298,27 @@ router.post('/businesses', async (req, res) => {
     //    key, it still exists on the new tenant.
     await seedTenantDefaults(client, business.id);
     templateSummary = await applyTemplate(client, business.id, template.key);
+
+    // 2b. Per-template wizard overrides. The wizard surfaces a tiny number
+    //     of fields (today: just assistant_name for personal_assistant) so
+    //     the owner can customise them at creation time without jumping
+    //     straight into the settings UI. We merge into the existing JSONB
+    //     rather than overwriting so any other owner_profile defaults
+    //     seeded by applyTemplate are preserved.
+    if (template.key === 'personal_assistant' && assistantName) {
+      await client.query(
+        `UPDATE settings
+            SET value = jsonb_set(
+                   COALESCE(value, '{}'::jsonb),
+                   '{assistant_name}',
+                   to_jsonb($1::text),
+                   true
+                 ),
+                updated_at = NOW()
+          WHERE business_id = $2 AND key = 'owner_profile'`,
+        [assistantName, business.id]
+      );
+    }
 
     // 3. Register phone numbers. Primary first (if supplied), then extras.
     if (twilioNumber) {
@@ -403,7 +436,8 @@ router.patch('/businesses/:id', async (req, res) => {
   const allowed = [
     'name', 'slug', 'twilio_phone_number', 'transfer_number', 'timezone',
     'contact_email', 'contact_phone', 'status', 'is_active', 'plan',
-    'primary_color', 'logo_url', 'internal_notes', 'setup_complete'
+    'primary_color', 'logo_url', 'internal_notes', 'setup_complete',
+    'template_key'
   ];
   const patches = {};
   for (const k of allowed) {

@@ -15,6 +15,7 @@
  */
 const WebSocket = require('ws');
 const { buildSystemPrompt } = require('./system-prompt');
+const { sendPostCallSummary } = require('./notification');
 const { lookupByPhone, lookupByName, registerCall, updateCustomer } = require('./caller-lookup');
 const {
   createBookingRequest,
@@ -551,6 +552,24 @@ ${callerLine}
       );
     } catch (err) {
       console.error(`[tenant:${businessId}] Failed to update call log:`, err.message);
+    }
+
+    // Personal Assistant post-call recap — owner gets a concise SMS summary
+    // of every call. Gated on the tenant's template so golf courses are
+    // unaffected. Never throws: sendPostCallSummary already swallows errors,
+    // but we also fire-and-forget so a slow SMS API can't keep the call
+    // cleanup path open.
+    if (business?.template_key === 'personal_assistant') {
+      sendPostCallSummary(businessId, {
+        transcript,
+        summary,
+        duration,
+        callerName: callerContext?.name || null,
+        callerPhone: callerContext?.phone || null,
+        startedAt: callState?.startTime ? new Date(callState.startTime) : new Date()
+      }).catch((err) => {
+        console.error(`[tenant:${businessId}] Post-call recap fire-and-forget failed:`, err.message);
+      });
     }
   });
 }

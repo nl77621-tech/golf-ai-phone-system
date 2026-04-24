@@ -73,6 +73,24 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ error: 'Username and password are required' });
     }
     const result = await login(username, password);
+
+    // Attach the tenant's template_key + business_name so the Command
+    // Center can pick the right sidebar / dashboard on first render
+    // without an extra /auth/verify round-trip. Non-fatal on failure.
+    if (Number.isInteger(result.business_id)) {
+      try {
+        const biz = await getBusinessById(result.business_id);
+        if (biz) {
+          result.template_key = biz.template_key || null;
+          result.business_name = biz.name || null;
+        }
+      } catch (err) {
+        console.warn('[auth/login] template_key lookup failed:', err.message);
+      }
+    } else {
+      result.template_key = null;
+    }
+
     // Audit — fire-and-forget. The login result contains the role +
     // business_id we want on the row. `login()` doesn't hand back the
     // numeric user_id, so we denormalize only what it gives us (email
@@ -97,14 +115,36 @@ router.post('/login', async (req, res) => {
 });
 
 // ----- GET /auth/verify ------------------------------------------------
-router.get('/verify', requireAuth, (req, res) => {
+//
+// Rehydrates session state on reload. Adds `template_key` and
+// `business_name` for the caller's tenant so the Command Center can
+// pick the right sidebar / dashboard without a second round-trip.
+// Super admins get template_key = null (they aren't bound to a tenant).
+router.get('/verify', requireAuth, async (req, res) => {
+  let template_key = null;
+  let business_name = null;
+  if (Number.isInteger(req.auth.business_id) && req.auth.business_id > 0) {
+    try {
+      const biz = await getBusinessById(req.auth.business_id);
+      if (biz) {
+        template_key = biz.template_key || null;
+        business_name = biz.name || null;
+      }
+    } catch (err) {
+      // Non-fatal — fall through to null so the UI renders the default
+      // (golf) view rather than erroring out on rehydrate.
+      console.warn('[auth/verify] template_key lookup failed:', err.message);
+    }
+  }
   res.json({
     valid: true,
     user: {
       user_id: req.auth.user_id,
       business_id: req.auth.business_id,
       role: req.auth.role,
-      username: req.auth.username
+      username: req.auth.username,
+      template_key,
+      business_name
     }
   });
 });

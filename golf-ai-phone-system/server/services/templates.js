@@ -261,6 +261,120 @@ const RESTAURANT = {
   ]
 };
 
+/* ------------------------------------------------------------------
+ * PERSONAL_ASSISTANT
+ *
+ * A dedicated personal-assistant vertical for solo professionals, small
+ * business owners, or anyone who wants an AI receptionist that knows
+ * *them* personally. This template is distinct from the business-facing
+ * verticals above in three important ways:
+ *
+ *   1. It seeds an `owner_profile` blob (name, business, family, notes).
+ *      `ai_personality.name` is CUSTOMIZABLE per-tenant — the owner
+ *      picks what to call their assistant ("Alex", "Sam", "Jamie"…).
+ *
+ *   2. The system prompt (built by services/personal-assistant-prompt.js)
+ *      ignores the golf-specific copy in the default buildSystemPrompt
+ *      and instead emphasises: screening unknown callers, taking
+ *      detailed messages, booking/rescheduling appointments, and
+ *      conversationally representing the owner.
+ *
+ *   3. `post_call_sms.enabled = true` instructs grok-voice.js's
+ *      close-handler to text the owner a concise recap of every call.
+ *      Example copy: "Alex called at 2:15pm — wants to reschedule
+ *      Thursday meeting. Message: 'Can we move to Friday 3pm?'"
+ *
+ * Keep every field here optional-but-sensible so the wizard's 5-minute
+ * onboarding still works: the owner fills in `owner_profile.owner_name`
+ * plus `post_call_sms.to_number` and the assistant is already useful.
+ * ------------------------------------------------------------------ */
+
+const PERSONAL_ASSISTANT = {
+  key: 'personal_assistant',
+  meta: {
+    label: 'Personal Assistant',
+    tagline: 'A friendly assistant who knows you and handles your calls.',
+    description: 'An always-on AI receptionist for solo professionals and small-business owners. Seeds an owner profile (name, business, family, schedule, important contacts), a customizable assistant name, and post-call SMS recaps so you always know who called. The AI screens unknown callers, takes detailed messages, can book or reschedule appointments, and answers routine questions on your behalf.',
+    icon: 'user',
+    icon_emoji: '\ud83d\udc64',
+    recommended_plan: 'starter',
+    default_timezone: 'America/Toronto',
+    features: [
+      'Call screening for unknown numbers',
+      'Detailed message taking',
+      'Appointment scheduling',
+      'Post-call SMS recap to the owner'
+    ]
+  },
+  settings: [
+    ['business_hours', weeklyHours({ open: '09:00', close: '17:00' }),
+      'When the owner is generally available'],
+    ['owner_profile', {
+      // The assistant's voice-facing name. CUSTOMIZABLE per-tenant via the
+      // onboarding wizard and the My Info page. The prompt builder reads
+      // this first and falls back to "Your Assistant" when blank, so a
+      // freshly provisioned business still answers the phone cleanly even
+      // before the owner has finished My Info.
+      assistant_name: '',
+      owner_name: '',
+      business_name: '',
+      business_description: '',
+      pronouns: '',
+      family: [],              // e.g. [{ relationship: 'spouse', name: 'Pat' }]
+      preferences: '',         // free-form: likes, dislikes, communication style
+      notable_details: ''      // anything the assistant should naturally know
+    }, 'Who the owner is — plus the customizable assistant_name the AI uses on calls'],
+    ['schedule_preferences', {
+      typical_hours: 'Weekdays 9\u20135',
+      busy_days: [],           // e.g. ['Tuesday','Thursday']
+      do_not_disturb: '',      // e.g. 'Before 9am and after 7pm'
+      appointment_buffer_min: 15
+    }, 'Scheduling preferences — the assistant respects these when booking'],
+    ['important_contacts', [], 'VIP contacts — always put these callers through (name, relationship, phone, note)'],
+    ['call_handling_rules', {
+      screen_unknown_callers: true,
+      always_take_message: true,
+      can_book_appointments: true,
+      can_reschedule_appointments: true,
+      can_transfer_to_owner: false,
+      topics_to_avoid: '',           // e.g. "Do not discuss pricing"
+      topics_to_handle_directly: ''  // e.g. "Share my office address freely"
+    }, 'How the assistant handles inbound calls'],
+    ['post_call_sms', {
+      enabled: true,
+      to_number: '',                 // owner's mobile in E.164 — required for SMS recaps
+      include_transcript_preview: true,
+      style: 'concise'               // 'concise' | 'detailed'
+    }, 'Post-call SMS recap sent to the owner after every call'],
+    // Keys the generic settings layer expects. Seeded empty / neutral so
+    // the Command Center dashboards don\u2019t render undefined fields.
+    ['pricing', {}, 'Pricing \u2014 only used if the assistant quotes fees'],
+    ['course_info', {}, 'Generic business info (kept for dashboard compatibility)'],
+    ['policies', {}, 'Policies \u2014 optional, leave empty unless relevant'],
+    ['memberships', {}, 'Memberships \u2014 optional, leave empty unless relevant'],
+    ['tournaments', {}, 'Group bookings \u2014 optional, leave empty unless relevant'],
+    ['amenities', {}, 'Amenities \u2014 optional, leave empty unless relevant'],
+    ['notifications', standardNotifications(),
+      'How to notify the owner of messages (email + SMS). Post-call SMS uses post_call_sms.to_number instead.'],
+    ['ai_personality', personality({
+      name: 'Assistant',
+      style: 'Friendly, warm, and proactive \u2014 like a thoughtful personal assistant who has worked with the owner for years. Confident without being pushy. Picks up on what the caller actually needs.',
+      language: 'English primary. Switch if the caller prefers another language.',
+      weather_behavior: 'Only mention weather if the caller asks.',
+      booking_limit: 1,
+      after_hours_message: "They\u2019re not available right now, but I can take a message and make sure they get it."
+    }), 'AI voice agent personality \u2014 `name` is customizable per-tenant'],
+    ['announcements', [], 'Active announcements the assistant should mention'],
+    ['booking_settings', { require_credit_card: false }, 'Appointment booking behavior'],
+    ['test_mode', { enabled: false, test_phone: '' }, 'Test phone number configuration']
+  ],
+  greetings: [
+    ['Hi, thanks for calling. How can I help?', false],
+    ['Hello \u2014 you\u2019ve reached the right number. What can I do for you?', false],
+    ['Hi {name}! Good to hear from you again \u2014 what\u2019s going on?', true]
+  ]
+};
+
 const GENERIC = {
   key: 'other',
   meta: {
@@ -298,6 +412,7 @@ const TEMPLATES = {
   [GOLF_COURSE.key]: GOLF_COURSE,
   [DRIVING_RANGE.key]: DRIVING_RANGE,
   [RESTAURANT.key]: RESTAURANT,
+  [PERSONAL_ASSISTANT.key]: PERSONAL_ASSISTANT,
   [GENERIC.key]: GENERIC
 };
 

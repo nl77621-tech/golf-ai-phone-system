@@ -6,7 +6,7 @@ import { createRoot } from 'react-dom/client';
 // ============================================
 // localStorage keys
 //   gc_token              — JWT bearer token
-//   gc_session            — JSON { role, business_id, business_name, username, name }
+//   gc_session            — JSON { role, business_id, business_name, template_key, username, name }
 //   gc_selected_business  — super-admin only: numeric id of the tenant they're
 //                           currently acting as via the Business Switcher.
 //                           When set, the UI reads/writes tenant data via
@@ -113,6 +113,7 @@ function LoginPage({ onLogin }) {
         role: data.role,
         business_id: data.business_id,
         business_name: data.business_name || null,
+        template_key: data.template_key || null,
         username: data.username,
         name: data.name
       });
@@ -168,15 +169,48 @@ function LoginPage({ onLogin }) {
 // ============================================
 // SIDEBAR
 // ============================================
-function Sidebar({ currentPage, onNavigate, onLogout, tenantName }) {
-  const menuItems = [
+// The sidebar and page router branch on `templateKey` so each vertical can
+// show only the tools it actually needs. Golf keeps its full nav; Personal
+// Assistant gets a focused four-item menu; everything else ("other",
+// "restaurant", …) shares a minimal baseline until Phase 7 fleshes them
+// out. Add a new template → add a case in sidebarItemsFor() and
+// tenantPagesFor() below.
+const DEFAULT_SIDEBAR_ICON = '\ud83c\udfe0'; // fallback emoji
+
+function sidebarItemsFor(templateKey) {
+  if (templateKey === 'personal_assistant') {
+    return [
+      { id: 'dashboard', label: 'Personal Assistant', icon: '\ud83d\udc64' },
+      { id: 'calls',     label: 'Call History',       icon: '\ud83d\udcde' },
+      { id: 'my_info',   label: 'My Info',            icon: '\ud83d\udccb' },
+      { id: 'settings',  label: 'Settings',           icon: '\u2699\ufe0f' }
+    ];
+  }
+  // Golf-style (driving_range reuses this shape for now) — keep the exact
+  // menu Valleymede has been running on.
+  if (templateKey === 'golf_course' || templateKey === 'driving_range' || !templateKey) {
+    return [
+      { id: 'dashboard', label: 'Dashboard', icon: '\ud83d\udcca' },
+      { id: 'teesheet',  label: 'Tee Sheet', icon: '\u26f3' },
+      { id: 'bookings',  label: 'Bookings',  icon: '\ud83d\udcc5' },
+      { id: 'customers', label: 'Customers', icon: '\ud83d\udc65' },
+      { id: 'calls',     label: 'Call Logs', icon: '\ud83d\udcde' },
+      { id: 'settings',  label: 'Settings',  icon: '\u2699\ufe0f' }
+    ];
+  }
+  // Neutral baseline for "other" / "restaurant" until Phase 7. No
+  // golf-specific pages are exposed, but the essentials (calls, settings)
+  // are always available.
+  return [
     { id: 'dashboard', label: 'Dashboard', icon: '\ud83d\udcca' },
-    { id: 'teesheet', label: 'Tee Sheet', icon: '\u26f3' },
-    { id: 'bookings', label: 'Bookings', icon: '\ud83d\udcc5' },
+    { id: 'calls',     label: 'Call Logs', icon: '\ud83d\udcde' },
     { id: 'customers', label: 'Customers', icon: '\ud83d\udc65' },
-    { id: 'calls', label: 'Call Logs', icon: '\ud83d\udcde' },
-    { id: 'settings', label: 'Settings', icon: '\u2699\ufe0f' }
+    { id: 'settings',  label: 'Settings',  icon: '\u2699\ufe0f' }
   ];
+}
+
+function Sidebar({ currentPage, onNavigate, onLogout, tenantName, templateKey }) {
+  const menuItems = sidebarItemsFor(templateKey);
 
   return React.createElement('aside', { className: 'w-64 bg-golf-800 text-white min-h-screen flex flex-col' },
     React.createElement('div', { className: 'p-6 border-b border-golf-700' },
@@ -2990,7 +3024,11 @@ function OnboardingWizard({ onCancel, onCreated, onActAs }) {
     phone_numbers: [],              // [{ phone_number, label }]
     template_key: 'golf_course',
     admin_email: '',
-    admin_name: ''
+    admin_name: '',
+    // Personal Assistant-only: the voice-facing name of the assistant.
+    // Harmless empty string for other templates — the backend ignores
+    // assistant_name unless template_key === 'personal_assistant'.
+    assistant_name: ''
   });
 
   // Live slug-availability state, driven by /api/super/slug-check.
@@ -3052,6 +3090,7 @@ function OnboardingWizard({ onCancel, onCreated, onActAs }) {
           { key: 'golf_course', label: 'Golf Course', tagline: 'Tee times, pricing, league play.', icon_emoji: '\u26f3\ufe0f' },
           { key: 'driving_range', label: 'Driving Range', tagline: 'Bay reservations, bucket pricing.', icon_emoji: '\ud83c\udfaf' },
           { key: 'restaurant', label: 'Restaurant', tagline: 'Reservations, hours, menu Q&A.', icon_emoji: '\ud83c\udf7d\ufe0f' },
+          { key: 'personal_assistant', label: 'Personal Assistant', tagline: 'A friendly assistant who knows you and handles your calls.', icon_emoji: '\ud83d\udc64' },
           { key: 'other', label: 'Other / Generic', tagline: 'Safe, unopinionated starting point.', icon_emoji: '\u2728' }
         ]);
       })
@@ -3122,7 +3161,11 @@ function OnboardingWizard({ onCancel, onCreated, onActAs }) {
           transfer_number: form.transfer_number.trim() || null,
           phone_numbers: extra,
           template_key: form.template_key,
-          admin_email: form.admin_email.trim() || null
+          admin_email: form.admin_email.trim() || null,
+          // Only meaningful when template_key === 'personal_assistant'; the
+          // backend defensively ignores it otherwise. Empty string is fine —
+          // the server treats blanks as "use template default".
+          assistant_name: (form.assistant_name || '').trim()
         })
       });
       setResult(resp);
@@ -3393,7 +3436,31 @@ function OnboardingWizard({ onCancel, onCreated, onActAs }) {
             )
           );
         })
-      )
+      ),
+    // Per-template customization fields. Rendered only when the relevant
+    // template is selected so golf_course onboarding is unchanged. Today
+    // personal_assistant is the only vertical with a wizard field; as new
+    // verticals grow their own knobs, add more conditional blocks here.
+    form.template_key === 'personal_assistant' && React.createElement('div', {
+      className: 'mt-4 rounded-xl border border-golf-200 bg-golf-50/60 p-4'
+    },
+      React.createElement('label', {
+        className: 'block text-xs font-semibold text-gray-700 mb-1',
+        htmlFor: 'wizard-assistant-name'
+      }, 'Assistant name '),
+      React.createElement('p', { className: 'text-[11px] text-gray-600 mb-2 leading-snug' },
+        'What should the AI call itself on the phone? Leave blank to use the default '
+        + '("Your Assistant"). You can change this any time from the My Info page.'),
+      React.createElement('input', {
+        id: 'wizard-assistant-name',
+        type: 'text',
+        maxLength: 40,
+        className: 'w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:border-golf-500 focus:ring-1 focus:ring-golf-400',
+        placeholder: 'e.g. Sam, Alex, Robin\u2026',
+        value: form.assistant_name || '',
+        onChange: (e) => set('assistant_name', e.target.value)
+      })
+    )
   );
 
   const renderReview = () => React.createElement('div', { className: 'space-y-4 text-sm' },
@@ -3648,6 +3715,250 @@ function TopBar({ session, businesses, selectedBusinessId, onSelectBusiness, onL
 }
 
 // ============================================
+// PERSONAL ASSISTANT PAGES
+// ============================================
+// Lightweight pages for the personal_assistant template. They intentionally
+// reuse the existing CallLogsPage + SettingsPage so the feature set matches
+// what tenants already trust; only the Owner Profile surface is net-new.
+
+// The "Personal Assistant" landing page — a clean, friendly overview for the
+// solo operator. Shows who the assistant is (assistant name + owner name)
+// and recent call activity. Avoids the golf-centric dashboard chrome.
+function PersonalAssistantPage() {
+  const [owner, setOwner] = useState(null);
+  const [personality, setPersonality] = useState(null);
+  const [recent, setRecent] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    // /api/settings returns the whole { key: { value, description } } map.
+    // Pull the two keys we care about out of it so we only make one request.
+    Promise.all([
+      api('/api/settings').catch(() => ({})),
+      api('/api/calls?limit=5').catch(() => ({ calls: [] }))
+    ]).then(([settings, calls]) => {
+      setOwner((settings && settings.owner_profile && settings.owner_profile.value) || {});
+      setPersonality((settings && settings.ai_personality && settings.ai_personality.value) || {});
+      setRecent((calls && calls.calls) || []);
+    }).finally(() => setLoading(false));
+  }, []);
+
+  if (loading) {
+    return React.createElement('div', { className: 'text-gray-500' }, 'Loading\u2026');
+  }
+
+  const assistantName = (personality && personality.name) || 'Your assistant';
+  const ownerName = (owner && owner.owner_name) || 'you';
+
+  return React.createElement('div', { className: 'max-w-4xl mx-auto space-y-6' },
+    React.createElement('div', { className: 'bg-white rounded-2xl shadow p-6 border border-gray-100' },
+      React.createElement('div', { className: 'flex items-center gap-4' },
+        React.createElement('div', { className: 'w-14 h-14 rounded-full bg-golf-100 flex items-center justify-center text-2xl' }, '\ud83d\udc64'),
+        React.createElement('div', null,
+          React.createElement('div', { className: 'text-sm text-gray-500' }, 'Meet your assistant'),
+          React.createElement('div', { className: 'text-xl font-bold text-gray-900' }, assistantName),
+          React.createElement('div', { className: 'text-sm text-gray-600' }, `Handling calls for ${ownerName}`)
+        )
+      ),
+      React.createElement('p', { className: 'mt-4 text-sm text-gray-600' },
+        'After every call, you get a concise SMS recap. Update your info and call-handling rules in My Info or Settings.'
+      )
+    ),
+    React.createElement('div', { className: 'bg-white rounded-2xl shadow p-6 border border-gray-100' },
+      React.createElement('h3', { className: 'text-lg font-semibold text-gray-900 mb-4' }, 'Recent calls'),
+      recent.length === 0
+        ? React.createElement('div', { className: 'text-sm text-gray-500' }, 'No calls yet. Your assistant will answer as soon as someone rings.')
+        : React.createElement('ul', { className: 'divide-y divide-gray-100' },
+            recent.slice(0, 5).map((c) =>
+              React.createElement('li', { key: c.id, className: 'py-3' },
+                React.createElement('div', { className: 'text-sm font-medium text-gray-900' },
+                  c.customer_name || c.caller_phone || 'Unknown caller'
+                ),
+                React.createElement('div', { className: 'text-xs text-gray-500 truncate' },
+                  c.summary || 'No summary'
+                )
+              )
+            )
+          )
+    )
+  );
+}
+
+// "My Info" — the owner fills in everything the assistant needs to speak on
+// their behalf: their name, business, family, preferences, schedule. All of
+// it feeds buildPersonalAssistantPrompt() on the server. No business logic
+// here beyond load/save; each field maps 1:1 to owner_profile.
+function MyInfoPage() {
+  const [profile, setProfile] = useState(null);
+  const [schedule, setSchedule] = useState(null);
+  const [status, setStatus] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    api('/api/settings').then((all) => {
+      const p = all && all.owner_profile && all.owner_profile.value;
+      const s = all && all.schedule_preferences && all.schedule_preferences.value;
+      setProfile(p || {
+        assistant_name: '',
+        owner_name: '', business_name: '', business_description: '',
+        pronouns: '', family: [], preferences: '', notable_details: ''
+      });
+      setSchedule(s || {
+        typical_hours: 'Weekdays 9\u20135', busy_days: [], do_not_disturb: '', appointment_buffer_min: 15
+      });
+    }).catch(() => {
+      setProfile({
+        assistant_name: '',
+        owner_name: '', business_name: '', business_description: '',
+        pronouns: '', family: [], preferences: '', notable_details: ''
+      });
+      setSchedule({ typical_hours: 'Weekdays 9\u20135', busy_days: [], do_not_disturb: '', appointment_buffer_min: 15 });
+    });
+  }, []);
+
+  const save = async () => {
+    setSaving(true);
+    setStatus('');
+    try {
+      await api('/api/settings/owner_profile', {
+        method: 'PUT',
+        body: JSON.stringify({ value: profile })
+      });
+      await api('/api/settings/schedule_preferences', {
+        method: 'PUT',
+        body: JSON.stringify({ value: schedule })
+      });
+      setStatus('Saved');
+    } catch (err) {
+      setStatus('Save failed');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!profile || !schedule) {
+    return React.createElement('div', { className: 'text-gray-500' }, 'Loading\u2026');
+  }
+
+  const label = 'block text-xs font-semibold text-gray-600 mb-1';
+  const input = 'w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-golf-500 focus:border-transparent outline-none';
+
+  const field = (key, text, opts = {}) =>
+    React.createElement('div', null,
+      React.createElement('label', { className: label }, text),
+      opts.multiline
+        ? React.createElement('textarea', {
+            className: input, rows: opts.rows || 3,
+            value: profile[key] || '',
+            onChange: (e) => setProfile({ ...profile, [key]: e.target.value })
+          })
+        : React.createElement('input', {
+            className: input,
+            value: profile[key] || '',
+            onChange: (e) => setProfile({ ...profile, [key]: e.target.value })
+          })
+    );
+
+  return React.createElement('div', { className: 'max-w-3xl mx-auto space-y-6' },
+    React.createElement('div', { className: 'bg-white rounded-2xl shadow p-6 border border-gray-100' },
+      React.createElement('h2', { className: 'text-xl font-bold text-gray-900 mb-1' }, 'My Info'),
+      React.createElement('p', { className: 'text-sm text-gray-600 mb-6' },
+        'Your assistant uses this information to speak on your behalf and answer basic questions. Nothing here is shared outside your calls.'
+      ),
+      // Assistant name gets its own callout — it controls how the AI
+      // introduces itself on the phone ("Hi, I'm Sam, taking calls for
+      // Nelson"), and is the single field owners touch most often. Sits
+      // above the rest of the profile so it's the first thing they see.
+      React.createElement('div', { className: 'mb-5 rounded-xl border border-golf-200 bg-golf-50/60 p-4' },
+        React.createElement('label', {
+          className: 'block text-xs font-semibold text-gray-700 mb-1',
+          htmlFor: 'my-info-assistant-name'
+        }, 'Assistant name'),
+        React.createElement('p', { className: 'text-[11px] text-gray-600 mb-2 leading-snug' },
+          'The name your AI assistant uses when it answers the phone. Leave blank to use the default ("Your Assistant").'
+        ),
+        React.createElement('input', {
+          id: 'my-info-assistant-name',
+          className: input,
+          maxLength: 40,
+          placeholder: 'e.g. Sam, Alex, Robin\u2026',
+          value: profile.assistant_name || '',
+          onChange: (e) => setProfile({ ...profile, assistant_name: e.target.value })
+        })
+      ),
+      React.createElement('div', { className: 'grid grid-cols-1 md:grid-cols-2 gap-4' },
+        field('owner_name', 'Your name'),
+        field('pronouns', 'Pronouns (optional)'),
+        field('business_name', 'Business / role'),
+        field('business_description', 'What you do', { multiline: true, rows: 2 })
+      ),
+      React.createElement('div', { className: 'mt-4 grid grid-cols-1 gap-4' },
+        field('preferences', 'Preferences (how you like calls handled)', { multiline: true, rows: 3 }),
+        field('notable_details', 'Anything else the assistant should know', { multiline: true, rows: 3 })
+      )
+    ),
+    React.createElement('div', { className: 'bg-white rounded-2xl shadow p-6 border border-gray-100' },
+      React.createElement('h3', { className: 'text-lg font-semibold text-gray-900 mb-4' }, 'Schedule preferences'),
+      React.createElement('div', { className: 'grid grid-cols-1 md:grid-cols-2 gap-4' },
+        React.createElement('div', null,
+          React.createElement('label', { className: label }, 'Typical hours'),
+          React.createElement('input', {
+            className: input, value: schedule.typical_hours || '',
+            onChange: (e) => setSchedule({ ...schedule, typical_hours: e.target.value })
+          })
+        ),
+        React.createElement('div', null,
+          React.createElement('label', { className: label }, 'Do-not-disturb window'),
+          React.createElement('input', {
+            className: input, value: schedule.do_not_disturb || '',
+            onChange: (e) => setSchedule({ ...schedule, do_not_disturb: e.target.value })
+          })
+        )
+      )
+    ),
+    React.createElement('div', { className: 'flex items-center gap-3' },
+      React.createElement('button', {
+        onClick: save, disabled: saving,
+        className: 'bg-golf-600 hover:bg-golf-700 text-white font-semibold py-2 px-4 rounded-lg transition-colors disabled:opacity-50'
+      }, saving ? 'Saving\u2026' : 'Save changes'),
+      status && React.createElement('span', { className: 'text-sm text-gray-500' }, status)
+    )
+  );
+}
+
+// Page router per template. Always falls back to the existing golf maps so
+// unknown keys keep working — we never want a wiring bug here to black-hole
+// Valleymede's UI.
+function tenantPagesFor(templateKey) {
+  if (templateKey === 'personal_assistant') {
+    return {
+      dashboard: PersonalAssistantPage,
+      calls:     CallLogsPage,
+      my_info:   MyInfoPage,
+      settings:  SettingsPage
+    };
+  }
+  // Golf (also the implicit default) — keep Valleymede's shape exactly.
+  if (templateKey === 'golf_course' || templateKey === 'driving_range' || !templateKey) {
+    return {
+      dashboard: DashboardPage,
+      teesheet:  TeeSheetPage,
+      bookings:  BookingsPage,
+      customers: CustomersPage,
+      calls:     CallLogsPage,
+      settings:  SettingsPage
+    };
+  }
+  // Minimal "other" baseline until Phase 7 adds dedicated verticals.
+  return {
+    dashboard: DashboardPage,
+    calls:     CallLogsPage,
+    customers: CustomersPage,
+    settings:  SettingsPage
+  };
+}
+
+// ============================================
 // MAIN APP
 // ============================================
 function App() {
@@ -3672,6 +3983,11 @@ function App() {
           const s = {
             role: d.user.role,
             business_id: d.user.business_id,
+            // /auth/verify now echoes the tenant's template_key + name so
+            // the sidebar and page router can branch without a second
+            // network round-trip on first render.
+            business_name: d.user.business_name || null,
+            template_key: d.user.template_key || null,
             username: d.user.username
           };
           setSession(s);
@@ -3711,6 +4027,8 @@ function App() {
     setSessionState({
       role: data.role,
       business_id: data.business_id,
+      business_name: data.business_name || null,
+      template_key: data.template_key || null,
       username: data.username,
       name: data.name
     });
@@ -3740,14 +4058,17 @@ function App() {
   }
 
   const isSuper = session.role === 'super_admin';
-  const tenantPages = {
-    dashboard: DashboardPage,
-    teesheet: TeeSheetPage,
-    bookings: BookingsPage,
-    customers: CustomersPage,
-    calls: CallLogsPage,
-    settings: SettingsPage
-  };
+
+  // Template resolution — tenant users get it from their JWT-issued session
+  // blob (populated by /auth/verify + /auth/login). Super-admins acting-as
+  // another business pick it up from the cached business list, because their
+  // JWT's template_key belongs to *their own* row (if any), not the tenant
+  // they're impersonating.
+  const effectiveTemplateKey = isSuper
+    ? (businesses.find(b => b.id === selectedBusinessId) || {}).template_key || null
+    : session.template_key || null;
+
+  const tenantPages = tenantPagesFor(effectiveTemplateKey);
 
   // Super admin with no selected business → platform dashboard only.
   if (isSuper && !selectedBusinessId) {
@@ -3788,6 +4109,8 @@ function App() {
         // data they're looking at. Falls back to generic text when the
         // lookup hasn't resolved yet (first render after act-as).
         tenantName: (businesses.find(b => b.id === selectedBusinessId) || {}).name
+          || session.business_name,
+        templateKey: effectiveTemplateKey
       }),
       React.createElement('main', { className: 'flex-1 p-8 overflow-auto bg-gray-50' },
         React.createElement(PageComponent)

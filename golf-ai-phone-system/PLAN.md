@@ -308,6 +308,125 @@ Audit trail + analytics layered on the multi-tenant backend, plus a final sweep 
 
 ---
 
+## Pre-Phase 7 — `personal_assistant` template (2026-04-23)
+
+Interstitial vertical-expansion work completed before Phase 7 starts on
+billing. Adds the first non-golf, non-hospitality template: a warm AI
+receptionist for solo professionals and small-business owners who want
+their calls screened and summarized without hiring staff.
+
+**Deliverables shipped**
+
+- `server/services/templates.js` — new `PERSONAL_ASSISTANT` template
+  (👤). Seeds `owner_profile`, `schedule_preferences`,
+  `important_contacts`, `call_handling_rules`, `post_call_sms`, and a
+  friendly `ai_personality` with greetings tuned for a solo operator.
+- `server/services/personal-assistant-prompt.js` — new sibling prompt
+  builder that reads the settings above and produces a non-golf system
+  prompt with sections for owner profile, schedule, VIPs, caller
+  context, after-hours behavior, and tools. No hardcoded tenant
+  content — fully settings-driven.
+- `server/services/system-prompt.js` — dispatcher at the top of
+  `buildSystemPrompt` that routes to the personal-assistant builder
+  when `businesses.template_key = 'personal_assistant'`. Golf path
+  unchanged.
+- `server/services/notification.js` — new `sendPostCallSummary(businessId, details)`
+  that formats and sends a concise SMS recap to the owner (gated on
+  the `post_call_sms.enabled` setting). Falls back through
+  `to_number` → `businesses.transfer_number` → `notifications.sms_to`.
+- `server/services/grok-voice.js` — close-handler fires
+  `sendPostCallSummary` (fire-and-forget) when the tenant's template
+  is `personal_assistant`. Transcript, summary, duration, caller name,
+  and start-time are all forwarded.
+- `command-center/src/App.jsx` — sidebar and page router are now
+  template-aware via `sidebarItemsFor()` + `tenantPagesFor()`. The
+  personal-assistant nav is _Personal Assistant · Call History ·
+  My Info · Settings_. New `PersonalAssistantPage` (landing) and
+  `MyInfoPage` (owner-profile form) components. `/auth/verify` and
+  `/auth/login` now persist `template_key` + `business_name` into the
+  session so first render doesn't flicker.
+- `server/routes/auth.js` — `/verify` and `/login` both echo
+  `template_key` and `business_name` from the businesses row.
+
+**Verification harness** (`/tmp/pa_harness.js`, 7/7 passing):
+
+1. `templates.listTemplates()` exposes `personal_assistant` with the
+   correct emoji and label.
+2. `applyTemplate` seeds every expected settings key + ≥2 greetings.
+3. `buildPersonalAssistantPrompt` contains the owner + assistant names
+   and none of the golf terms (tee time / green fee / cart / etc.).
+4. `buildSystemPrompt` routes to the PA builder when
+   `template_key = 'personal_assistant'`.
+5. `buildSystemPrompt` still serves the golf prompt for
+   `template_key = 'golf_course'` (Valleymede safety net).
+6. `sendPostCallSummary` produces the expected
+   `[Acme Advisory] Alex called at 2:15pm — … Duration: 62s.` body
+   and hits the configured owner number.
+7. `sendPostCallSummary` short-circuits to `null` when the
+   `post_call_sms.enabled` flag is false.
+
+A separate Valleymede-shape sanity check confirms the golf prompt
+still renders end-to-end after the dispatcher rewire (4/4 passing).
+
+**Pre-Phase 7 locked (2026-04-23).**
+
+### Polish pass (2026-04-23)
+
+Four small refinements applied on top of the locked Pre-Phase 7 work, at
+the user's request, before handing off to Phase 7:
+
+1. **Prominent `assistant_name` plumbing in the prompt.**
+   `buildPersonalAssistantPrompt` now reads the assistant's voice-facing
+   name from `owner_profile.assistant_name` first, then legacy
+   `ai_personality.name`, and finally defaults to `"Your Assistant"`.
+   Comments in the prompt builder call this out as a customizable
+   per-tenant field so future maintainers don't re-hardcode a name.
+
+2. **Shorter, more natural post-call SMS.** `sendPostCallSummary` now
+   emits a 2-line body at most: `"{Who} called at {time} — {summary}"`
+   followed optionally by `"Left message: {preview}"`. No business tag,
+   no duration suffix. The preview regex was also fixed so the `caller:`
+   / `user:` speaker label is stripped before the text is included.
+
+3. **Sidebar already clean.** Verified `sidebarItemsFor('personal_assistant')`
+   returns exactly four items (👤 Personal Assistant, Call History,
+   My Info, Settings) and that golf-specific pages are not registered in
+   `tenantPagesFor('personal_assistant')`. No change needed.
+
+4. **`assistant_name` pipeline end-to-end.**
+   - Template default: `owner_profile` now seeds `assistant_name: ''` so
+     the column exists on every new PA tenant.
+   - Wizard UI: step 2 renders a labelled `Assistant name` text input
+     (placeholder *"e.g. Sam, Alex, Robin…"*, 40-char cap) when
+     `personal_assistant` is selected. Value is posted as `assistant_name`
+     to `POST /api/super/businesses`.
+   - Super-admin route: validates, trims, caps at 40 chars, and — only
+     when the selected template is `personal_assistant` and the field is
+     non-empty — merges it into `owner_profile` via
+     `jsonb_set(..., '{assistant_name}', ...)` inside the creation
+     transaction.
+   - My Info page: renders a dedicated "Assistant name" callout at the
+     top of the profile card so owners can edit it post-creation; the
+     value round-trips through `PUT /api/settings/owner_profile`.
+
+**Verification harness (`/tmp/pa_harness.js`) re-run: 11/11 passing.**
+New assertions cover:
+
+- Template seeds `owner_profile.assistant_name = ''` by default.
+- Blank `assistant_name` falls back to `"Your Assistant"`.
+- Custom `assistant_name` (`'Robin'`) overrides the default.
+- SMS body has no `[Business]` tag, no `Duration:` suffix, at most 2
+  lines, and the preview strips the `caller:` speaker label.
+- Single-line SMS when the transcript / preview is empty.
+
+Valleymede golf sanity check re-run: 1/1 passing. Golf prompt still
+mentions tee times, course info, and pricing; no personal-assistant
+copy leaks in.
+
+**Polish pass locked (2026-04-23).**
+
+---
+
 ## Phase 7 — Billing & plans (later)
 
 Stripe integration, plans, usage metering (call minutes, bookings). Not in scope until Phase 6 is stable.

@@ -288,9 +288,21 @@ ${callerLine}
   }
   console.log(`[tenant:${businessId}][${callSid}] Voice tier: ${voiceCfg.tier || 'legacy'} | model=${voiceCfg.model} voice=${voiceCfg.voice} speed=${voiceCfg.speed}`);
 
-  // xAI realtime mirrors the OpenAI realtime convention of taking `model` as a
-  // query string on the WebSocket URL. Encode defensively.
-  const grokUrl = `${GROK_REALTIME_URL}?model=${encodeURIComponent(voiceCfg.model)}`;
+  // IMPORTANT: do NOT put `?model=...` on the WebSocket URL.
+  //
+  // Earlier iterations of this file assumed xAI's realtime endpoint mirrored
+  // the OpenAI-realtime `?model=` convention, but in production that caused
+  // the handshake to complete at the TCP level while no audio ever streamed
+  // back — phone answered, dead silence on the caller's end. xAI picks the
+  // realtime model server-side; the documented override for the non-default
+  // model lives in session.update, not the URL.
+  //
+  // For now every tenant connects to the bare realtime endpoint and the tier
+  // plumbing still controls `voice` + `speed` in the session.update payload
+  // below. Once we've verified the correct way to activate
+  // `grok-think-fast-1.0` we can re-add a per-tier model override — but it
+  // must go into the session payload, not the URL.
+  const grokUrl = GROK_REALTIME_URL;
 
   // Connect to Grok Real-time Voice API
   const grokWs = new WebSocket(grokUrl, {

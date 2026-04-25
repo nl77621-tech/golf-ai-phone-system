@@ -2718,12 +2718,21 @@ function EditTenantModal({ business, onClose, onSaved }) {
   const [form, setForm] = useState(null);
   const [ownerProfile, setOwnerProfile] = useState(null);
   const [originalOwnerProfile, setOriginalOwnerProfile] = useState(null);
+  // Original template_key — used to decide whether to show the
+  // "switching template" warning banner and to label the previous value.
+  const [originalTemplateKey, setOriginalTemplateKey] = useState(null);
+  // Catalog of available templates for the dropdown. Loaded from
+  // /api/super/templates so the same registry powers wizard + edit.
+  const [templates, setTemplates] = useState([]);
 
   useEffect(() => {
     if (!business) return;
     setLoading(true);
-    api(`/api/super/businesses/${business.id}`)
-      .then(resp => {
+    Promise.all([
+      api(`/api/super/businesses/${business.id}`),
+      api('/api/super/templates').catch(() => ({ templates: [] }))
+    ])
+      .then(([resp, tpl]) => {
         const b = resp.business;
         setForm({
           name: b.name || '',
@@ -2739,8 +2748,11 @@ function EditTenantModal({ business, onClose, onSaved }) {
           primary_color: b.primary_color || '',
           logo_url: b.logo_url || '',
           internal_notes: b.internal_notes || '',
-          billing_notes: b.billing_notes || ''
+          billing_notes: b.billing_notes || '',
+          template_key: b.template_key || ''
         });
+        setOriginalTemplateKey(b.template_key || null);
+        setTemplates(Array.isArray(tpl?.templates) ? tpl.templates : []);
         // Only surface owner_profile if the tenant has a settings row for
         // it. The PA wizard seeds assistant_name into this object; we
         // expose just that field (plus any raw JSON for power users).
@@ -2796,7 +2808,7 @@ function EditTenantModal({ business, onClose, onSaved }) {
         React.createElement('div', null,
           React.createElement('h2', { className: 'text-lg font-bold text-gray-800' }, '\u270f\ufe0f Edit tenant'),
           React.createElement('p', { className: 'text-xs text-gray-500 mt-0.5' },
-            `${business.name} (${business.slug}) \u2022 template: ${business.template_key || '\u2014'} (locked)`
+            `${business.name} (${business.slug}) \u2022 template: ${business.template_key || '\u2014'}`
           )
         ),
         React.createElement('button', {
@@ -2833,6 +2845,49 @@ function EditTenantModal({ business, onClose, onSaved }) {
                   ['pro', 'pro'], ['trial', 'trial']
                 ])
               )
+            ),
+
+            // ---------- Template (vertical) ----------
+            // Switching template_key changes the sidebar shape + page router
+            // (see sidebarItemsFor / tenantPagesFor) so the tenant sees the
+            // right vertical's UI. We do NOT re-apply the new template's
+            // settings defaults — that would risk clobbering customisations
+            // the tenant has already made. The dropdown is disabled for
+            // Valleymede (id=1) because the legacy plan-lock would force
+            // golf anyway and the mismatch only confuses forensics.
+            React.createElement('section', null,
+              React.createElement('h3', { className: 'text-xs font-bold uppercase tracking-wide text-gray-500 mb-2' }, 'Template'),
+              business.id === 1
+                ? React.createElement('p', { className: 'text-xs text-gray-500' },
+                    'Valleymede (id=1) is locked to the golf_course template by the legacy safety lock.'
+                  )
+                : React.createElement('div', null,
+                    React.createElement('label', { className: 'text-xs text-gray-600 block mb-1' }, 'Vertical / template'),
+                    React.createElement('select', {
+                      value: form.template_key || '',
+                      onChange: e => set('template_key', e.target.value),
+                      className: 'w-full text-sm border rounded-lg px-3 py-2 bg-white'
+                    },
+                      React.createElement('option', { value: '' }, '\u2014 unset \u2014'),
+                      (templates.length > 0
+                        ? templates
+                        : [
+                            { key: 'golf_course', label: 'Golf Course' },
+                            { key: 'driving_range', label: 'Driving Range' },
+                            { key: 'restaurant', label: 'Restaurant' },
+                            { key: 'personal_assistant', label: 'Personal Assistant' },
+                            { key: 'other', label: 'Other / Generic' }
+                          ]
+                      ).map(t =>
+                        React.createElement('option', { key: t.key, value: t.key }, `${t.icon_emoji ? t.icon_emoji + ' ' : ''}${t.label} (${t.key})`)
+                      )
+                    ),
+                    form.template_key && form.template_key !== originalTemplateKey && React.createElement('p', {
+                      className: 'mt-2 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2'
+                    },
+                      `Switching from "${originalTemplateKey || 'unset'}" to "${form.template_key}" changes which sidebar + pages this tenant sees. Existing settings (greetings, hours, prompt, etc.) are NOT reset — only the UI shape changes. The tenant must sign out and sign back in for the new shape to take effect.`
+                    )
+                  )
             ),
 
             // ---------- Telephony ----------

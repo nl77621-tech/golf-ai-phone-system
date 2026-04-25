@@ -753,17 +753,40 @@ router.patch('/businesses/:id', async (req, res) => {
     return res.status(409).json({ error: 'Business is soft-deleted — restore before editing' });
   }
 
-  // Editable business columns. template_key deliberately omitted (see above).
+  // Editable business columns. template_key is editable so a super-admin
+  // can convert a tenant from one vertical to another (e.g. switch a
+  // mis-onboarded golf_course tenant to personal_assistant) without
+  // recreating the row. We DON'T re-apply the new template's settings
+  // defaults here — that's intentionally a separate operation, since
+  // applying a template wholesale could clobber settings the tenant has
+  // already customised. The Edit modal makes that clear.
   const allowed = [
     'name', 'slug', 'twilio_phone_number', 'transfer_number', 'timezone',
     'contact_email', 'contact_phone', 'status', 'is_active', 'plan',
     'primary_color', 'logo_url', 'internal_notes', 'setup_complete',
-    'billing_notes'
+    'billing_notes', 'template_key'
   ];
   const body = req.body || {};
   const patches = {};
   for (const k of allowed) {
     if (k in body) patches[k] = body[k];
+  }
+
+  // Validate template_key against the registry. Reject unknown keys so a
+  // typo can't push a tenant into the null-fallback golf path silently.
+  // Valleymede (id=1) is doubly-protected: we refuse to flip its template
+  // away from golf_course because the legacy plan check would still force
+  // golf, and the mismatch would just confuse forensics.
+  if ('template_key' in patches) {
+    const newKey = patches.template_key;
+    if (typeof newKey !== 'string' || !getTemplate(newKey)) {
+      return res.status(400).json({ error: `Unknown template_key '${newKey}'` });
+    }
+    if (id === 1 && newKey !== 'golf_course') {
+      return res.status(403).json({
+        error: 'Tenant id=1 (Valleymede) is locked to template_key=golf_course'
+      });
+    }
   }
 
   // Settings map. Every entry upserts into settings(business_id, key).

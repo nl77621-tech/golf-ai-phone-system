@@ -1667,6 +1667,7 @@ function SettingsPage() {
     { id: 'daily', label: '📋 Daily' },
     { id: 'general', label: 'General' },
     { id: 'phones', label: '📞 Phones' },
+    { id: 'team', label: '👥 Team' },
     { id: 'knowledge', label: 'Knowledge' },
     { id: 'hours', label: 'Hours' },
     { id: 'pricing', label: 'Pricing' },
@@ -1753,6 +1754,9 @@ function SettingsPage() {
           title: 'This Business\u2019s Phone Numbers'
         })
       ),
+
+      // TEAM TAB \u2014 directory of named people the AI can leave a message for.
+      activeTab === 'team' && React.createElement(TeamDirectoryManager, null),
 
       // PROMPT TAB
       activeTab === 'prompt' && React.createElement('div', null,
@@ -2400,6 +2404,187 @@ function TeeSheetPage() {
           React.createElement('button', { onClick: () => setModal(null), className: 'px-5 py-2.5 rounded-xl font-semibold text-sm bg-gray-100 hover:bg-gray-200 text-gray-600 transition-colors' }, 'Cancel')
         )
       )
+    )
+  );
+}
+
+// ============================================
+// TEAM DIRECTORY MANAGER
+// ============================================
+//
+// Per-tenant directory of named people the AI can leave a message for.
+// Mounts inside the "Team" tab of every Settings page (golf, personal,
+// restaurant). Backed by the /api/team CRUD routes; SMS dispatch happens
+// server-side via the take_message_for_team_member tool, this UI only
+// manages the directory + offers a per-row "test SMS" button so the
+// operator can verify the phone number works before relying on it on a
+// real call.
+function TeamDirectoryManager() {
+  const [members, setMembers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [testing, setTesting] = useState(null);
+  const [draft, setDraft] = useState({ name: '', role: '', sms_phone: '', email: '', aliases: '' });
+  const [adding, setAdding] = useState(false);
+
+  const reload = () => {
+    setLoading(true);
+    api('/api/team')
+      .then(rows => setMembers(Array.isArray(rows) ? rows : []))
+      .catch(err => setError(err.message || 'Failed to load team'))
+      .finally(() => setLoading(false));
+  };
+  useEffect(reload, []);
+
+  const addMember = async () => {
+    if (!draft.name.trim() || !draft.sms_phone.trim()) {
+      setError('Name and phone number are required.');
+      return;
+    }
+    setAdding(true);
+    setError('');
+    try {
+      const aliases = draft.aliases
+        ? draft.aliases.split(',').map(s => s.trim()).filter(Boolean)
+        : [];
+      const created = await api('/api/team', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: draft.name.trim(),
+          role: draft.role.trim() || null,
+          sms_phone: draft.sms_phone.trim(),
+          email: draft.email.trim() || null,
+          aliases
+        })
+      });
+      setMembers(prev => [...prev, created]);
+      setDraft({ name: '', role: '', sms_phone: '', email: '', aliases: '' });
+    } catch (err) {
+      setError(err.message || 'Failed to add team member');
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  const updateField = async (id, patch) => {
+    try {
+      const updated = await api(`/api/team/${id}`, { method: 'PATCH', body: JSON.stringify(patch) });
+      setMembers(prev => prev.map(m => (m.id === id ? updated : m)));
+    } catch (err) {
+      alert(err.message || 'Failed to update team member');
+    }
+  };
+
+  const removeMember = async (id, name) => {
+    if (!window.confirm(`Remove ${name} from the directory? They’ll no longer receive routed messages.`)) return;
+    try {
+      await api(`/api/team/${id}`, { method: 'DELETE' });
+      setMembers(prev => prev.filter(m => m.id !== id));
+    } catch (err) {
+      alert(err.message || 'Failed to remove team member');
+    }
+  };
+
+  const testSms = async (id, name) => {
+    setTesting(id);
+    try {
+      const result = await api(`/api/team/${id}/test-sms`, { method: 'POST', body: JSON.stringify({}) });
+      if (result.delivered) {
+        alert(`Test SMS sent to ${name}. Check their phone.`);
+      } else {
+        alert(`Test SMS attempted for ${name} but Twilio reported it didn't deliver. Check the phone number.`);
+      }
+    } catch (err) {
+      alert(`Test failed: ${err.message || 'unknown error'}`);
+    } finally {
+      setTesting(null);
+    }
+  };
+
+  if (loading) return React.createElement('div', { className: 'text-sm text-gray-500' }, 'Loading team directory…');
+
+  return React.createElement('div', null,
+    React.createElement('p', { className: 'text-sm text-gray-500 mb-4' },
+      'When a caller wants to leave a message for one of these people, the AI texts them the transcript. Add by name (first or full — the AI matches case-insensitively).'
+    ),
+    error && React.createElement('div', { className: 'mb-3 text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2' }, error),
+
+    members.length === 0
+      ? React.createElement('p', { className: 'text-sm text-gray-400 italic mb-4' }, 'No team members yet. Add the first one below.')
+      : React.createElement('div', { className: 'space-y-2 mb-6' },
+          members.map(m =>
+            React.createElement('div', {
+              key: m.id,
+              className: `border rounded-lg p-3 ${m.is_active ? 'bg-white' : 'bg-gray-50 opacity-70'}`
+            },
+              React.createElement('div', { className: 'flex items-start justify-between gap-3' },
+                React.createElement('div', { className: 'flex-1 min-w-0' },
+                  React.createElement('div', { className: 'flex items-center gap-2' },
+                    React.createElement('span', { className: 'font-semibold text-gray-800' }, m.name),
+                    m.role && React.createElement('span', { className: 'text-xs text-gray-500' }, '• ' + m.role),
+                    !m.is_active && React.createElement('span', { className: 'text-xs bg-gray-200 text-gray-600 px-2 py-0.5 rounded' }, 'inactive')
+                  ),
+                  React.createElement('div', { className: 'text-xs text-gray-500 mt-1' },
+                    React.createElement('span', null, '📞 ' + m.sms_phone),
+                    m.email && React.createElement('span', { className: 'ml-3' }, '✉️ ' + m.email)
+                  ),
+                  Array.isArray(m.aliases) && m.aliases.length > 0 && React.createElement('div', { className: 'text-xs text-gray-400 mt-1' },
+                    'Also called: ' + m.aliases.join(', ')
+                  )
+                ),
+                React.createElement('div', { className: 'flex flex-col gap-1 shrink-0' },
+                  React.createElement('button', {
+                    onClick: () => testSms(m.id, m.name),
+                    disabled: !m.is_active || testing === m.id,
+                    className: 'text-xs px-2 py-1 rounded bg-golf-50 text-golf-700 hover:bg-golf-100 disabled:opacity-50'
+                  }, testing === m.id ? 'Sending…' : 'Test SMS'),
+                  React.createElement('button', {
+                    onClick: () => updateField(m.id, { is_active: !m.is_active }),
+                    className: 'text-xs px-2 py-1 rounded bg-gray-100 text-gray-700 hover:bg-gray-200'
+                  }, m.is_active ? 'Disable' : 'Enable'),
+                  React.createElement('button', {
+                    onClick: () => removeMember(m.id, m.name),
+                    className: 'text-xs px-2 py-1 rounded bg-red-50 text-red-700 hover:bg-red-100'
+                  }, 'Remove')
+                )
+              )
+            )
+          )
+        ),
+
+    React.createElement('div', { className: 'border-t pt-4' },
+      React.createElement('h3', { className: 'font-semibold text-sm mb-3' }, 'Add a team member'),
+      React.createElement('div', { className: 'grid grid-cols-1 md:grid-cols-2 gap-3 mb-3' },
+        React.createElement('input', {
+          type: 'text', placeholder: 'Name (e.g. John Smith)',
+          value: draft.name, onChange: e => setDraft({ ...draft, name: e.target.value }),
+          className: 'border rounded-lg px-3 py-2 text-sm'
+        }),
+        React.createElement('input', {
+          type: 'text', placeholder: 'Role / title (optional, e.g. Manager)',
+          value: draft.role, onChange: e => setDraft({ ...draft, role: e.target.value }),
+          className: 'border rounded-lg px-3 py-2 text-sm'
+        }),
+        React.createElement('input', {
+          type: 'tel', placeholder: 'SMS phone (E.164 — +14165551234)',
+          value: draft.sms_phone, onChange: e => setDraft({ ...draft, sms_phone: e.target.value }),
+          className: 'border rounded-lg px-3 py-2 text-sm'
+        }),
+        React.createElement('input', {
+          type: 'email', placeholder: 'Email (optional)',
+          value: draft.email, onChange: e => setDraft({ ...draft, email: e.target.value }),
+          className: 'border rounded-lg px-3 py-2 text-sm'
+        }),
+        React.createElement('input', {
+          type: 'text', placeholder: 'Aliases (comma-separated, optional)',
+          value: draft.aliases, onChange: e => setDraft({ ...draft, aliases: e.target.value }),
+          className: 'border rounded-lg px-3 py-2 text-sm md:col-span-2'
+        })
+      ),
+      React.createElement('button', {
+        onClick: addMember, disabled: adding,
+        className: 'bg-golf-600 hover:bg-golf-700 text-white px-4 py-2 rounded-lg text-sm disabled:opacity-50'
+      }, adding ? 'Adding…' : 'Add team member')
     )
   );
 }
@@ -4811,6 +4996,7 @@ function PersonalSettingsPage() {
 
   const tabs = [
     { id: 'phones',        label: '\uD83D\uDCDE Phones' },
+    { id: 'team',          label: '\uD83D\uDC65 Team' },
     { id: 'greetings',     label: 'Greetings' },
     { id: 'prompt',        label: 'Prompt' },
     { id: 'notifications', label: 'Notifications' },
@@ -4847,6 +5033,9 @@ function PersonalSettingsPage() {
           title: 'Your Phone Numbers'
         })
       ),
+
+      // TEAM
+      activeTab === 'team' && React.createElement(TeamDirectoryManager, null),
 
       // GREETINGS
       activeTab === 'greetings' && React.createElement('div', null,
@@ -5072,6 +5261,7 @@ function RestaurantSettingsPage() {
     { id: 'menu',          label: '\uD83D\uDCCB Menu' },
     { id: 'reservations',  label: '\uD83D\uDCC5 Reservations' },
     { id: 'phones',        label: '\uD83D\uDCDE Phones' },
+    { id: 'team',          label: '\uD83D\uDC65 Team' },
     { id: 'greetings',     label: 'Greetings' },
     { id: 'prompt',        label: 'Prompt' },
     { id: 'notifications', label: 'Notifications' },
@@ -5232,6 +5422,9 @@ function RestaurantSettingsPage() {
           title: 'Restaurant Phone Numbers'
         })
       ),
+
+      // TEAM
+      activeTab === 'team' && React.createElement(TeamDirectoryManager, null),
 
       // GREETINGS — same KV store as golf / personal so behaviour is identical.
       activeTab === 'greetings' && React.createElement('div', null,

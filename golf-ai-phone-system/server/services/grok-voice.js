@@ -29,6 +29,7 @@ const { query, getSetting, getBusinessById } = require('../config/database');
 const { requireBusinessId } = require('../context/tenant-context');
 const { recordCallUsage } = require('./credits');
 const { resolveVoiceConfigFromSettings } = require('./voice-tiers');
+const { findTeamMemberByName, sendMessageToTeamMember } = require('./team-directory');
 const teeon = require('./teeon-automation');
 require('dotenv').config();
 
@@ -799,6 +800,21 @@ function buildToolDefinitions() {
         },
         required: ['name']
       }
+    },
+    {
+      type: 'function',
+      name: 'take_message_for_team_member',
+      description: 'Take a message for a specific team member from the TEAM DIRECTORY in your system prompt and dispatch it as an SMS to that person. Call this AFTER you have: (1) confirmed the recipient name back to the caller, (2) collected the caller\'s name and a callback number, (3) listened to the message. NEVER invent a recipient — only call this for names that appear in your TEAM DIRECTORY. If the directory is empty or the caller asks for a name not on the list, do not call this tool — apologize and offer to take a general message or transfer them.',
+      parameters: {
+        type: 'object',
+        properties: {
+          team_member_name: { type: 'string', description: 'The exact name from the TEAM DIRECTORY this message is for. Use the canonical name as listed (you can match by alias, but pass the canonical name).' },
+          caller_name: { type: 'string', description: 'The caller\'s name as they gave it. If they declined to share, pass "Unknown caller".' },
+          caller_phone: { type: 'string', description: 'A callback number for the recipient. Default to the caller\'s incoming number unless they gave you a different one.' },
+          message: { type: 'string', description: 'A short transcript of what the caller wants to convey. Keep it under ~200 words. Do not paraphrase loosely — capture key facts (what, when, why).' }
+        },
+        required: ['team_member_name', 'message']
+      }
     }
   ];
 }
@@ -1149,6 +1165,87 @@ async function executeToolCall(toolName, args, ctx) {
           }
         }
         return { success: false, message: 'I had trouble saving that number, but no worries — staff will follow up with you.' };
+      }
+
+      case 'take_message_for_team_member': {
+        // Resolve the spoken name to a directory row, then dispatch SMS via
+        // notification.sendSMS. Three return shapes the AI knows how to
+        // handle (matched language in the system-prompt's TEAM DIRECTORY
+        // section): success / ambiguous / not_found / inactive.
+        console.log(
+          `[tenant:${businessId}][${callLogId}] take_message_for_team_member | for=${args.team_member_name} | from=${args.caller_name || 'n/a'}`
+        );
+        const spokenName = typeof args.team_member_name === 'string' ? args.team_member_name : '';
+        if (!spokenName.trim()) {
+          return { success: false, error: 'missing_name', message: 'Tell me who the message is for, and I’ll get it to them.' };
+        }
+        if (typeof args.message !== 'string' || !args.message.trim()) {
+          return { success: false, error: 'missing_message', message: 'What would you like me to pass along?' };
+        }
+
+        let match;
+        try {
+          match = await findTeamMemberByName(businessId, spokenName);
+        } catch (err) {
+          console.error(`[tenant:${businessId}][${callLogId}] team lookup failed:`, err.message);
+          return { success: false, error: 'lookup_failed', message: 'I’m having trouble looking that up — let me take a general message and someone will follow up.' };
+        }
+
+        if (!match) {
+          return {
+            success: false,
+            error: 'not_found',
+            message: `I don’t have ${spokenName} on my list of people I can leave a message for. I can take a general message and pass it along, or transfer you if you’d like.`
+          };
+        }
+        if (match.ambiguous) {
+          return {
+            success: false,
+            error: 'ambiguous',
+            candidates: match.candidates,
+            message: `I have a couple of people by that name — ${match.candidates.map(c => c.name + (c.role ? ` (${c.role})` : '')).join(' or ')}. Which one?`
+          };
+        }
+
+        // Resolve callback number — caller-supplied beats the inbound DID,
+        // and the inbound DID beats nothing.
+        const callerPhone =
+          (typeof args.caller_phone === 'string' && args.caller_phone.trim()) ||
+          callerContext?.callerPhone ||
+          callerContext?.alternatePhone ||
+          null;
+        const callerName =
+          (typeof args.caller_name === 'string' && args.caller_name.trim()) ||
+          callerContext?.name ||
+          'Unknown caller';
+
+        try {
+          const business = await getBusinessById(businessId);
+          const result = await sendMessageToTeamMember(businessId, match.id, {
+            callerName,
+            callerPhone,
+            message: args.message,
+            businessName: business?.name
+          });
+          console.log(
+            `[tenant:${businessId}][${callLogId}] Routed message to ${match.name} (id=${match.id}) — sid=${result.message_sid}`
+          );
+          // Note: the per-call action log is appended at the WebSocket
+          // dispatch site (see `callState.actions.push` near the
+          // function_call_arguments.done handler) — no need to do it here.
+          return {
+            success: true,
+            recipient: match.name,
+            message: `I’ll get that to ${match.name} right away.`
+          };
+        } catch (err) {
+          console.error(`[tenant:${businessId}][${callLogId}] team SMS dispatch failed:`, err.message);
+          return {
+            success: false,
+            error: 'sms_failed',
+            message: `I’ll make sure ${match.name} gets your message — there was a hiccup with the text right now, but I’ve noted it.`
+          };
+        }
       }
 
       default:

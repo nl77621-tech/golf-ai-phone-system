@@ -9,6 +9,7 @@
 const { getSetting, getBusinessById } = require('../config/database');
 const { requireBusinessId } = require('../context/tenant-context');
 const { buildPersonalAssistantPrompt } = require('./personal-assistant-prompt');
+const { listTeamMembers } = require('./team-directory');
 
 async function buildSystemPrompt(businessId, callerContext = {}) {
   requireBusinessId(businessId, 'buildSystemPrompt');
@@ -63,6 +64,18 @@ async function buildSystemPrompt(businessId, callerContext = {}) {
     getSetting(businessId, 'booking_settings'),
     getSetting(businessId, 'greetings')
   ]);
+
+  // Per-tenant team directory — list of named people the AI can leave a
+  // message for (and trigger an SMS to via take_message_for_team_member).
+  // Only active members are surfaced; the lookup at tool-call time also
+  // filters to active so a disabled row never receives a routed message.
+  // Failure here is non-fatal: a tenant with no directory just doesn't
+  // expose the message-routing prompt section.
+  const teamMembers = await listTeamMembers(businessId, { includeInactive: false })
+    .catch(err => {
+      console.warn(`[tenant:${businessId}] Team directory load failed:`, err.message);
+      return [];
+    });
 
   // Tenant identity + timezone — everything downstream uses these.
   const businessName =
@@ -197,6 +210,36 @@ Keep it short and natural.
 `;
   }
 
+  // Team directory — names the AI can route messages to. The
+  // `take_message_for_team_member` tool resolves the spoken name and
+  // dispatches an SMS to that member. We list only active members; a
+  // tenant with no entries gets no section, which keeps the prompt
+  // unchanged for tenants that haven't set up the feature yet.
+  let teamSection = '';
+  if (Array.isArray(teamMembers) && teamMembers.length > 0) {
+    const lines = teamMembers.map(m => {
+      const role = m.role ? ` (${m.role})` : '';
+      const aliases = Array.isArray(m.aliases) && m.aliases.length > 0 ? ` — also called ${m.aliases.join(', ')}` : '';
+      return `- ${m.name}${role}${aliases}`;
+    });
+    teamSection = `
+## TEAM DIRECTORY (people you can leave a message for)
+If a caller wants to leave a message for a specific person, these are the people you can reach. They each have a phone number on file and will receive an SMS with the transcript.
+
+${lines.join('\n')}
+
+How to handle "I'd like to leave a message for [name]":
+- Confirm the name back to the caller ("a message for John, got it").
+- Ask the caller for their name and a callback number if they haven't already given one.
+- Listen to the message — keep it short, no more than ~2 minutes of content.
+- Call the take_message_for_team_member tool with: { team_member_name, caller_name, caller_phone, message }.
+- After the tool returns success, tell the caller "I've passed that along to [name] — they'll get it as a text message right away."
+- If the tool returns ambiguous (multiple people share that name), ask "did you mean [Name A] or [Name B]?" and call the tool again with the disambiguated name.
+- If the tool returns not_found, apologize and offer to take a general message or transfer them.
+- DO NOT invent a recipient. Only leave messages for people in the list above.
+`;
+  }
+
   // Phone/contact fallback: prefer the business row, then course_info, then transfer_number.
   const businessPhoneLocal =
     business?.transfer_number ||
@@ -306,6 +349,7 @@ ${seasonalNotes}
 ` : ''}${dailySection}
 ${announcementSection}
 ${greetingSection}
+${teamSection}
 ${callerSection}
 
 ## AFTER-HOURS BEHAVIOR

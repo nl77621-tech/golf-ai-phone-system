@@ -45,6 +45,14 @@ const {
 } = require('../services/booking-manager');
 const { normalizePhone } = require('../services/caller-lookup');
 const { logEventFromReq } = require('../services/audit-log');
+const {
+  listTeamMembers,
+  getTeamMember,
+  createTeamMember,
+  updateTeamMember,
+  deleteTeamMember,
+  sendMessageToTeamMember
+} = require('../services/team-directory');
 
 // Apply auth + tenant hydration to every route in this router.
 router.use(requireAuth);
@@ -1037,6 +1045,132 @@ router.delete('/greetings/:id', async (req, res) => {
   } catch (err) {
     console.error(`[tenant:${businessId}] Delete greeting error:`, err.message);
     res.status(500).json({ error: 'Failed to delete greeting' });
+  }
+});
+
+// ============================================
+// TEAM DIRECTORY (per-tenant message routing)
+// ============================================
+//
+// CRUD for the team members the AI can leave a message for. Every route
+// is tenant-scoped via attachTenantFromAuth. POST/PATCH/DELETE require
+// business_admin (same gate as phone-numbers — these rows control SMS
+// destinations and shouldn't be editable by every staff user).
+
+// GET /api/team — list members (always returns inactive too so the UI
+// can offer a "re-enable" toggle).
+router.get('/team', async (req, res) => {
+  const businessId = tenantId(req);
+  try {
+    const members = await listTeamMembers(businessId, { includeInactive: true });
+    res.json(members);
+  } catch (err) {
+    console.error(`[tenant:${businessId}] Team list error:`, err.message);
+    res.status(500).json({ error: 'Failed to load team directory' });
+  }
+});
+
+// POST /api/team — create
+router.post('/team', requireBusinessAdmin, async (req, res) => {
+  const businessId = tenantId(req);
+  try {
+    const member = await createTeamMember(businessId, req.body || {});
+    await logEventFromReq(req, {
+      businessId,
+      action: 'team_member.created',
+      targetType: 'team_member',
+      targetId: member.id,
+      meta: { name: member.name, role: member.role, sms_phone: member.sms_phone }
+    }).catch(() => {});
+    res.status(201).json(member);
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ error: `A team member named "${req.body?.name}" already exists.` });
+    }
+    if (/required|valid phone/i.test(err.message)) {
+      return res.status(400).json({ error: err.message });
+    }
+    console.error(`[tenant:${businessId}] Team create error:`, err.message);
+    res.status(500).json({ error: 'Failed to create team member' });
+  }
+});
+
+// PATCH /api/team/:id — update
+router.patch('/team/:id', requireBusinessAdmin, async (req, res) => {
+  const businessId = tenantId(req);
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+  try {
+    const member = await updateTeamMember(businessId, id, req.body || {});
+    if (!member) return res.status(404).json({ error: 'Team member not found' });
+    await logEventFromReq(req, {
+      businessId,
+      action: 'team_member.updated',
+      targetType: 'team_member',
+      targetId: member.id,
+      meta: { fields: Object.keys(req.body || {}) }
+    }).catch(() => {});
+    res.json(member);
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ error: `A team member with that name already exists.` });
+    }
+    if (/empty|valid phone/i.test(err.message)) {
+      return res.status(400).json({ error: err.message });
+    }
+    console.error(`[tenant:${businessId}] Team update error:`, err.message);
+    res.status(500).json({ error: 'Failed to update team member' });
+  }
+});
+
+// DELETE /api/team/:id — hard delete (history lives in audit_log).
+router.delete('/team/:id', requireBusinessAdmin, async (req, res) => {
+  const businessId = tenantId(req);
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+  try {
+    const existing = await getTeamMember(businessId, id);
+    if (!existing) return res.status(404).json({ error: 'Team member not found' });
+    await deleteTeamMember(businessId, id);
+    await logEventFromReq(req, {
+      businessId,
+      action: 'team_member.deleted',
+      targetType: 'team_member',
+      targetId: id,
+      meta: { name: existing.name, role: existing.role, sms_phone: existing.sms_phone }
+    }).catch(() => {});
+    res.json({ deleted: true, id });
+  } catch (err) {
+    console.error(`[tenant:${businessId}] Team delete error:`, err.message);
+    res.status(500).json({ error: 'Failed to delete team member' });
+  }
+});
+
+// POST /api/team/:id/test-sms — fire a test SMS to verify the phone number.
+// Useful so the operator can confirm "I get pinged at the right number"
+// before relying on the AI to fire it on a real call. Body is optional.
+router.post('/team/:id/test-sms', requireBusinessAdmin, async (req, res) => {
+  const businessId = tenantId(req);
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+  try {
+    const result = await sendMessageToTeamMember(businessId, id, {
+      callerName: 'Test',
+      callerPhone: req.business?.twilio_phone_number || null,
+      message: req.body?.message || 'This is a test of your team-message SMS routing. If you got this, you’ll hear from the AI when a caller leaves you a real message.',
+      businessName: req.business?.name
+    });
+    await logEventFromReq(req, {
+      businessId,
+      action: 'team_member.test_sms',
+      targetType: 'team_member',
+      targetId: id,
+      meta: { delivered: result.delivered, message_sid: result.message_sid }
+    }).catch(() => {});
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error(`[tenant:${businessId}] Team test-sms error:`, err.message);
+    res.status(500).json({ error: err.message || 'Failed to send test SMS' });
   }
 });
 

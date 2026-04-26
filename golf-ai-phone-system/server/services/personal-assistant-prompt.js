@@ -34,6 +34,7 @@
  */
 const { getSetting, getBusinessById } = require('../config/database');
 const { requireBusinessId } = require('../context/tenant-context');
+const { listTeamMembers } = require('./team-directory');
 
 async function buildPersonalAssistantPrompt(businessId, callerContext = {}) {
   requireBusinessId(businessId, 'buildPersonalAssistantPrompt');
@@ -57,6 +58,15 @@ async function buildPersonalAssistantPrompt(businessId, callerContext = {}) {
     getSetting(businessId, 'business_hours'),
     getSetting(businessId, 'announcements')
   ]);
+
+  // Team directory — same shape as the golf path. Personal-assistant tenants
+  // legitimately use this too: a small business owner might list a spouse,
+  // dispatcher, or backup contact who can receive a routed message.
+  const teamMembers = await listTeamMembers(businessId, { includeInactive: false })
+    .catch(err => {
+      console.warn(`[tenant:${businessId}] PA team directory load failed:`, err.message);
+      return [];
+    });
 
   const timezone = business?.timezone || 'America/Toronto';
 
@@ -194,6 +204,30 @@ Early in the conversation ask for their name — something natural like "Who\u20
     personality?.after_hours_message ||
     `They\u2019re not available right now, but I\u2019ll make sure they get the message.`;
 
+  // ------- Team directory section -------
+  let teamSection = '';
+  if (Array.isArray(teamMembers) && teamMembers.length > 0) {
+    const lines = teamMembers.map(m => {
+      const role = m.role ? ` (${m.role})` : '';
+      const aliases = Array.isArray(m.aliases) && m.aliases.length > 0 ? ` \u2014 also called ${m.aliases.join(', ')}` : '';
+      return `- ${m.name}${role}${aliases}`;
+    });
+    teamSection = `## PEOPLE YOU CAN ROUTE A MESSAGE TO
+If the caller asks to leave a message for someone specific, these are the people on file. Each will get an SMS with your transcript.
+
+${lines.join('\n')}
+
+How to handle "leave a message for [name]":
+- Confirm the name back. Ask for caller name + callback number if missing.
+- Listen, keep it short (~2 min max).
+- Call take_message_for_team_member with { team_member_name, caller_name, caller_phone, message }.
+- On success: "I'll get that to [name] right away."
+- On ambiguous: ask "did you mean [A] or [B]?" and call again.
+- On not_found: apologize and offer to take a general message instead.
+- Never invent a recipient outside this list.
+`;
+  }
+
   // ------- Assemble -------
   const prompt = `You are ${assistantName}, a warm and capable personal assistant answering the phone for ${ownerName || 'the owner'}${ownerProfile?.business_name ? ` of ${ownerProfile.business_name}` : ''}. You are NOT a robot — you sound like a real person who has worked alongside them for a long time and genuinely cares about being helpful.
 
@@ -227,6 +261,8 @@ ${ownerSection}
 ${scheduleLines.length > 0 ? `## OWNER'S SCHEDULE PREFERENCES\n${scheduleLines.join('\n')}` : ''}
 
 ${vipSection}
+
+${teamSection}
 
 ## HOW TO HANDLE THIS CALL
 ${handlingLines.join('\n')}

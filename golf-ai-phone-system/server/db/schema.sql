@@ -135,6 +135,31 @@ CREATE TRIGGER trg_business_phone_numbers_touch
     EXECUTE FUNCTION touch_business_phone_numbers_updated_at();
 
 -- ============================================
+-- Per-tenant team directory (message routing) — see migration 009
+-- ============================================
+-- Named people the AI can leave a message for. The AI's
+-- `take_message_for_team_member` tool looks up by (business_id, lower(name))
+-- and dispatches an SMS with the transcript to `sms_phone`.
+CREATE TABLE IF NOT EXISTS business_team_members (
+    id SERIAL PRIMARY KEY,
+    business_id INTEGER NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+    name VARCHAR(80) NOT NULL,
+    role VARCHAR(80),
+    sms_phone VARCHAR(20) NOT NULL,
+    email VARCHAR(120),
+    aliases JSONB NOT NULL DEFAULT '[]'::jsonb,
+    notes TEXT,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_team_members_unique_name
+    ON business_team_members (business_id, LOWER(name));
+CREATE INDEX IF NOT EXISTS idx_team_members_business
+    ON business_team_members (business_id, is_active);
+
+-- ============================================
 -- Tenant staff users
 -- ============================================
 CREATE TABLE IF NOT EXISTS business_users (

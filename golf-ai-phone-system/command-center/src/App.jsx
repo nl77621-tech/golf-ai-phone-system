@@ -211,6 +211,19 @@ function sidebarItemsFor(templateKey, plan) {
       { id: 'settings',  label: 'Settings',           icon: '\u2699\ufe0f' }
     ];
   }
+  // Restaurant — same general shape as golf (dashboard + booking-flavoured
+  // page + customers + calls + settings) but with restaurant-friendly
+  // labels and no Tee Sheet. The `reservations` id maps to BookingsPage in
+  // tenantPagesFor — bookings table is generic, only the label changes.
+  if (templateKey === 'restaurant') {
+    return [
+      { id: 'dashboard',    label: 'Dashboard',    icon: '\ud83d\udcca' },
+      { id: 'reservations', label: 'Reservations', icon: '\ud83d\udcc5' },
+      { id: 'customers',    label: 'Customers',    icon: '\ud83d\udc65' },
+      { id: 'calls',        label: 'Call Logs',    icon: '\ud83d\udcde' },
+      { id: 'settings',     label: 'Settings',     icon: '\u2699\ufe0f' }
+    ];
+  }
   // Golf-style (driving_range reuses this shape for now) — keep the exact
   // menu Valleymede has been running on. `!templateKey` keeps pre-Phase-7
   // rows (before migration 005 backfilled the column) on the golf path
@@ -218,9 +231,9 @@ function sidebarItemsFor(templateKey, plan) {
   if (templateKey === 'golf_course' || templateKey === 'driving_range' || !templateKey) {
     return GOLF_SIDEBAR_ITEMS;
   }
-  // Neutral baseline for "other" / "restaurant" until Phase 7 fleshes
-  // those verticals out. No golf-specific pages, but the essentials
-  // (calls, settings) are always available.
+  // Neutral baseline for "other" until a dedicated vertical ships. No
+  // golf-specific pages, but the essentials (calls, settings) are always
+  // available.
   return [
     { id: 'dashboard', label: 'Dashboard', icon: '\ud83d\udcca' },
     { id: 'calls',     label: 'Call Logs', icon: '\ud83d\udcde' },
@@ -4996,6 +5009,392 @@ function PersonalSettingsPage() {
   );
 }
 
+// Restaurant Settings page.
+//
+// Mirrors the layout of SettingsPage but replaces every golf-specific tab
+// (Daily ops, Course Info, Knowledge, Pricing) with restaurant-shaped
+// content (Restaurant Info, Hours, Menu, Reservations). Greetings, Prompt,
+// Notifications, AI Behavior, and Test Mode are universally applicable
+// and reused unchanged. Shares the same /api/settings KV store +
+// PhoneNumbersManager + greetings endpoints as the golf SettingsPage —
+// only the UI surface is template-specific. Stored under settings keys:
+//   restaurant_info        — name, cuisine, address, capacity, etc.
+//   business_hours         — same shape golf already uses (per-day open/close)
+//   menu                   — string (URL or short text)
+//   reservation_policy     — { max_party_size, advance_days, requires_deposit, deposit_amount, cancellation_policy }
+function RestaurantSettingsPage() {
+  const [settings, setSettings] = useState({});
+  const [greetings, setGreetings] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState('');
+  const [newGreeting, setNewGreeting] = useState('');
+  const [newGreetingKnown, setNewGreetingKnown] = useState(false);
+  const [activeTab, setActiveTab] = useState('info');
+
+  useEffect(() => {
+    Promise.all([
+      api('/api/settings').catch(() => ({})),
+      api('/api/greetings').catch(() => [])
+    ]).then(([s, g]) => { setSettings(s || {}); setGreetings(Array.isArray(g) ? g : []); })
+      .catch(console.error).finally(() => setLoading(false));
+  }, []);
+
+  const saveSetting = async (key, value) => {
+    setSaving(key);
+    try {
+      await api(`/api/settings/${key}`, { method: 'PUT', body: JSON.stringify({ value }) });
+      setSettings(prev => ({ ...prev, [key]: { ...prev[key], value } }));
+    } catch (err) { alert('Failed to save: ' + err.message); }
+    finally { setSaving(''); }
+  };
+
+  const addGreeting = async () => {
+    if (!newGreeting.trim()) return;
+    try {
+      const g = await api('/api/greetings', { method: 'POST', body: JSON.stringify({ message: newGreeting, for_known_caller: newGreetingKnown }) });
+      setGreetings(prev => [...prev, g]);
+      setNewGreeting('');
+    } catch (err) { alert('Failed: ' + err.message); }
+  };
+
+  const deleteGreeting = async (id) => {
+    try {
+      await api(`/api/greetings/${id}`, { method: 'DELETE' });
+      setGreetings(prev => prev.filter(g => g.id !== id));
+    } catch (err) { alert('Failed: ' + err.message); }
+  };
+
+  if (loading) return React.createElement('div', { className: 'p-8 text-gray-500' }, 'Loading settings\u2026');
+
+  const tabs = [
+    { id: 'info',          label: '\uD83C\uDF7D\uFE0F Restaurant Info' },
+    { id: 'hours',         label: '\uD83D\uDD52 Hours' },
+    { id: 'menu',          label: '\uD83D\uDCCB Menu' },
+    { id: 'reservations',  label: '\uD83D\uDCC5 Reservations' },
+    { id: 'phones',        label: '\uD83D\uDCDE Phones' },
+    { id: 'greetings',     label: 'Greetings' },
+    { id: 'prompt',        label: 'Prompt' },
+    { id: 'notifications', label: 'Notifications' },
+    { id: 'ai',            label: 'AI Behavior' },
+    { id: 'test',          label: 'Test Mode' }
+  ];
+
+  const val = (key) => settings[key]?.value;
+
+  return React.createElement('div', null,
+    React.createElement('h1', { className: 'text-2xl font-bold text-gray-800 mb-2' }, 'Settings'),
+    React.createElement('p', { className: 'text-sm text-gray-500 mb-6' },
+      'Configure how your AI host answers calls, takes reservations, and answers menu / hours questions.'
+    ),
+
+    React.createElement('div', { className: 'flex gap-1 mb-6 bg-gray-100 rounded-lg p-1 overflow-x-auto' },
+      tabs.map(t =>
+        React.createElement('button', {
+          key: t.id, onClick: () => setActiveTab(t.id),
+          className: `px-4 py-2 rounded-md text-sm font-medium whitespace-nowrap transition-colors ${activeTab === t.id ? 'bg-white shadow text-golf-700' : 'text-gray-500 hover:text-gray-700'}`
+        }, t.label)
+      )
+    ),
+
+    React.createElement('div', { className: 'bg-white rounded-xl shadow-sm border p-6' },
+
+      // RESTAURANT INFO
+      activeTab === 'info' && React.createElement('div', null,
+        React.createElement('p', { className: 'text-sm text-gray-500 mb-4' },
+          'Basic restaurant information. The AI uses these on every call so callers always hear consistent details.'
+        ),
+        (() => {
+          const info = val('restaurant_info') || {};
+          const update = (field, value) => saveSetting('restaurant_info', { ...info, [field]: value });
+          return React.createElement('div', null,
+            React.createElement(SettingField, { label: 'Restaurant Name', value: info.name || '', onSave: v => update('name', v), saving: saving === 'restaurant_info' }),
+            React.createElement(SettingField, { label: 'Cuisine', description: 'E.g., Italian, Japanese, Modern Canadian, Steakhouse', value: info.cuisine || '', onSave: v => update('cuisine', v), saving: saving === 'restaurant_info' }),
+            React.createElement(SettingField, { label: 'Address', value: info.address || '', onSave: v => update('address', v), saving: saving === 'restaurant_info' }),
+            React.createElement(SettingField, { label: 'Phone', description: 'E.g., (905) 555-1234', value: info.phone || '', onSave: v => update('phone', v), saving: saving === 'restaurant_info' }),
+            React.createElement(SettingField, { label: 'Email', value: info.email || '', onSave: v => update('email', v), saving: saving === 'restaurant_info' }),
+            React.createElement(SettingField, { label: 'Website', value: info.website || '', onSave: v => update('website', v), saving: saving === 'restaurant_info' }),
+            React.createElement(SettingField, { label: 'Capacity', type: 'number', description: 'Total seats. Helps the AI judge whether large parties can be accommodated.', value: String(info.capacity || ''), onSave: v => update('capacity', parseInt(v) || null), saving: saving === 'restaurant_info' }),
+            React.createElement(SettingField, { label: 'Dress Code', description: 'E.g., Smart casual, Business casual, Formal', value: info.dress_code || '', onSave: v => update('dress_code', v), saving: saving === 'restaurant_info' }),
+            React.createElement(SettingField, { label: 'Parking', description: 'E.g., Valet available, Street parking, Lot beside building', value: info.parking || '', onSave: v => update('parking', v), saving: saving === 'restaurant_info' }),
+            React.createElement(SettingTextarea, { label: 'Description', description: 'A short pitch the AI can use when callers ask "what kind of place is it?"', rows: 3, value: info.description || '', onSave: v => update('description', v), saving: saving === 'restaurant_info' })
+          );
+        })()
+      ),
+
+      // HOURS — reuses the shared business_hours setting golf already uses.
+      // No template-specific naming — the AI prompt already reads
+      // business_hours generically.
+      activeTab === 'hours' && React.createElement('div', null,
+        React.createElement('p', { className: 'text-sm text-gray-500 mb-4' }, 'Set hours for each day. The AI uses these to tell callers when you\u2019re open and to refuse reservations outside service.'),
+        ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'].map(day => {
+          const h = val('business_hours')?.[day] || { open: '17:00', close: '22:00' };
+          return React.createElement('div', { key: day, className: 'flex items-center gap-4 mb-3' },
+            React.createElement('span', { className: 'w-24 font-medium capitalize' }, day),
+            React.createElement('input', { type: 'time', value: h.open, className: 'border rounded px-2 py-1',
+              onChange: e => {
+                const updated = { ...val('business_hours'), [day]: { ...h, open: e.target.value } };
+                saveSetting('business_hours', updated);
+              }
+            }),
+            React.createElement('span', { className: 'text-gray-400' }, 'to'),
+            React.createElement('input', { type: 'time', value: h.close, className: 'border rounded px-2 py-1',
+              onChange: e => {
+                const updated = { ...val('business_hours'), [day]: { ...h, close: e.target.value } };
+                saveSetting('business_hours', updated);
+              }
+            })
+          );
+        })
+      ),
+
+      // MENU
+      activeTab === 'menu' && React.createElement('div', null,
+        React.createElement('p', { className: 'text-sm text-gray-500 mb-4' },
+          'Where the AI gets menu information when callers ask about dishes, prices, or dietary options. Either link to your online menu or paste a short summary.'
+        ),
+        React.createElement(SettingField, {
+          label: 'Menu URL',
+          description: 'Link to a publicly viewable menu (PDF, restaurant website, etc.). The AI will mention this if asked for the full menu.',
+          value: val('menu')?.url || '',
+          onSave: v => saveSetting('menu', { ...val('menu'), url: v }),
+          saving: saving === 'menu'
+        }),
+        React.createElement(SettingTextarea, {
+          label: 'Highlights',
+          description: 'A short summary of signature dishes, dietary options, and price range. Keep it under ~10 lines.',
+          rows: 8,
+          value: val('menu')?.highlights || '',
+          onSave: v => saveSetting('menu', { ...val('menu'), highlights: v }),
+          saving: saving === 'menu'
+        })
+      ),
+
+      // RESERVATIONS
+      activeTab === 'reservations' && React.createElement('div', null,
+        React.createElement('p', { className: 'text-sm text-gray-500 mb-4' },
+          'Rules the AI follows when callers want to book a table.'
+        ),
+        (() => {
+          const policy = val('reservation_policy') || {};
+          const update = (field, value) => saveSetting('reservation_policy', { ...policy, [field]: value });
+          return React.createElement('div', null,
+            React.createElement(SettingField, {
+              label: 'Maximum party size for AI booking',
+              type: 'number',
+              description: 'Parties larger than this get transferred to a human (or an offer to call back).',
+              value: String(policy.max_party_size || 8),
+              onSave: v => update('max_party_size', parseInt(v) || 8),
+              saving: saving === 'reservation_policy'
+            }),
+            React.createElement(SettingField, {
+              label: 'Advance booking window (days)',
+              type: 'number',
+              description: 'How far ahead callers can book. E.g., 30 = up to a month out.',
+              value: String(policy.advance_days || 30),
+              onSave: v => update('advance_days', parseInt(v) || 30),
+              saving: saving === 'reservation_policy'
+            }),
+            React.createElement('label', { className: 'flex items-center gap-2 my-3' },
+              React.createElement('input', {
+                type: 'checkbox',
+                checked: !!policy.requires_deposit,
+                onChange: e => update('requires_deposit', e.target.checked)
+              }),
+              React.createElement('span', { className: 'text-sm font-medium' }, 'Require deposit for large parties')
+            ),
+            policy.requires_deposit && React.createElement(SettingField, {
+              label: 'Deposit amount per seat',
+              type: 'number',
+              description: 'In your local currency. The AI mentions this when quoting policy.',
+              value: String(policy.deposit_amount || ''),
+              onSave: v => update('deposit_amount', parseFloat(v) || 0),
+              saving: saving === 'reservation_policy'
+            }),
+            React.createElement(SettingTextarea, {
+              label: 'Cancellation policy',
+              description: 'E.g., "Cancel up to 24h before with no fee. Same-day no-shows charged $25/seat."',
+              rows: 3,
+              value: policy.cancellation_policy || '',
+              onSave: v => update('cancellation_policy', v),
+              saving: saving === 'reservation_policy'
+            })
+          );
+        })()
+      ),
+
+      // PHONES — reused from PersonalSettingsPage / SettingsPage.
+      activeTab === 'phones' && React.createElement('div', null,
+        React.createElement('p', { className: 'text-sm text-gray-500 mb-4' },
+          'The phone numbers your AI host answers. Disable a number to stop taking calls on it without losing history.'
+        ),
+        React.createElement(PhoneNumbersManager, {
+          endpointBase: '/api/phone-numbers',
+          title: 'Restaurant Phone Numbers'
+        })
+      ),
+
+      // GREETINGS — same KV store as golf / personal so behaviour is identical.
+      activeTab === 'greetings' && React.createElement('div', null,
+        React.createElement('p', { className: 'text-sm text-gray-500 mb-4' },
+          'The AI picks a random greeting each time. Use {name} as a placeholder so returning callers hear their own name.'
+        ),
+
+        React.createElement('h3', { className: 'font-semibold mb-2' }, 'New caller greetings'),
+        greetings.filter(g => !g.for_known_caller).length === 0
+          ? React.createElement('p', { className: 'text-sm text-gray-400 mb-3' }, 'No new-caller greetings yet.')
+          : greetings.filter(g => !g.for_known_caller).map(g =>
+              React.createElement('div', { key: g.id, className: 'flex items-center gap-2 mb-2 bg-gray-50 rounded-lg p-3' },
+                React.createElement('span', { className: 'flex-1 text-sm' }, g.message),
+                React.createElement('button', { onClick: () => deleteGreeting(g.id), className: 'text-red-400 hover:text-red-600 text-sm' }, 'Remove')
+              )
+            ),
+
+        React.createElement('h3', { className: 'font-semibold mb-2 mt-4' }, 'Returning caller greetings'),
+        greetings.filter(g => g.for_known_caller).length === 0
+          ? React.createElement('p', { className: 'text-sm text-gray-400 mb-3' }, 'No returning-caller greetings yet.')
+          : greetings.filter(g => g.for_known_caller).map(g =>
+              React.createElement('div', { key: g.id, className: 'flex items-center gap-2 mb-2 bg-green-50 rounded-lg p-3' },
+                React.createElement('span', { className: 'flex-1 text-sm' }, g.message),
+                React.createElement('button', { onClick: () => deleteGreeting(g.id), className: 'text-red-400 hover:text-red-600 text-sm' }, 'Remove')
+              )
+            ),
+
+        React.createElement('div', { className: 'mt-4 border-t pt-4' },
+          React.createElement('h3', { className: 'font-semibold mb-2' }, 'Add a greeting'),
+          React.createElement('input', {
+            type: 'text', value: newGreeting, onChange: e => setNewGreeting(e.target.value),
+            placeholder: 'e.g., Thanks for calling {restaurant}, how can I help?',
+            className: 'w-full border rounded-lg px-3 py-2 mb-2 text-sm'
+          }),
+          React.createElement('div', { className: 'flex items-center gap-4' },
+            React.createElement('label', { className: 'flex items-center gap-2 text-sm' },
+              React.createElement('input', { type: 'checkbox', checked: newGreetingKnown, onChange: e => setNewGreetingKnown(e.target.checked) }),
+              'For returning callers (use {name} placeholder)'
+            ),
+            React.createElement('button', { onClick: addGreeting, className: 'bg-golf-600 hover:bg-golf-700 text-white px-4 py-2 rounded-lg text-sm' }, 'Add greeting')
+          )
+        )
+      ),
+
+      // PROMPT — restaurant-specific defaults; same custom_prompt key as
+      // golf/personal so the prompt dispatcher reads it identically.
+      activeTab === 'prompt' && React.createElement('div', null,
+        React.createElement('p', { className: 'text-sm text-gray-500 mb-4' },
+          'Fine-tune how the AI host behaves. These instructions are layered on top of the built-in restaurant prompt.'
+        ),
+        React.createElement(SettingField, {
+          label: 'Host name',
+          description: 'The name the AI uses when answering ("Hi, I\u2019m Sam at Bella Notte\u2026").',
+          value: val('ai_personality')?.name || '',
+          onSave: v => saveSetting('ai_personality', { ...val('ai_personality'), name: v }),
+          saving: saving === 'ai_personality'
+        }),
+        React.createElement(SettingField, {
+          label: 'Language handling',
+          description: 'How the AI decides which language to respond in. E.g., "Match the caller\u2019s language; default to English."',
+          value: val('ai_personality')?.language || '',
+          onSave: v => saveSetting('ai_personality', { ...val('ai_personality'), language: v }),
+          saving: saving === 'ai_personality'
+        }),
+        React.createElement(SettingTextarea, {
+          label: 'Custom prompt additions',
+          description: 'Extra instructions for the AI. Keep it short and specific \u2014 e.g., "Always mention happy hour 4-6pm Mon\u2013Thu" or "Tasting menu requires booking 48h ahead."',
+          value: val('custom_prompt') || '',
+          rows: 10,
+          onSave: v => saveSetting('custom_prompt', v),
+          saving: saving === 'custom_prompt'
+        })
+      ),
+
+      // NOTIFICATIONS
+      activeTab === 'notifications' && React.createElement('div', null,
+        React.createElement('p', { className: 'text-sm text-gray-500 mb-4' },
+          'Where to send call recaps and reservation alerts.'
+        ),
+        React.createElement(SettingField, {
+          label: 'Recap email',
+          description: 'Email address for call recaps and reservation confirmations.',
+          value: val('notifications')?.email_to || '',
+          onSave: v => saveSetting('notifications', { ...val('notifications'), email_to: v }),
+          saving: saving === 'notifications'
+        }),
+        React.createElement(SettingField, {
+          label: 'Recap SMS number',
+          description: 'Phone number for SMS recaps. Useful for the host stand.',
+          value: val('notifications')?.sms_to || '',
+          onSave: v => saveSetting('notifications', { ...val('notifications'), sms_to: v }),
+          saving: saving === 'notifications'
+        }),
+        React.createElement('div', { className: 'flex gap-6 mt-4' },
+          React.createElement('label', { className: 'flex items-center gap-2' },
+            React.createElement('input', {
+              type: 'checkbox', checked: val('notifications')?.email_enabled ?? true,
+              onChange: e => saveSetting('notifications', { ...val('notifications'), email_enabled: e.target.checked })
+            }),
+            'Email recaps'
+          ),
+          React.createElement('label', { className: 'flex items-center gap-2' },
+            React.createElement('input', {
+              type: 'checkbox', checked: val('notifications')?.sms_enabled ?? true,
+              onChange: e => saveSetting('notifications', { ...val('notifications'), sms_enabled: e.target.checked })
+            }),
+            'SMS recaps'
+          )
+        )
+      ),
+
+      // AI BEHAVIOR
+      activeTab === 'ai' && React.createElement('div', null,
+        React.createElement('p', { className: 'text-sm text-gray-500 mb-4' },
+          'How the AI host speaks and handles edge cases.'
+        ),
+        React.createElement(SettingTextarea, {
+          label: 'Personality & style',
+          description: 'How the host should sound on calls. E.g., "Warm, brief, professional. Never push specials. Friendly but efficient."',
+          value: val('ai_personality')?.style || '',
+          onSave: v => saveSetting('ai_personality', { ...val('ai_personality'), style: v }),
+          saving: saving === 'ai_personality'
+        }),
+        React.createElement(SettingField, {
+          label: 'After-hours message',
+          description: 'What the AI says if someone calls outside service hours.',
+          value: val('ai_personality')?.after_hours_message || '',
+          onSave: v => saveSetting('ai_personality', { ...val('ai_personality'), after_hours_message: v }),
+          saving: saving === 'ai_personality'
+        }),
+        React.createElement(SettingField, {
+          label: 'Transfer number (optional)',
+          description: 'If the AI should transfer urgent calls (e.g. large parties, complaints) to a human, put that number here.',
+          value: typeof val('transfer_number') === 'string' ? val('transfer_number') : '',
+          onSave: v => saveSetting('transfer_number', v),
+          saving: saving === 'transfer_number'
+        })
+      ),
+
+      // TEST MODE
+      activeTab === 'test' && React.createElement('div', null,
+        React.createElement('p', { className: 'text-sm text-gray-500 mb-4' },
+          'While test mode is on, only the test number reaches the AI host. Every other caller hears a short temporary message.'
+        ),
+        React.createElement('label', { className: 'flex items-center gap-2 mb-4' },
+          React.createElement('input', {
+            type: 'checkbox', checked: val('test_mode')?.enabled ?? false,
+            onChange: e => saveSetting('test_mode', { ...val('test_mode'), enabled: e.target.checked })
+          }),
+          React.createElement('span', { className: 'font-medium' }, 'Enable test mode')
+        ),
+        React.createElement(SettingField, {
+          label: 'Test phone number',
+          description: 'Only this number reaches the AI host while test mode is on.',
+          value: val('test_mode')?.test_phone || '',
+          onSave: v => saveSetting('test_mode', { ...val('test_mode'), test_phone: v }),
+          saving: saving === 'test_mode'
+        })
+      )
+    )
+  );
+}
+
 // Shared golf page map — used by the plan='legacy' safety lock and by
 // the regular golf_course / driving_range path so dispatch stays in
 // lockstep with the sidebar.
@@ -5021,6 +5420,20 @@ function tenantPagesFor(templateKey, plan) {
       calls:     CallLogsPage,
       my_info:   MyInfoPage,
       settings:  PersonalSettingsPage
+    };
+  }
+  // Restaurant — uses the shared dashboard / customers / call-logs pages
+  // until a dedicated restaurant dashboard ships, but gets a vertical-
+  // specific Settings page (Restaurant Info / Hours / Menu / Reservations
+  // instead of golf's Course Info / Pricing). Reservations is wired to the
+  // existing BookingsPage because the underlying `bookings` table is shared.
+  if (templateKey === 'restaurant') {
+    return {
+      dashboard:    DashboardPage,
+      reservations: BookingsPage,
+      customers:    CustomersPage,
+      calls:        CallLogsPage,
+      settings:     RestaurantSettingsPage
     };
   }
   // Golf (also the implicit default) — keep Valleymede's shape exactly.

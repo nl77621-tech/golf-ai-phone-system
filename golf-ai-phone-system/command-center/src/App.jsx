@@ -101,7 +101,19 @@ async function api(path, options = {}) {
 // LOGIN PAGE
 // ============================================
 function LoginPage({ onLogin }) {
-  const [username, setUsername] = useState('');
+  // Pre-fill email from `?email=` query param. Used by the "Add user"
+  // flow in Super Admin — the create-user response includes a sign-in
+  // URL with the email baked in so the new tenant pastes one link
+  // instead of typing both fields. We only read it on first mount;
+  // if the user changes the field manually, that wins.
+  const [username, setUsername] = useState(() => {
+    if (typeof window === 'undefined') return '';
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const e = params.get('email');
+      return e ? e.trim() : '';
+    } catch (_) { return ''; }
+  });
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
@@ -2953,7 +2965,7 @@ function TenantUsersPanel({ businessId }) {
   const [resetMode, setResetMode] = useState('generate'); // 'generate' | 'manual'
   const [manualPwd, setManualPwd] = useState('');
   const [resetting, setResetting] = useState(false);
-  const [revealed, setRevealed] = useState(null);         // { email, password }
+  const [revealed, setRevealed] = useState(null);         // { email, password, signinUrl }
   // Add-user form state. `addOpen` toggles the inline form; we keep it
   // collapsed by default so the panel stays compact for tenants that
   // don't need to add anyone.
@@ -2993,7 +3005,13 @@ function TenantUsersPanel({ businessId }) {
       );
       setRevealed({
         email: result?.user?.email || resetTarget.email,
-        password: result?.password || ''
+        password: result?.password || '',
+        // Reset doesn't return a signin_url today (it's only on create);
+        // we synthesize one here so the reveal modal stays consistent
+        // and the operator gets the same paste-and-share UX.
+        signinUrl: typeof window !== 'undefined' && resetTarget?.email
+          ? `${window.location.origin}/?email=${encodeURIComponent(resetTarget.email)}`
+          : ''
       });
       setResetTarget(null);
       setManualPwd('');
@@ -3014,6 +3032,20 @@ function TenantUsersPanel({ businessId }) {
   const copyPassword = async () => {
     if (!revealed?.password) return;
     try { await navigator.clipboard?.writeText(revealed.password); } catch (_) {}
+  };
+
+  const copySignin = async () => {
+    if (!revealed?.signinUrl) return;
+    try { await navigator.clipboard?.writeText(revealed.signinUrl); } catch (_) {}
+  };
+
+  const copyShareBundle = async () => {
+    if (!revealed) return;
+    const lines = [];
+    if (revealed.signinUrl) lines.push(`Sign in: ${revealed.signinUrl}`);
+    if (revealed.email)     lines.push(`Email: ${revealed.email}`);
+    if (revealed.password)  lines.push(`Temporary password: ${revealed.password}`);
+    try { await navigator.clipboard?.writeText(lines.join('\n')); } catch (_) {}
   };
 
   const toggleActive = async (user) => {
@@ -3049,7 +3081,8 @@ function TenantUsersPanel({ businessId }) {
       // Show the one-time password reveal modal — same UX as reset.
       setRevealed({
         email: result?.user?.email || addForm.email,
-        password: result?.password || ''
+        password: result?.password || '',
+        signinUrl: result?.signin_url || ''
       });
       setAddOpen(false);
       setAddForm({ email: '', name: '', role: 'business_admin', mode: 'generate', password: '' });
@@ -3234,29 +3267,56 @@ function TenantUsersPanel({ businessId }) {
       )
     ),
 
-    // One-time password reveal modal
+    // One-time password + sign-in link reveal modal
     revealed && React.createElement('div', {
       className: 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4',
       onClick: dismissRevealed
     },
       React.createElement('div', {
-        className: 'bg-white rounded-2xl shadow-xl max-w-md w-full p-6',
+        className: 'bg-white rounded-2xl shadow-xl max-w-lg w-full p-6',
         onClick: e => e.stopPropagation()
       },
         React.createElement('h3', { className: 'text-base font-bold text-gray-800 mb-1' },
-          '🔑 New password — copy it now'
+          '🔑 New credentials — copy them now'
         ),
         React.createElement('p', { className: 'text-sm text-gray-600 mb-4' },
-          `For ${revealed.email}. This is the only time it will be shown — once you close this dialog, we cannot retrieve it.`
+          `For ${revealed.email}. This password is only shown once — once you close this dialog we cannot retrieve it. Share these with the user out-of-band (text, secure email, password manager, etc.).`
         ),
-        React.createElement('div', {
-          className: 'font-mono text-base bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 mb-3 break-all select-all'
-        }, revealed.password),
-        React.createElement('div', { className: 'flex justify-end gap-2' },
+
+        revealed.signinUrl && React.createElement('div', { className: 'mb-3' },
+          React.createElement('div', { className: 'flex items-center justify-between mb-1' },
+            React.createElement('span', { className: 'text-xs font-semibold text-gray-500 uppercase tracking-wide' }, 'Sign-in link'),
+            React.createElement('button', {
+              onClick: copySignin,
+              className: 'text-xs text-golf-700 hover:text-golf-800'
+            }, 'Copy link')
+          ),
+          React.createElement('div', {
+            className: 'font-mono text-xs bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 break-all select-all'
+          }, revealed.signinUrl),
+          React.createElement('p', { className: 'text-[11px] text-gray-500 mt-1' },
+            'Opens the Command Center login with the email pre-filled.'
+          )
+        ),
+
+        React.createElement('div', { className: 'mb-4' },
+          React.createElement('div', { className: 'flex items-center justify-between mb-1' },
+            React.createElement('span', { className: 'text-xs font-semibold text-gray-500 uppercase tracking-wide' }, 'Temporary password'),
+            React.createElement('button', {
+              onClick: copyPassword,
+              className: 'text-xs text-golf-700 hover:text-golf-800'
+            }, 'Copy password')
+          ),
+          React.createElement('div', {
+            className: 'font-mono text-base bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 break-all select-all'
+          }, revealed.password)
+        ),
+
+        React.createElement('div', { className: 'flex justify-between items-center gap-2' },
           React.createElement('button', {
-            onClick: copyPassword,
+            onClick: copyShareBundle,
             className: 'text-sm px-3 py-1.5 rounded-lg bg-gray-100 hover:bg-gray-200 text-gray-700'
-          }, 'Copy'),
+          }, '📋 Copy link + email + password'),
           React.createElement('button', {
             onClick: dismissRevealed,
             className: 'text-sm px-3 py-1.5 rounded-lg bg-golf-600 hover:bg-golf-700 text-white'

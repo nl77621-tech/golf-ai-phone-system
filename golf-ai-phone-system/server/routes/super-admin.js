@@ -1762,11 +1762,23 @@ router.post('/businesses/:id/users', async (req, res) => {
       `[super] Created business_user ${user.id} (${email}) on tenant ${id} ` +
       `by super_admin ${req.auth?.user_id || '?'}`
     );
+
+    // Sign-in URL — base URL of THIS deployment + `?email=` so the
+    // LoginPage can pre-fill the email field. Built from the request so
+    // it works whether you're on golf-ai-phone-system-production.up.railway.app
+    // or a custom domain. The operator pastes this link + the temp
+    // password in their message to the new user; the user clicks the
+    // link, sees their email already filled in, and types the password.
+    const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+    const host = req.get('host');
+    const signinUrl = host ? `${proto}://${host}/?email=${encodeURIComponent(email)}` : null;
+
     res.status(201).json({
       ok: true,
       user,
       password: plaintext,
       generated: !supplied,
+      signin_url: signinUrl,
       note: 'This password is shown once. Save or share it now — we cannot retrieve it later.'
     });
   } catch (err) {

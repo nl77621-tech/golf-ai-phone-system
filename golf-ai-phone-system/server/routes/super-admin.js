@@ -19,6 +19,8 @@
  * the business-switcher flow (see `/api` router — `X-Business-Id` header).
  */
 const express = require('express');
+const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const router = express.Router();
 
 const { requireAuth, requireSuperAdmin, createInvite } = require('../middleware/auth');
@@ -1611,6 +1613,208 @@ router.post('/businesses/:id/invite-admin', async (req, res) => {
 //   PATCH  /api/super/businesses/:id/phone-numbers/:phoneId
 //   DELETE /api/super/businesses/:id/phone-numbers/:phoneId
 // ----------------------------------------------------------------------------
+
+// ============================================================================
+// USER MANAGEMENT — list tenant users + reset their passwords
+// ============================================================================
+//
+// Super-admin convenience tools for the "I need to get a tenant back into
+// their account" case. Two principles:
+//
+//   1. We do NOT store, log, or display plaintext passwords. The
+//      password_hash column is bcrypt-only; the original plaintext is
+//      destroyed at signup. Anyone who tells you otherwise is selling
+//      a vulnerability.
+//
+//   2. A super-admin CAN reset a user's password and is shown the new
+//      plaintext exactly once in the response — to be delivered to the
+//      tenant out-of-band. The audit log records who reset what, but
+//      not the password itself.
+//
+// GET  /api/super/businesses/:id/users               — list users on the tenant
+// POST /api/super/businesses/:id/users/:userId/reset-password
+//                                                     — reset password,
+//                                                       returns plaintext ONCE
+
+// GET — list business_users for a tenant. Includes is_active so the UI can
+// surface deactivated accounts and offer to reactivate them.
+router.get('/businesses/:id/users', async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ error: 'invalid business id' });
+  }
+  try {
+    const biz = await getBusinessById(id, { includeDeleted: true });
+    if (!biz) return res.status(404).json({ error: 'Business not found' });
+    const { rows } = await query(
+      `SELECT id, email, name, role, is_active, last_login_at,
+              created_at, updated_at
+         FROM business_users
+        WHERE business_id = $1
+        ORDER BY is_active DESC, LOWER(email) ASC`,
+      [id]
+    );
+    res.json({ business_id: id, business_slug: biz.slug, users: rows });
+  } catch (err) {
+    console.error(`[super] list users for ${id} error:`, err.message);
+    res.status(500).json({ error: 'Failed to load users' });
+  }
+});
+
+// Generate a 14-character URL-safe-ish password — readable enough to be
+// shared verbally if needed. Uses crypto.randomBytes (NOT Math.random).
+// Excludes ambiguous characters (0/O, 1/l/I) to reduce dictation errors.
+function generateTempPassword() {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
+  const bytes = crypto.randomBytes(14);
+  let out = '';
+  for (let i = 0; i < 14; i++) out += alphabet[bytes[i] % alphabet.length];
+  return out;
+}
+
+// Strict password policy for super-admin-supplied passwords. We don't
+// enforce all the OWASP rules here because the operator IS the security
+// boundary on this endpoint, but minimum length + no whitespace is a
+// reasonable floor.
+function validateSuppliedPassword(p) {
+  if (typeof p !== 'string') return 'password must be a string';
+  if (p.length < 8) return 'password must be at least 8 characters';
+  if (p.length > 200) return 'password must be at most 200 characters';
+  if (/\s/.test(p)) return 'password cannot contain whitespace';
+  return null;
+}
+
+// POST — reset a user's password. Body shape:
+//   { password?: string, generate?: true }
+// One of `password` or `generate: true` is required. The hashed value is
+// written; the plaintext is returned exactly once in the response and
+// never logged or audited (only the metadata of the reset action is).
+router.post('/businesses/:id/users/:userId/reset-password', async (req, res) => {
+  const businessId = parseInt(req.params.id, 10);
+  const userId = parseInt(req.params.userId, 10);
+  if (!Number.isInteger(businessId) || businessId <= 0 ||
+      !Number.isInteger(userId) || userId <= 0) {
+    return res.status(400).json({ error: 'invalid id(s)' });
+  }
+
+  const wantGenerate = req.body?.generate === true;
+  const supplied = typeof req.body?.password === 'string' ? req.body.password : null;
+  if (!wantGenerate && !supplied) {
+    return res.status(400).json({
+      error: 'Provide either { password: "..." } or { generate: true }'
+    });
+  }
+
+  let plaintext;
+  if (supplied) {
+    const err = validateSuppliedPassword(supplied);
+    if (err) return res.status(400).json({ error: err });
+    plaintext = supplied;
+  } else {
+    plaintext = generateTempPassword();
+  }
+
+  try {
+    // Confirm user belongs to the named tenant before we touch them.
+    // This both guards against id-swap mistakes and gives us nice
+    // metadata for the audit event.
+    const { rows: [user] } = await query(
+      `SELECT id, email, name, role, business_id, is_active
+         FROM business_users
+        WHERE id = $1 AND business_id = $2
+        LIMIT 1`,
+      [userId, businessId]
+    );
+    if (!user) return res.status(404).json({ error: 'User not found in this tenant' });
+
+    const passwordHash = await bcrypt.hash(plaintext, 10);
+    await query(
+      `UPDATE business_users
+          SET password_hash = $1, updated_at = NOW()
+        WHERE id = $2 AND business_id = $3`,
+      [passwordHash, userId, businessId]
+    );
+
+    // Audit — record actor + target, NEVER the plaintext or hash.
+    await logEventFromReq(req, {
+      businessId,
+      action: 'user.password_reset_by_super',
+      targetType: 'business_user',
+      targetId: userId,
+      meta: {
+        target_email: user.email,
+        target_role: user.role,
+        method: supplied ? 'operator_supplied' : 'auto_generated',
+        actor_super_admin_id: req.auth?.user_id || null
+      }
+    }).catch(() => {});
+
+    console.log(
+      `[super] Password reset for business_user ${userId} (${user.email}) ` +
+      `on tenant ${businessId} by super_admin ${req.auth?.user_id || '?'}`
+    );
+
+    // Return the plaintext ONCE so the operator can deliver it to the
+    // tenant out-of-band. The UI shows a copy-to-clipboard panel and
+    // makes clear the value is not retrievable later.
+    res.json({
+      ok: true,
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        is_active: user.is_active
+      },
+      password: plaintext,
+      generated: !supplied,
+      note: 'This password is shown once. Save or share it now — we cannot retrieve it later.'
+    });
+  } catch (err) {
+    console.error(`[super] password reset for user ${userId} error:`, err.message);
+    res.status(500).json({ error: 'Failed to reset password' });
+  }
+});
+
+// PATCH — toggle a user's is_active flag. Useful for "lock the account
+// until they confirm" workflows or for revoking access without losing
+// audit history. Only is_active is editable here; for email/name changes
+// the user signs in and updates their profile themselves.
+router.patch('/businesses/:id/users/:userId', async (req, res) => {
+  const businessId = parseInt(req.params.id, 10);
+  const userId = parseInt(req.params.userId, 10);
+  if (!Number.isInteger(businessId) || businessId <= 0 ||
+      !Number.isInteger(userId) || userId <= 0) {
+    return res.status(400).json({ error: 'invalid id(s)' });
+  }
+  if (typeof req.body?.is_active !== 'boolean') {
+    return res.status(400).json({ error: 'Body must include { is_active: boolean }' });
+  }
+  try {
+    const { rows } = await query(
+      `UPDATE business_users
+          SET is_active = $1, updated_at = NOW()
+        WHERE id = $2 AND business_id = $3
+        RETURNING id, email, name, role, is_active`,
+      [req.body.is_active, userId, businessId]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'User not found in this tenant' });
+    await logEventFromReq(req, {
+      businessId,
+      action: 'user.activation_changed',
+      targetType: 'business_user',
+      targetId: userId,
+      meta: {
+        target_email: rows[0].email,
+        is_active: req.body.is_active
+      }
+    }).catch(() => {});
+    res.json({ user: rows[0] });
+  } catch (err) {
+    console.error(`[super] toggle user ${userId} error:`, err.message);
+    res.status(500).json({ error: 'Failed to update user' });
+  }
+});
 
 // Minimal E.164 validator to keep the DB honest. The UI validates too, but
 // the backend must defend itself.

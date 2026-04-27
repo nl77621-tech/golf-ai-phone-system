@@ -2928,6 +2928,244 @@ function BusinessCard({ business, onActAs, onManagePhones, onManageVoice, onEdit
 // Template is intentionally read-only (see PATCH comment in server/routes/
 // super-admin.js) — switching vertical post-creation would overwrite
 // per-tenant customisation, so the path is "delete + create new" instead.
+// ============================================
+// TENANT USERS PANEL — list + reset password + activate/deactivate
+// ============================================
+//
+// Mounts inside the Edit Tenant modal. Shows every business_users row
+// for the tenant, with three super-admin actions per user:
+//   • Reset password — generates or accepts a new password and shows
+//     it ONCE in a copy-to-clipboard panel. We never display existing
+//     passwords because they're bcrypt-hashed and unrecoverable.
+//   • Toggle is_active — soft-disable a user account.
+//   • (Read-only) email / role / last login.
+//
+// IMPORTANT: a "view password" affordance is intentionally NOT
+// implemented. If a tenant forgets their password, super-admin resets
+// it and shares the new one out-of-band. That's the same flow every
+// reputable platform uses (banks, GitHub, Twilio, etc.) and is a hard
+// requirement of password hashing.
+function TenantUsersPanel({ businessId }) {
+  const [users, setUsers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [resetTarget, setResetTarget] = useState(null);   // user being reset
+  const [resetMode, setResetMode] = useState('generate'); // 'generate' | 'manual'
+  const [manualPwd, setManualPwd] = useState('');
+  const [resetting, setResetting] = useState(false);
+  const [revealed, setRevealed] = useState(null);         // { email, password }
+
+  const reload = () => {
+    setLoading(true);
+    api(`/api/super/businesses/${businessId}/users`)
+      .then(d => setUsers(d?.users || []))
+      .catch(err => setError(err.message || 'Failed to load users'))
+      .finally(() => setLoading(false));
+  };
+  useEffect(() => { if (businessId) reload(); }, [businessId]);
+
+  const beginReset = (user) => {
+    setResetTarget(user);
+    setResetMode('generate');
+    setManualPwd('');
+    setRevealed(null);
+  };
+
+  const submitReset = async () => {
+    if (!resetTarget) return;
+    setResetting(true);
+    setError('');
+    try {
+      const body = resetMode === 'generate'
+        ? { generate: true }
+        : { password: manualPwd };
+      const result = await api(
+        `/api/super/businesses/${businessId}/users/${resetTarget.id}/reset-password`,
+        { method: 'POST', body: JSON.stringify(body) }
+      );
+      setRevealed({
+        email: result?.user?.email || resetTarget.email,
+        password: result?.password || ''
+      });
+      setResetTarget(null);
+      setManualPwd('');
+    } catch (err) {
+      setError(err.message || 'Reset failed');
+    } finally {
+      setResetting(false);
+    }
+  };
+
+  const cancelReset = () => {
+    setResetTarget(null);
+    setManualPwd('');
+  };
+
+  const dismissRevealed = () => setRevealed(null);
+
+  const copyPassword = async () => {
+    if (!revealed?.password) return;
+    try { await navigator.clipboard?.writeText(revealed.password); } catch (_) {}
+  };
+
+  const toggleActive = async (user) => {
+    try {
+      await api(`/api/super/businesses/${businessId}/users/${user.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ is_active: !user.is_active })
+      });
+      reload();
+    } catch (err) {
+      alert(err.message || 'Failed to update user');
+    }
+  };
+
+  return React.createElement('div', null,
+    error && React.createElement('div', {
+      className: 'mb-2 text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2'
+    }, error),
+
+    loading
+      ? React.createElement('p', { className: 'text-sm text-gray-500' }, 'Loading users…')
+      : users.length === 0
+        ? React.createElement('p', { className: 'text-sm text-gray-500 italic' }, 'No users on this tenant yet.')
+        : React.createElement('div', { className: 'space-y-2' },
+            users.map(u =>
+              React.createElement('div', {
+                key: u.id,
+                className: `border rounded-lg p-3 ${u.is_active ? 'bg-white' : 'bg-gray-50 opacity-75'}`
+              },
+                React.createElement('div', { className: 'flex items-start justify-between gap-3' },
+                  React.createElement('div', { className: 'flex-1 min-w-0' },
+                    React.createElement('div', { className: 'flex items-center gap-2 flex-wrap' },
+                      React.createElement('span', { className: 'font-semibold text-sm text-gray-800 truncate' }, u.email),
+                      React.createElement('span', {
+                        className: 'text-[10px] uppercase tracking-wide bg-gray-100 text-gray-600 px-1.5 py-0.5 rounded'
+                      }, u.role || 'staff'),
+                      !u.is_active && React.createElement('span', {
+                        className: 'text-[10px] uppercase tracking-wide bg-red-100 text-red-700 px-1.5 py-0.5 rounded'
+                      }, 'inactive')
+                    ),
+                    u.name && React.createElement('div', { className: 'text-xs text-gray-500 mt-0.5' }, u.name),
+                    React.createElement('div', { className: 'text-[11px] text-gray-400 mt-0.5' },
+                      u.last_login_at
+                        ? `Last sign-in: ${new Date(u.last_login_at).toLocaleString()}`
+                        : 'Never signed in'
+                    )
+                  ),
+                  React.createElement('div', { className: 'flex flex-col gap-1 shrink-0' },
+                    React.createElement('button', {
+                      onClick: () => beginReset(u),
+                      className: 'text-xs px-2 py-1 rounded bg-golf-50 text-golf-700 hover:bg-golf-100 whitespace-nowrap'
+                    }, 'Reset password'),
+                    React.createElement('button', {
+                      onClick: () => toggleActive(u),
+                      className: 'text-xs px-2 py-1 rounded bg-gray-100 text-gray-700 hover:bg-gray-200'
+                    }, u.is_active ? 'Disable' : 'Enable')
+                  )
+                )
+              )
+            )
+          ),
+
+    React.createElement('p', { className: 'text-[11px] text-gray-500 mt-3' },
+      'Existing passwords are stored hashed and cannot be retrieved. Use Reset password to set a new one and share it with the tenant out-of-band.'
+    ),
+
+    // Reset confirmation modal
+    resetTarget && React.createElement('div', {
+      className: 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4',
+      onClick: cancelReset
+    },
+      React.createElement('div', {
+        className: 'bg-white rounded-2xl shadow-xl max-w-md w-full p-6',
+        onClick: e => e.stopPropagation()
+      },
+        React.createElement('h3', { className: 'text-base font-bold text-gray-800 mb-1' }, 'Reset password'),
+        React.createElement('p', { className: 'text-sm text-gray-600 mb-4' },
+          `For ${resetTarget.email}. The current password will be invalidated immediately.`
+        ),
+        React.createElement('div', { className: 'space-y-2 mb-4' },
+          React.createElement('label', { className: 'flex items-start gap-2 text-sm' },
+            React.createElement('input', {
+              type: 'radio', name: 'resetMode', checked: resetMode === 'generate',
+              onChange: () => setResetMode('generate'),
+              className: 'mt-0.5'
+            }),
+            React.createElement('span', null,
+              React.createElement('span', { className: 'font-medium' }, 'Generate a secure password'),
+              React.createElement('span', { className: 'text-xs text-gray-500 block' },
+                '14 characters, no ambiguous letters. Recommended.'
+              )
+            )
+          ),
+          React.createElement('label', { className: 'flex items-start gap-2 text-sm' },
+            React.createElement('input', {
+              type: 'radio', name: 'resetMode', checked: resetMode === 'manual',
+              onChange: () => setResetMode('manual'),
+              className: 'mt-0.5'
+            }),
+            React.createElement('span', null,
+              React.createElement('span', { className: 'font-medium' }, 'Set a specific password'),
+              React.createElement('span', { className: 'text-xs text-gray-500 block' },
+                'Min 8 characters, no whitespace.'
+              )
+            )
+          ),
+          resetMode === 'manual' && React.createElement('input', {
+            type: 'text',
+            value: manualPwd,
+            onChange: e => setManualPwd(e.target.value),
+            placeholder: 'New password',
+            className: 'w-full text-sm border rounded-lg px-3 py-2 ml-6'
+          })
+        ),
+        React.createElement('div', { className: 'flex justify-end gap-2' },
+          React.createElement('button', {
+            onClick: cancelReset, disabled: resetting,
+            className: 'text-sm px-3 py-1.5 rounded-lg bg-gray-100 hover:bg-gray-200 text-gray-700'
+          }, 'Cancel'),
+          React.createElement('button', {
+            onClick: submitReset, disabled: resetting || (resetMode === 'manual' && !manualPwd),
+            className: 'text-sm px-3 py-1.5 rounded-lg bg-golf-600 hover:bg-golf-700 text-white disabled:opacity-50'
+          }, resetting ? 'Resetting…' : 'Reset password')
+        )
+      )
+    ),
+
+    // One-time password reveal modal
+    revealed && React.createElement('div', {
+      className: 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4',
+      onClick: dismissRevealed
+    },
+      React.createElement('div', {
+        className: 'bg-white rounded-2xl shadow-xl max-w-md w-full p-6',
+        onClick: e => e.stopPropagation()
+      },
+        React.createElement('h3', { className: 'text-base font-bold text-gray-800 mb-1' },
+          '🔑 New password — copy it now'
+        ),
+        React.createElement('p', { className: 'text-sm text-gray-600 mb-4' },
+          `For ${revealed.email}. This is the only time it will be shown — once you close this dialog, we cannot retrieve it.`
+        ),
+        React.createElement('div', {
+          className: 'font-mono text-base bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 mb-3 break-all select-all'
+        }, revealed.password),
+        React.createElement('div', { className: 'flex justify-end gap-2' },
+          React.createElement('button', {
+            onClick: copyPassword,
+            className: 'text-sm px-3 py-1.5 rounded-lg bg-gray-100 hover:bg-gray-200 text-gray-700'
+          }, 'Copy'),
+          React.createElement('button', {
+            onClick: dismissRevealed,
+            className: 'text-sm px-3 py-1.5 rounded-lg bg-golf-600 hover:bg-golf-700 text-white'
+          }, 'I saved it')
+        )
+      )
+    )
+  );
+}
+
 function EditTenantModal({ business, onClose, onSaved }) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -3231,6 +3469,12 @@ function EditTenantModal({ business, onClose, onSaved }) {
                   React.createElement('span', null, 'Is active (inbound calls accepted)')
                 )
               )
+            ),
+
+            // ---------- Users + password reset ----------
+            React.createElement('section', null,
+              React.createElement('h3', { className: 'text-xs font-bold uppercase tracking-wide text-gray-500 mb-2' }, 'Users'),
+              React.createElement(TenantUsersPanel, { businessId: business.id })
             ),
 
             // ---------- Personal Assistant (only if applicable) ----------

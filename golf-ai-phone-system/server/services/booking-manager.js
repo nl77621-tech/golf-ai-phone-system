@@ -242,6 +242,50 @@ async function updateModificationStatus(businessId, id, status, staffNotes) {
   return mod;
 }
 
+/**
+ * Get all PENDING holds for a tenant on a given date. Used by the AI's
+ * `check_tee_times` tool to subtract slots the assistant has already
+ * promised on this call (or earlier today) but that staff hasn't yet
+ * pushed to the live tee sheet — without this, two callers in quick
+ * succession could each be offered the same time.
+ *
+ * Only `status = 'pending'` rows are returned. Once staff marks a row
+ * `confirmed`, it should already be on Tee-On, so the live availability
+ * check will reflect it directly — subtracting it here would double-count.
+ *
+ * Returns rows with `requested_time` normalised to "HH:MM" (24-hour) so
+ * the caller can match them against tee-sheet slot times. Postgres
+ * returns TIME as a string like "08:00:00" — we slice to "HH:MM".
+ */
+async function getPendingHoldsForDate(businessId, dateYMD) {
+  requireBusinessId(businessId, 'getPendingHoldsForDate');
+  if (!dateYMD || typeof dateYMD !== 'string') return [];
+  const res = await query(
+    `SELECT id, requested_time, party_size, customer_name, created_at
+       FROM booking_requests
+      WHERE business_id = $1
+        AND status = 'pending'
+        AND requested_date = $2::date`,
+    [businessId, dateYMD]
+  );
+  return res.rows.map(r => {
+    const raw = r.requested_time;
+    let time_24h = null;
+    if (raw) {
+      const s = String(raw).trim();
+      // Postgres TIME comes back as "HH:MM:SS" — slice off seconds.
+      time_24h = s.slice(0, 5);
+    }
+    return {
+      id: r.id,
+      time_24h,
+      party_size: Number(r.party_size) || 1,
+      customer_name: r.customer_name || null,
+      created_at: r.created_at
+    };
+  });
+}
+
 // Get bookings for a date range
 async function getBookingsForDateRange(businessId, startDate, endDate) {
   requireBusinessId(businessId, 'getBookingsForDateRange');
@@ -347,6 +391,7 @@ module.exports = {
   createBookingRequest,
   createModificationRequest,
   getPendingBookings,
+  getPendingHoldsForDate,
   getPendingModifications,
   updateBookingStatus,
   updateModificationStatus,

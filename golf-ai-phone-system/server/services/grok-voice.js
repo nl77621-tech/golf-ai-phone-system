@@ -21,7 +21,8 @@ const {
   createBookingRequest,
   createModificationRequest,
   getConfirmedBookingsByPhone,
-  getBookingById
+  getBookingById,
+  getPendingHoldsForDate
 } = require('./booking-manager');
 const { getLineType } = require('./phone-lookup');
 const { getCurrentWeather, getForecast } = require('./weather');
@@ -838,6 +839,54 @@ async function executeToolCall(toolName, args, ctx) {
           const teeOnCfg = await getTeeOnConfigForBusiness(businessId);
           console.log(`[tenant:${businessId}][${callLogId}] check_tee_times | date: ${args.date} | party_size: ${partySize} | raw args:`, JSON.stringify(args));
           const allSlots = await teeon.checkAvailability(args.date, partySize, teeOnCfg);
+
+          // Subtract any pending holds — bookings the AI has taken on this
+          // call (or earlier today) that staff hasn't yet pushed to Tee-On.
+          // Without this, two callers in quick succession could both be
+          // offered the same slot. We only subtract `status='pending'` rows
+          // because once staff confirms, the row is on Tee-On and the live
+          // availability already reflects it (subtracting again would
+          // double-count). Group holds by HH:MM, then for each Tee-On slot
+          // reduce maxPlayers by the matching held seats.
+          let pendingHolds = [];
+          try {
+            pendingHolds = await getPendingHoldsForDate(businessId, args.date);
+          } catch (holdErr) {
+            console.warn(`[tenant:${businessId}][${callLogId}] pending-holds lookup failed, proceeding with live capacity only:`, holdErr.message);
+          }
+          const heldByTime = new Map();
+          for (const h of pendingHolds) {
+            if (!h.time_24h) continue;
+            heldByTime.set(h.time_24h, (heldByTime.get(h.time_24h) || 0) + (h.party_size || 0));
+          }
+          const slotTimeTo24h = (str) => {
+            if (!str) return null;
+            const m = String(str).trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+            if (m) {
+              let h = parseInt(m[1], 10);
+              const mins = m[2];
+              const ampm = m[3].toUpperCase();
+              if (ampm === 'PM' && h !== 12) h += 12;
+              if (ampm === 'AM' && h === 12) h = 0;
+              return `${String(h).padStart(2, '0')}:${mins}`;
+            }
+            const m2 = String(str).trim().match(/^(\d{1,2}):(\d{2})/);
+            return m2 ? `${m2[1].padStart(2, '0')}:${m2[2]}` : null;
+          };
+          let heldSubtractions = 0;
+          if (heldByTime.size > 0) {
+            for (const slot of allSlots) {
+              const key = slotTimeTo24h(slot.time);
+              const held = key ? heldByTime.get(key) : 0;
+              if (held && held > 0) {
+                slot.maxPlayers = Math.max(0, (slot.maxPlayers || 0) - held);
+                heldSubtractions++;
+              }
+            }
+            console.log(
+              `[tenant:${businessId}][${callLogId}] Applied ${pendingHolds.length} pending hold(s) — adjusted ${heldSubtractions} slot(s) on ${args.date}`
+            );
+          }
 
           const slots = allSlots.filter(s => s.maxPlayers >= partySize);
 

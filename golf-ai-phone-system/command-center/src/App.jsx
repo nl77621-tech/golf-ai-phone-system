@@ -4718,6 +4718,194 @@ function OnboardingWizard({ onCancel, onCreated, onActAs, mode = 'business', ini
 }
 
 // ============================================
+// TOAST NOTIFICATIONS (live booking events)
+// ============================================
+//
+// Listens for `cmdcenter:refresh` window events (re-broadcast by the App
+// from the SSE stream — see App() useEffect) and shows a small slide-in
+// toast for booking.created / modification.created events. Every other
+// event type is ignored — booking.updated etc. is what STAFF cause when
+// they confirm/reject, no point showing a toast for those.
+//
+// Sound: short Web Audio chime (no asset file needed). Can be muted via
+// the bell icon, persisted in localStorage so the choice survives reloads.
+//
+// Optional desktop notifications: if the user has granted Notification
+// permission (one-click prompt rendered next to the bell when permission
+// is "default"), we ALSO fire a native OS notification, useful when staff
+// are tabbed away.
+//
+// Click a toast to dismiss it. Clicking the body navigates to the
+// bookings list (passed in as `onNavigate` from App).
+function playBookingChime() {
+  if (typeof window === 'undefined') return;
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return;
+  try {
+    const ctx = new Ctx();
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(880, ctx.currentTime);
+    o.frequency.exponentialRampToValueAtTime(1320, ctx.currentTime + 0.18);
+    o.connect(g);
+    g.connect(ctx.destination);
+    g.gain.setValueAtTime(0.0001, ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.18, ctx.currentTime + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.45);
+    o.start();
+    o.stop(ctx.currentTime + 0.5);
+  } catch (_) { /* no-op — silence beats a crash */ }
+}
+
+function formatBookingWhen(dateStr, timeStr) {
+  // Postgres returns DATE as "YYYY-MM-DD" and TIME as "HH:MM:SS".
+  // We render a compact "Sat, May 4 — 8:08 AM"-ish string.
+  if (!dateStr) return '';
+  let d;
+  try {
+    // Treat YYYY-MM-DD as local date (avoid UTC shift).
+    const m = String(dateStr).match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (m) d = new Date(parseInt(m[1]), parseInt(m[2]) - 1, parseInt(m[3]));
+    else d = new Date(dateStr);
+  } catch (_) { return String(dateStr); }
+  if (isNaN(d?.getTime())) return String(dateStr);
+  const datePart = d.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+  let timePart = '';
+  if (timeStr) {
+    const t = String(timeStr).match(/^(\d{1,2}):(\d{2})/);
+    if (t) {
+      let h = parseInt(t[1]);
+      const mins = t[2];
+      const ampm = h >= 12 ? 'PM' : 'AM';
+      h = h % 12 || 12;
+      timePart = ` — ${h}:${mins} ${ampm}`;
+    }
+  }
+  return datePart + timePart;
+}
+
+function Toaster({ onNavigate }) {
+  const [toasts, setToasts] = useState([]);
+  const [muted, setMuted] = useState(() => {
+    if (typeof localStorage === 'undefined') return false;
+    return localStorage.getItem('cc_toaster_muted') === '1';
+  });
+  const [notifPerm, setNotifPerm] = useState(() => {
+    if (typeof Notification === 'undefined') return 'unsupported';
+    return Notification.permission;
+  });
+
+  const dismiss = (id) => setToasts(prev => prev.filter(t => t.id !== id));
+
+  useEffect(() => {
+    const onLive = (e) => {
+      const detail = e?.detail || {};
+      const type = detail.type;
+      const data = detail.data || {};
+      if (type !== 'booking.created' && type !== 'modification.created') return;
+
+      let title, body;
+      if (type === 'booking.created') {
+        const who = data.customer_name || 'A caller';
+        const players = parseInt(data.party_size) || 1;
+        const playerWord = players === 1 ? 'player' : 'players';
+        const when = formatBookingWhen(data.requested_date, data.requested_time);
+        title = '🔔 New booking';
+        body = when ? `${who} — ${players} ${playerWord} • ${when}` : `${who} — ${players} ${playerWord}`;
+      } else {
+        const who = data.customer_name || 'A caller';
+        const verb = data.request_type === 'cancel' ? 'cancellation' : 'change request';
+        title = '✏️ New ' + verb;
+        body = who;
+      }
+
+      const id = Date.now() + Math.random();
+      setToasts(prev => [...prev.slice(-4), { id, title, body }]);
+      setTimeout(() => {
+        setToasts(prev => prev.filter(t => t.id !== id));
+      }, 9000);
+
+      if (!muted) playBookingChime();
+
+      if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+        try {
+          const n = new Notification(title, { body, tag: `cc-${type}-${id}` });
+          n.onclick = () => {
+            window.focus();
+            if (typeof onNavigate === 'function') onNavigate();
+            n.close();
+          };
+        } catch (_) { /* some browsers throw on notif from non-secure context */ }
+      }
+    };
+    window.addEventListener('cmdcenter:refresh', onLive);
+    return () => window.removeEventListener('cmdcenter:refresh', onLive);
+  }, [muted, onNavigate]);
+
+  const toggleMute = () => {
+    setMuted(m => {
+      const next = !m;
+      try { localStorage.setItem('cc_toaster_muted', next ? '1' : '0'); } catch (_) {}
+      return next;
+    });
+  };
+
+  const enableNotifs = async () => {
+    if (typeof Notification === 'undefined') return;
+    try {
+      const result = await Notification.requestPermission();
+      setNotifPerm(result);
+    } catch (_) { /* user dismissed */ }
+  };
+
+  // Floating control cluster (mute toggle + notification opt-in) lives in
+  // the same fixed corner so it doesn't interfere with page layout.
+  const controls = React.createElement('div', {
+    className: 'fixed top-4 right-4 z-40 flex items-center gap-2'
+  },
+    notifPerm === 'default' && React.createElement('button', {
+      onClick: enableNotifs,
+      title: 'Enable desktop notifications',
+      className: 'bg-white border border-gray-200 hover:border-golf-400 text-xs px-3 py-1.5 rounded-full shadow-sm text-gray-700'
+    }, '🔔 Enable desktop alerts'),
+    React.createElement('button', {
+      onClick: toggleMute,
+      title: muted ? 'Sounds off — click to enable' : 'Sounds on — click to mute',
+      className: `bg-white border border-gray-200 hover:border-golf-400 text-base w-9 h-9 rounded-full shadow-sm ${muted ? 'opacity-60' : ''}`
+    }, muted ? '🔕' : '🔔')
+  );
+
+  const stack = React.createElement('div', {
+    className: 'fixed bottom-4 right-4 z-50 flex flex-col gap-2 max-w-sm'
+  },
+    toasts.map(t =>
+      React.createElement('div', {
+        key: t.id,
+        onClick: () => {
+          if (typeof onNavigate === 'function') onNavigate();
+          dismiss(t.id);
+        },
+        className: 'bg-white border-l-4 border-golf-500 shadow-lg rounded-lg pl-4 pr-3 py-3 cursor-pointer hover:shadow-xl transition-shadow'
+      },
+        React.createElement('div', { className: 'flex items-start gap-3' },
+          React.createElement('div', { className: 'flex-1 min-w-0' },
+            React.createElement('div', { className: 'font-semibold text-sm text-gray-800' }, t.title),
+            React.createElement('div', { className: 'text-sm text-gray-600 mt-0.5' }, t.body)
+          ),
+          React.createElement('button', {
+            onClick: (e) => { e.stopPropagation(); dismiss(t.id); },
+            className: 'text-gray-300 hover:text-gray-500 text-lg leading-none -mt-1'
+          }, '×')
+        )
+      )
+    )
+  );
+
+  return React.createElement(React.Fragment, null, controls, stack);
+}
+
+// ============================================
 // TOP BAR (shown above all authenticated views)
 // ============================================
 function TopBar({ session, businesses, selectedBusinessId, onSelectBusiness, onLogout }) {
@@ -5870,6 +6058,12 @@ function App() {
 
   // Tenant user OR super admin acting as a tenant → regular sidebar + page.
   const PageComponent = tenantPages[currentPage] || DashboardPage;
+  // Pick the right "where to take the operator when a toast is clicked"
+  // target — bookings for golf/restaurant verticals, calls for the
+  // personal_assistant template (which doesn't have a bookings page).
+  const toastNavTarget =
+    effectiveTemplateKey === 'personal_assistant' ? 'calls'
+    : (effectiveTemplateKey === 'restaurant' ? 'reservations' : 'bookings');
   return React.createElement('div', { className: 'flex flex-col min-h-screen' },
     React.createElement(TopBar, {
       session, businesses,
@@ -5894,7 +6088,11 @@ function App() {
       React.createElement('main', { className: 'flex-1 p-8 overflow-auto bg-gray-50' },
         React.createElement(PageComponent)
       )
-    )
+    ),
+    // Live toast notifications + sound/desktop-alert controls. Mounted
+    // here (not inside <main>) so the toasts are positioned relative to
+    // the viewport and stay visible regardless of which page is active.
+    React.createElement(Toaster, { onNavigate: () => setCurrentPage(toastNavTarget) })
   );
 }
 

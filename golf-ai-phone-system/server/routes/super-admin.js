@@ -865,9 +865,39 @@ router.patch('/businesses/:id', async (req, res) => {
     });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
-    console.error('[super] patch business error:', err.message);
+    console.error('[super] patch business error:', err.message, err.detail || '');
     if (err.code === '23505') {
-      return res.status(409).json({ error: 'slug or twilio_phone_number already in use' });
+      // Mirror the targeted-error UX from POST /businesses — parse
+      // err.detail to tell the operator EXACTLY which column collided
+      // and what value caused it. Generic message was the lazy fallback
+      // that left operators staring at a meaningless banner.
+      const detail = typeof err.detail === 'string' ? err.detail : '';
+      const match = detail.match(/Key \(([^)]+)\)=\(([^)]+)\)/);
+      const col = match?.[1];
+      const value = match?.[2];
+      let friendly = 'Slug or twilio_phone_number already in use.';
+      let field = null;
+      if (col === 'slug') {
+        friendly = `The slug "${value}" is already taken by another tenant (possibly a soft-deleted one). Pick a different slug, or run the reclaim-orphaned endpoint to free it up.`;
+        field = 'slug';
+      } else if (
+        col === 'phone_number' || col === 'twilio_phone_number' ||
+        err.constraint === 'business_phone_numbers_phone_number_key' ||
+        err.constraint === 'businesses_twilio_phone_number_key'
+      ) {
+        friendly = value
+          ? `The phone number "${value}" is already attached to another tenant (possibly a soft-deleted one). Clear it on this tenant, change it, or run the reclaim-orphaned endpoint.`
+          : 'A phone number on this tenant collides with another tenant.';
+        field = 'phone_number';
+      } else if (col) {
+        friendly = `The value "${value}" collides with an existing tenant on column "${col}".`;
+      }
+      return res.status(409).json({
+        error: friendly,
+        field,
+        constraint: err.constraint || null,
+        detail: detail || null
+      });
     }
     res.status(500).json({ error: err.message || 'Failed to update business' });
   } finally {

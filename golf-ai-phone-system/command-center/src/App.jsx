@@ -3176,6 +3176,12 @@ function EditTenantModal({ business, onClose, onSaved }) {
   // Original template_key — used to decide whether to show the
   // "switching template" warning banner and to label the previous value.
   const [originalTemplateKey, setOriginalTemplateKey] = useState(null);
+  // Snapshot of form values at load time. Save() compares against this so
+  // we only PATCH columns the operator actually changed — sending the
+  // whole form back would re-write `slug` / `twilio_phone_number` to
+  // their existing values, which trips a 23505 if any soft-deleted
+  // tenant happens to be hoarding the same identifier.
+  const [originalForm, setOriginalForm] = useState(null);
   // Catalog of available templates for the dropdown. Loaded from
   // /api/super/templates so the same registry powers wizard + edit.
   const [templates, setTemplates] = useState([]);
@@ -3198,7 +3204,7 @@ function EditTenantModal({ business, onClose, onSaved }) {
     ])
       .then(([resp, tpl, vt]) => {
         const b = resp.business;
-        setForm({
+        const initialForm = {
           name: b.name || '',
           slug: b.slug || '',
           twilio_phone_number: b.twilio_phone_number || '',
@@ -3214,7 +3220,9 @@ function EditTenantModal({ business, onClose, onSaved }) {
           internal_notes: b.internal_notes || '',
           billing_notes: b.billing_notes || '',
           template_key: b.template_key || ''
-        });
+        };
+        setForm(initialForm);
+        setOriginalForm(initialForm);
         setOriginalTemplateKey(b.template_key || null);
         setTemplates(Array.isArray(tpl?.templates) ? tpl.templates : []);
         setVoiceTiers(Array.isArray(vt?.tiers) ? vt.tiers : []);
@@ -3246,7 +3254,22 @@ function EditTenantModal({ business, onClose, onSaved }) {
     setSaving(true);
     setError('');
     try {
-      const payload = { ...form };
+      // Only PATCH columns the operator actually changed. Sending the
+      // whole form back would re-UPDATE every column to its existing
+      // value — and any column with a UNIQUE index (slug,
+      // twilio_phone_number) trips a 23505 if a soft-deleted tenant
+      // somewhere is hoarding the same value. The PATCH endpoint
+      // accepts partial bodies, so this just works.
+      const payload = {};
+      if (originalForm) {
+        for (const k of Object.keys(form)) {
+          if (form[k] !== originalForm[k]) payload[k] = form[k];
+        }
+      } else {
+        // First-load fallback (shouldn't fire — useEffect sets
+        // originalForm at the same time as form — but defend anyway).
+        Object.assign(payload, form);
+      }
       // Only include settings.* keys that actually changed — avoids
       // bumping updated_at on settings rows the operator didn't touch,
       // which keeps the audit log tidy.
@@ -3264,6 +3287,11 @@ function EditTenantModal({ business, onClose, onSaved }) {
       }
       if (Object.keys(settingsPatch).length > 0) {
         payload.settings = settingsPatch;
+      }
+      // Nothing changed at all? Just close the modal.
+      if (Object.keys(payload).length === 0) {
+        onClose();
+        return;
       }
       const resp = await api(`/api/super/businesses/${business.id}`, {
         method: 'PATCH',

@@ -2954,6 +2954,14 @@ function TenantUsersPanel({ businessId }) {
   const [manualPwd, setManualPwd] = useState('');
   const [resetting, setResetting] = useState(false);
   const [revealed, setRevealed] = useState(null);         // { email, password }
+  // Add-user form state. `addOpen` toggles the inline form; we keep it
+  // collapsed by default so the panel stays compact for tenants that
+  // don't need to add anyone.
+  const [addOpen, setAddOpen] = useState(false);
+  const [addForm, setAddForm] = useState({
+    email: '', name: '', role: 'business_admin', mode: 'generate', password: ''
+  });
+  const [adding, setAdding] = useState(false);
 
   const reload = () => {
     setLoading(true);
@@ -3020,6 +3028,39 @@ function TenantUsersPanel({ businessId }) {
     }
   };
 
+  const submitAdd = async () => {
+    setAdding(true);
+    setError('');
+    try {
+      const body = {
+        email: addForm.email.trim().toLowerCase(),
+        name: addForm.name.trim() || undefined,
+        role: addForm.role
+      };
+      if (addForm.mode === 'manual') {
+        body.password = addForm.password;
+      } else {
+        body.generate = true;
+      }
+      const result = await api(`/api/super/businesses/${businessId}/users`, {
+        method: 'POST',
+        body: JSON.stringify(body)
+      });
+      // Show the one-time password reveal modal — same UX as reset.
+      setRevealed({
+        email: result?.user?.email || addForm.email,
+        password: result?.password || ''
+      });
+      setAddOpen(false);
+      setAddForm({ email: '', name: '', role: 'business_admin', mode: 'generate', password: '' });
+      reload();
+    } catch (err) {
+      setError(err.message || 'Failed to create user');
+    } finally {
+      setAdding(false);
+    }
+  };
+
   return React.createElement('div', null,
     error && React.createElement('div', {
       className: 'mb-2 text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2'
@@ -3070,6 +3111,66 @@ function TenantUsersPanel({ businessId }) {
 
     React.createElement('p', { className: 'text-[11px] text-gray-500 mt-3' },
       'Existing passwords are stored hashed and cannot be retrieved. Use Reset password to set a new one and share it with the tenant out-of-band.'
+    ),
+
+    // Add-user form: collapsed by default, expands inline on click.
+    React.createElement('div', { className: 'mt-4 border-t pt-3' },
+      !addOpen
+        ? React.createElement('button', {
+            onClick: () => setAddOpen(true),
+            className: 'text-sm px-3 py-1.5 rounded-lg bg-golf-50 text-golf-700 hover:bg-golf-100 font-medium'
+          }, '+ Add user')
+        : React.createElement('div', { className: 'space-y-3' },
+            React.createElement('h4', { className: 'font-semibold text-sm' }, 'Add a new user'),
+            React.createElement('div', { className: 'grid grid-cols-1 md:grid-cols-2 gap-2' },
+              React.createElement('input', {
+                type: 'email', placeholder: 'Email',
+                value: addForm.email,
+                onChange: e => setAddForm(f => ({ ...f, email: e.target.value })),
+                className: 'border rounded-lg px-3 py-2 text-sm'
+              }),
+              React.createElement('input', {
+                type: 'text', placeholder: 'Name (optional)',
+                value: addForm.name,
+                onChange: e => setAddForm(f => ({ ...f, name: e.target.value })),
+                className: 'border rounded-lg px-3 py-2 text-sm'
+              }),
+              React.createElement('select', {
+                value: addForm.role,
+                onChange: e => setAddForm(f => ({ ...f, role: e.target.value })),
+                className: 'border rounded-lg px-3 py-2 text-sm bg-white'
+              },
+                React.createElement('option', { value: 'business_admin' }, 'Business Admin'),
+                React.createElement('option', { value: 'staff' }, 'Staff')
+              ),
+              React.createElement('select', {
+                value: addForm.mode,
+                onChange: e => setAddForm(f => ({ ...f, mode: e.target.value })),
+                className: 'border rounded-lg px-3 py-2 text-sm bg-white'
+              },
+                React.createElement('option', { value: 'generate' }, 'Auto-generate password'),
+                React.createElement('option', { value: 'manual' }, 'Set a specific password')
+              )
+            ),
+            addForm.mode === 'manual' && React.createElement('input', {
+              type: 'text', placeholder: 'Password (min 8 chars, no spaces)',
+              value: addForm.password,
+              onChange: e => setAddForm(f => ({ ...f, password: e.target.value })),
+              className: 'w-full border rounded-lg px-3 py-2 text-sm'
+            }),
+            React.createElement('div', { className: 'flex gap-2' },
+              React.createElement('button', {
+                onClick: submitAdd,
+                disabled: adding || !addForm.email.trim() || (addForm.mode === 'manual' && addForm.password.length < 8),
+                className: 'text-sm px-3 py-1.5 rounded-lg bg-golf-600 hover:bg-golf-700 text-white disabled:opacity-50'
+              }, adding ? 'Creating…' : 'Create user'),
+              React.createElement('button', {
+                onClick: () => { setAddOpen(false); setError(''); setAddForm({ email: '', name: '', role: 'business_admin', mode: 'generate', password: '' }); },
+                disabled: adding,
+                className: 'text-sm px-3 py-1.5 rounded-lg bg-gray-100 hover:bg-gray-200 text-gray-700'
+              }, 'Cancel')
+            )
+          )
     ),
 
     // Reset confirmation modal

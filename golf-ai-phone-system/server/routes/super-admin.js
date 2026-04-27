@@ -1666,8 +1666,9 @@ router.post('/businesses/:id/invite-admin', async (req, res) => {
 //                                                     — reset password,
 //                                                       returns plaintext ONCE
 
-// GET — list business_users for a tenant. Includes is_active so the UI can
-// surface deactivated accounts and offer to reactivate them.
+// GET — list business_users for a tenant. The schema uses `active`
+// (not `is_active`) and has no `updated_at` — alias to is_active in the
+// JSON so the frontend can keep using a consistent key name.
 router.get('/businesses/:id/users', async (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (!Number.isInteger(id) || id <= 0) {
@@ -1677,17 +1678,105 @@ router.get('/businesses/:id/users', async (req, res) => {
     const biz = await getBusinessById(id, { includeDeleted: true });
     if (!biz) return res.status(404).json({ error: 'Business not found' });
     const { rows } = await query(
-      `SELECT id, email, name, role, is_active, last_login_at,
-              created_at, updated_at
+      `SELECT id, email, name, role,
+              active AS is_active,
+              last_login_at, created_at
          FROM business_users
         WHERE business_id = $1
-        ORDER BY is_active DESC, LOWER(email) ASC`,
+        ORDER BY active DESC, LOWER(email) ASC`,
       [id]
     );
     res.json({ business_id: id, business_slug: biz.slug, users: rows });
   } catch (err) {
     console.error(`[super] list users for ${id} error:`, err.message);
     res.status(500).json({ error: 'Failed to load users' });
+  }
+});
+
+// POST — create a new business_user directly (no invite flow). The
+// super-admin is shown the new password ONCE in the response so they
+// can deliver it out-of-band. Same one-time-reveal contract as
+// reset-password. Body shape:
+//   { email, name?, role?, password? | generate?: true }
+//
+// `email` is required. `role` defaults to 'business_admin'; supply
+// 'staff' for non-admin tenant users. The (business_id, email) UNIQUE
+// constraint guards against duplicates — we surface a 409 on collision.
+router.post('/businesses/:id/users', async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ error: 'invalid business id' });
+  }
+  const body = req.body || {};
+  const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'A valid email is required' });
+  }
+  const name = typeof body.name === 'string' ? body.name.trim().slice(0, 200) : null;
+  const rawRole = typeof body.role === 'string' ? body.role.trim() : 'business_admin';
+  const role = rawRole === 'staff' || rawRole === 'business_admin' ? rawRole : 'business_admin';
+
+  const wantGenerate = body.generate === true;
+  const supplied = typeof body.password === 'string' ? body.password : null;
+  if (!wantGenerate && !supplied) {
+    return res.status(400).json({
+      error: 'Provide either { password: "..." } or { generate: true }'
+    });
+  }
+  let plaintext;
+  if (supplied) {
+    const err = validateSuppliedPassword(supplied);
+    if (err) return res.status(400).json({ error: err });
+    plaintext = supplied;
+  } else {
+    plaintext = generateTempPassword();
+  }
+
+  try {
+    const biz = await getBusinessById(id);
+    if (!biz) return res.status(404).json({ error: 'Business not found' });
+
+    const passwordHash = await bcrypt.hash(plaintext, 10);
+    const { rows } = await query(
+      `INSERT INTO business_users (business_id, email, password_hash, name, role)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, email, name, role, active AS is_active, created_at`,
+      [id, email, passwordHash, name, role]
+    );
+    const user = rows[0];
+
+    await logEventFromReq(req, {
+      businessId: id,
+      action: 'user.created_by_super',
+      targetType: 'business_user',
+      targetId: user.id,
+      meta: {
+        target_email: user.email,
+        target_role: user.role,
+        method: supplied ? 'operator_supplied' : 'auto_generated',
+        actor_super_admin_id: req.auth?.user_id || null
+      }
+    }).catch(() => {});
+
+    console.log(
+      `[super] Created business_user ${user.id} (${email}) on tenant ${id} ` +
+      `by super_admin ${req.auth?.user_id || '?'}`
+    );
+    res.status(201).json({
+      ok: true,
+      user,
+      password: plaintext,
+      generated: !supplied,
+      note: 'This password is shown once. Save or share it now — we cannot retrieve it later.'
+    });
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({
+        error: `A user with email "${email}" already exists on this tenant.`
+      });
+    }
+    console.error(`[super] create user on ${id} error:`, err.message);
+    res.status(500).json({ error: 'Failed to create user' });
   }
 });
 
@@ -1749,7 +1838,7 @@ router.post('/businesses/:id/users/:userId/reset-password', async (req, res) => 
     // This both guards against id-swap mistakes and gives us nice
     // metadata for the audit event.
     const { rows: [user] } = await query(
-      `SELECT id, email, name, role, business_id, is_active
+      `SELECT id, email, name, role, business_id, active AS is_active
          FROM business_users
         WHERE id = $1 AND business_id = $2
         LIMIT 1`,
@@ -1760,7 +1849,7 @@ router.post('/businesses/:id/users/:userId/reset-password', async (req, res) => 
     const passwordHash = await bcrypt.hash(plaintext, 10);
     await query(
       `UPDATE business_users
-          SET password_hash = $1, updated_at = NOW()
+          SET password_hash = $1
         WHERE id = $2 AND business_id = $3`,
       [passwordHash, userId, businessId]
     );
@@ -1821,11 +1910,13 @@ router.patch('/businesses/:id/users/:userId', async (req, res) => {
     return res.status(400).json({ error: 'Body must include { is_active: boolean }' });
   }
   try {
+    // Schema column is `active` (no `updated_at`); alias back to is_active
+    // in the response so the frontend keeps a consistent key name.
     const { rows } = await query(
       `UPDATE business_users
-          SET is_active = $1, updated_at = NOW()
+          SET active = $1
         WHERE id = $2 AND business_id = $3
-        RETURNING id, email, name, role, is_active`,
+        RETURNING id, email, name, role, active AS is_active`,
       [req.body.is_active, userId, businessId]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'User not found in this tenant' });

@@ -2965,7 +2965,12 @@ function TenantUsersPanel({ businessId }) {
   const [resetMode, setResetMode] = useState('generate'); // 'generate' | 'manual'
   const [manualPwd, setManualPwd] = useState('');
   const [resetting, setResetting] = useState(false);
-  const [revealed, setRevealed] = useState(null);         // { email, password, signinUrl }
+  const [revealed, setRevealed] = useState(null);         // { userId, email, password, signinUrl }
+  // SMS-dispatch state for the reveal modal. `smsTo` is a phone number
+  // the operator types; `smsStatus` is the send result we surface inline.
+  const [smsTo, setSmsTo] = useState('');
+  const [smsSending, setSmsSending] = useState(false);
+  const [smsStatus, setSmsStatus] = useState(null); // { ok: bool, message: string }
   // Add-user form state. `addOpen` toggles the inline form; we keep it
   // collapsed by default so the panel stays compact for tenants that
   // don't need to add anyone.
@@ -3004,6 +3009,7 @@ function TenantUsersPanel({ businessId }) {
         { method: 'POST', body: JSON.stringify(body) }
       );
       setRevealed({
+        userId: resetTarget.id,
         email: result?.user?.email || resetTarget.email,
         password: result?.password || '',
         // Reset doesn't return a signin_url today (it's only on create);
@@ -3013,6 +3019,8 @@ function TenantUsersPanel({ businessId }) {
           ? `${window.location.origin}/?email=${encodeURIComponent(resetTarget.email)}`
           : ''
       });
+      setSmsTo('');
+      setSmsStatus(null);
       setResetTarget(null);
       setManualPwd('');
     } catch (err) {
@@ -3027,7 +3035,38 @@ function TenantUsersPanel({ businessId }) {
     setManualPwd('');
   };
 
-  const dismissRevealed = () => setRevealed(null);
+  const dismissRevealed = () => {
+    setRevealed(null);
+    setSmsTo('');
+    setSmsStatus(null);
+  };
+
+  const sendSmsCredentials = async () => {
+    if (!revealed?.userId || !smsTo.trim()) return;
+    setSmsSending(true);
+    setSmsStatus(null);
+    try {
+      const result = await api(
+        `/api/super/businesses/${businessId}/users/${revealed.userId}/send-credentials-sms`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            to: smsTo.trim(),
+            password: revealed.password,
+            signin_url: revealed.signinUrl || null
+          })
+        }
+      );
+      setSmsStatus({
+        ok: true,
+        message: `Sent to ${result?.to || smsTo.trim()}${result?.from ? ` from ${result.from}` : ''}.`
+      });
+    } catch (err) {
+      setSmsStatus({ ok: false, message: err.message || 'SMS dispatch failed' });
+    } finally {
+      setSmsSending(false);
+    }
+  };
 
   const copyPassword = async () => {
     if (!revealed?.password) return;
@@ -3080,10 +3119,13 @@ function TenantUsersPanel({ businessId }) {
       });
       // Show the one-time password reveal modal — same UX as reset.
       setRevealed({
+        userId: result?.user?.id || null,
         email: result?.user?.email || addForm.email,
         password: result?.password || '',
         signinUrl: result?.signin_url || ''
       });
+      setSmsTo('');
+      setSmsStatus(null);
       setAddOpen(false);
       setAddForm({ email: '', name: '', role: 'business_admin', mode: 'generate', password: '' });
       reload();
@@ -3310,6 +3352,37 @@ function TenantUsersPanel({ businessId }) {
           React.createElement('div', {
             className: 'font-mono text-base bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 break-all select-all'
           }, revealed.password)
+        ),
+
+        // SMS dispatch — only available when we know which user to log
+        // against (i.e. created/reset within this same session). The
+        // server sends FROM the tenant's primary Twilio number, so the
+        // recipient sees a recognizable caller ID.
+        revealed.userId && React.createElement('div', { className: 'mb-4 border-t pt-3' },
+          React.createElement('div', { className: 'text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2' },
+            'Text it to the user'
+          ),
+          React.createElement('div', { className: 'flex gap-2' },
+            React.createElement('input', {
+              type: 'tel',
+              placeholder: '+14165551234',
+              value: smsTo,
+              onChange: e => setSmsTo(e.target.value),
+              disabled: smsSending,
+              className: 'flex-1 text-sm border rounded-lg px-3 py-2 disabled:bg-gray-50'
+            }),
+            React.createElement('button', {
+              onClick: sendSmsCredentials,
+              disabled: smsSending || !smsTo.trim(),
+              className: 'text-sm px-3 py-2 rounded-lg bg-golf-600 hover:bg-golf-700 text-white disabled:opacity-50 whitespace-nowrap'
+            }, smsSending ? 'Sending…' : '📱 Send SMS')
+          ),
+          smsStatus && React.createElement('p', {
+            className: `mt-2 text-xs ${smsStatus.ok ? 'text-green-700' : 'text-red-700'}`
+          }, smsStatus.ok ? `✓ ${smsStatus.message}` : `✗ ${smsStatus.message}`),
+          React.createElement('p', { className: 'text-[11px] text-gray-500 mt-1' },
+            'Sent from this tenant’s primary Twilio number. The message includes the sign-in link, email, and temporary password.'
+          )
         ),
 
         React.createElement('div', { className: 'flex justify-between items-center gap-2' },

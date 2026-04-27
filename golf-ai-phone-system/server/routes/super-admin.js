@@ -21,6 +21,8 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
+const { sendSMS } = require('../services/notification');
+const { normalizeToE164 } = require('../services/caller-lookup');
 const router = express.Router();
 
 const { requireAuth, requireSuperAdmin, createInvite } = require('../middleware/auth');
@@ -1814,6 +1816,102 @@ function validateSuppliedPassword(p) {
   if (/\s/.test(p)) return 'password cannot contain whitespace';
   return null;
 }
+
+// POST — text the new credentials to the user via SMS, sent FROM the
+// tenant's primary Twilio number so the recipient sees a recognizable
+// caller-ID. Body shape:
+//   { to: "+1...", password: "...", signin_url?: "https://..." }
+//
+// We accept the password as input on this one route specifically because
+// the operator needs to forward it to the new user — and the alternative
+// (sending the plaintext through some persistent server-side state)
+// would be worse. The password is used only to compose the SMS body and
+// is NOT logged. Audit records the dispatch metadata (who sent, who to,
+// recipient phone) but never the password content.
+router.post('/businesses/:id/users/:userId/send-credentials-sms', async (req, res) => {
+  const businessId = parseInt(req.params.id, 10);
+  const userId = parseInt(req.params.userId, 10);
+  if (!Number.isInteger(businessId) || businessId <= 0 ||
+      !Number.isInteger(userId) || userId <= 0) {
+    return res.status(400).json({ error: 'invalid id(s)' });
+  }
+
+  const to = normalizeToE164(req.body?.to || '');
+  if (!to) {
+    return res.status(400).json({ error: 'to must be a valid phone number (E.164 — e.g. +14165551234)' });
+  }
+  const password = typeof req.body?.password === 'string' ? req.body.password : '';
+  if (!password) {
+    return res.status(400).json({ error: 'password is required (the value to text to the user)' });
+  }
+  const signinUrl = typeof req.body?.signin_url === 'string' && req.body.signin_url.trim()
+    ? req.body.signin_url.trim()
+    : null;
+
+  try {
+    // Confirm the target user belongs to this tenant — the meta we put
+    // in the SMS (business name, recipient name) reads from these rows
+    // and we want a clean 404 if the operator id-swapped.
+    const { rows: [user] } = await query(
+      `SELECT id, email, name, role, business_id
+         FROM business_users
+        WHERE id = $1 AND business_id = $2
+        LIMIT 1`,
+      [userId, businessId]
+    );
+    if (!user) return res.status(404).json({ error: 'User not found in this tenant' });
+
+    const business = await getBusinessById(businessId);
+    const tenantName = business?.name || 'your account';
+    const greeting = user.name ? `Hi ${user.name.split(' ')[0]}` : 'Hi';
+
+    // Compose the SMS body. Keep it under ~480 chars so it fits 3
+    // segments comfortably; longer bodies get chunked unpredictably by
+    // some carriers.
+    const lines = [`${greeting}, your ${tenantName} account is ready.`];
+    if (signinUrl) lines.push(`Sign in: ${signinUrl}`);
+    lines.push(`Email: ${user.email}`);
+    lines.push(`Temporary password: ${password}`);
+    lines.push('Please sign in and change your password.');
+    const body = lines.join('\n');
+
+    const result = await sendSMS(businessId, to, body);
+    if (!result) {
+      return res.status(502).json({
+        error: 'SMS dispatch returned no result — check that Twilio is configured and the tenant has a primary phone number.'
+      });
+    }
+
+    await logEventFromReq(req, {
+      businessId,
+      action: 'user.credentials_sms_sent',
+      targetType: 'business_user',
+      targetId: userId,
+      meta: {
+        target_email: user.email,
+        target_phone: to,
+        message_sid: result.sid || null,
+        actor_super_admin_id: req.auth?.user_id || null
+        // password content intentionally NOT logged
+      }
+    }).catch(() => {});
+
+    console.log(
+      `[super] Credentials SMS dispatched to ${to} for business_user ${userId} ` +
+      `(${user.email}) on tenant ${businessId} — sid=${result.sid || '?'}`
+    );
+
+    res.json({
+      ok: true,
+      message_sid: result.sid || null,
+      to,
+      from: result.from || null
+    });
+  } catch (err) {
+    console.error(`[super] credentials SMS for user ${userId} error:`, err.message);
+    res.status(500).json({ error: err.message || 'Failed to send credentials SMS' });
+  }
+});
 
 // POST — reset a user's password. Body shape:
 //   { password?: string, generate?: true }

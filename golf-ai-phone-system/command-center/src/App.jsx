@@ -2941,15 +2941,24 @@ function EditTenantModal({ business, onClose, onSaved }) {
   // Catalog of available templates for the dropdown. Loaded from
   // /api/super/templates so the same registry powers wizard + edit.
   const [templates, setTemplates] = useState([]);
+  // Voice tier — separate state so we can detect "did the operator
+  // change it?" cheaply and only push a settings patch when they did.
+  const [voiceConfig, setVoiceConfig] = useState({ tier: 'standard' });
+  const [originalVoiceConfig, setOriginalVoiceConfig] = useState({ tier: 'standard' });
+  // Catalog of voice tiers (loaded from /api/super/voice-tiers — same
+  // source the wizard uses). Falls back to a minimal hardcoded list if
+  // the catalog endpoint is offline so the dropdown still works.
+  const [voiceTiers, setVoiceTiers] = useState([]);
 
   useEffect(() => {
     if (!business) return;
     setLoading(true);
     Promise.all([
       api(`/api/super/businesses/${business.id}`),
-      api('/api/super/templates').catch(() => ({ templates: [] }))
+      api('/api/super/templates').catch(() => ({ templates: [] })),
+      api('/api/super/voice-tiers').catch(() => ({ tiers: [] }))
     ])
-      .then(([resp, tpl]) => {
+      .then(([resp, tpl, vt]) => {
         const b = resp.business;
         setForm({
           name: b.name || '',
@@ -2970,12 +2979,24 @@ function EditTenantModal({ business, onClose, onSaved }) {
         });
         setOriginalTemplateKey(b.template_key || null);
         setTemplates(Array.isArray(tpl?.templates) ? tpl.templates : []);
+        setVoiceTiers(Array.isArray(vt?.tiers) ? vt.tiers : []);
         // Only surface owner_profile if the tenant has a settings row for
         // it. The PA wizard seeds assistant_name into this object; we
         // expose just that field (plus any raw JSON for power users).
         const op = resp.settings?.owner_profile || null;
         setOwnerProfile(op);
         setOriginalOwnerProfile(op ? JSON.parse(JSON.stringify(op)) : null);
+        // Read the existing voice_config (tier + optional voice override).
+        // Default to `standard` for tenants that haven't been onboarded
+        // through the new wizard yet — that matches what grok-voice falls
+        // back to anyway.
+        const vc = resp.settings?.voice_config || { tier: 'standard' };
+        const normalized = {
+          tier: typeof vc.tier === 'string' && vc.tier ? vc.tier : 'standard',
+          voice: typeof vc.voice === 'string' && vc.voice ? vc.voice : ''
+        };
+        setVoiceConfig(normalized);
+        setOriginalVoiceConfig(JSON.parse(JSON.stringify(normalized)));
       })
       .catch(err => setError(err.message || 'Failed to load tenant'))
       .finally(() => setLoading(false));
@@ -2988,12 +3009,20 @@ function EditTenantModal({ business, onClose, onSaved }) {
     setError('');
     try {
       const payload = { ...form };
-      // Only include settings.owner_profile if it actually changed —
-      // avoids bumping updated_at on settings rows the operator didn't
-      // touch, which keeps the audit log tidy.
+      // Only include settings.* keys that actually changed — avoids
+      // bumping updated_at on settings rows the operator didn't touch,
+      // which keeps the audit log tidy.
       const settingsPatch = {};
       if (ownerProfile && JSON.stringify(ownerProfile) !== JSON.stringify(originalOwnerProfile)) {
         settingsPatch.owner_profile = ownerProfile;
+      }
+      if (JSON.stringify(voiceConfig) !== JSON.stringify(originalVoiceConfig)) {
+        // Strip the empty-string voice override so we don't write
+        // `voice: ""` into the JSONB — the resolver would treat that the
+        // same as null, but cleaner not to persist it.
+        const next = { tier: voiceConfig.tier };
+        if (voiceConfig.voice && voiceConfig.voice.trim()) next.voice = voiceConfig.voice.trim();
+        settingsPatch.voice_config = next;
       }
       if (Object.keys(settingsPatch).length > 0) {
         payload.settings = settingsPatch;
@@ -3105,6 +3134,63 @@ function EditTenantModal({ business, onClose, onSaved }) {
                       `Switching from "${originalTemplateKey || 'unset'}" to "${form.template_key}" changes which sidebar + pages this tenant sees. Existing settings (greetings, hours, prompt, etc.) are NOT reset — only the UI shape changes. The tenant must sign out and sign back in for the new shape to take effect.`
                     )
                   )
+            ),
+
+            // ---------- Voice tier ----------
+            // Per-tenant voice_config override. Writes settings.voice_config
+            // via the existing PATCH /api/super/businesses/:id settings
+            // pathway. Premium tier resolves to the grok-think-fast-1.0
+            // model + Rock voice in voice-tiers.js — that's the "best
+            // voice" tenants typically ask for. Default voice for each
+            // tier is fine for 99% of tenants; the optional override is
+            // there for the rare case where a tenant wants a specific
+            // named voice (e.g. a forthcoming xAI release that ships
+            // before we update the catalog).
+            React.createElement('section', null,
+              React.createElement('h3', { className: 'text-xs font-bold uppercase tracking-wide text-gray-500 mb-2' }, 'Voice'),
+              React.createElement('div', { className: 'grid grid-cols-2 gap-3' },
+                React.createElement('div', null,
+                  React.createElement('label', { className: 'text-xs text-gray-600 block mb-1' }, 'Voice tier'),
+                  React.createElement('select', {
+                    value: voiceConfig.tier || 'standard',
+                    onChange: e => setVoiceConfig(vc => ({ ...vc, tier: e.target.value })),
+                    className: 'w-full text-sm border rounded-lg px-3 py-2 bg-white'
+                  },
+                    (voiceTiers.length > 0
+                      ? voiceTiers
+                      : [
+                          { key: 'economy',  label: 'Economy',  tagline: 'Lowest cost' },
+                          { key: 'standard', label: 'Standard', tagline: 'Balanced' },
+                          { key: 'premium',  label: 'Premium',  tagline: 'Grok Think Fast 1.0 + Rock voice' }
+                        ]
+                    ).map(t =>
+                      React.createElement('option', { key: t.key, value: t.key },
+                        `${t.label}${t.tagline ? ' — ' + t.tagline : ''}`
+                      )
+                    )
+                  )
+                ),
+                React.createElement('div', null,
+                  React.createElement('label', { className: 'text-xs text-gray-600 block mb-1' }, 'Voice override (optional)'),
+                  React.createElement('input', {
+                    type: 'text',
+                    value: voiceConfig.voice || '',
+                    onChange: e => setVoiceConfig(vc => ({ ...vc, voice: e.target.value })),
+                    placeholder: 'e.g. rock',
+                    className: 'w-full text-sm border rounded-lg px-3 py-2 bg-white'
+                  })
+                )
+              ),
+              React.createElement('p', { className: 'text-[11px] text-gray-500 mt-2' },
+                voiceConfig.tier === 'premium'
+                  ? 'Premium uses the Grok Think Fast 1.0 model with the Rock voice — xAI’s newest, most expressive voice.'
+                  : 'Voice override pins a specific named voice (e.g. "rock"). Leave blank to use the tier’s default voice.'
+              ),
+              voiceConfig.tier !== originalVoiceConfig.tier && React.createElement('p', {
+                className: 'mt-2 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2'
+              },
+                `Voice tier change from "${originalVoiceConfig.tier}" to "${voiceConfig.tier}" takes effect on the next inbound call — no restart needed.`
+              )
             ),
 
             // ---------- Telephony ----------

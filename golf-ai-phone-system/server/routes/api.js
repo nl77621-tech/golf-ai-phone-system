@@ -54,6 +54,7 @@ const {
   sendMessageToTeamMember
 } = require('../services/team-directory');
 const eventBus = require('../services/event-bus');
+const userMgmt = require('../services/business-user-management');
 
 // Apply auth + tenant hydration to every route in this router.
 router.use(requireAuth);
@@ -1231,6 +1232,199 @@ router.post('/team/:id/test-sms', requireBusinessAdmin, async (req, res) => {
   } catch (err) {
     console.error(`[tenant:${businessId}] Team test-sms error:`, err.message);
     res.status(500).json({ error: err.message || 'Failed to send test SMS' });
+  }
+});
+
+// ============================================
+// TENANT USER MANAGEMENT — business_admin self-service
+// ============================================
+//
+// Same surface as the super-admin user-management endpoints, but scoped
+// to req.business.id (the caller's own tenant). Gated by
+// requireBusinessAdmin so a `staff` role can't add/remove users.
+//
+// All logic lives in services/business-user-management.js — both this
+// router and the super-admin router call into the same helpers, so a
+// fix or audit-log shape change shows up in both places automatically.
+
+function mapUserMgmtError(err, res) {
+  if (err && err.code === 'INVALID')   return res.status(400).json({ error: err.message });
+  if (err && err.code === 'CONFLICT')  return res.status(409).json({ error: err.message });
+  if (err && err.code === 'NOT_FOUND') return res.status(404).json({ error: err.message });
+  console.error('[tenant] user mgmt error:', err?.message);
+  return res.status(500).json({ error: err?.message || 'User management failed' });
+}
+
+// GET /api/users — list users on THIS tenant.
+router.get('/users', async (req, res) => {
+  const businessId = tenantId(req);
+  try {
+    const users = await userMgmt.listUsers(businessId);
+    res.json({ business_id: businessId, users });
+  } catch (err) {
+    mapUserMgmtError(err, res);
+  }
+});
+
+// POST /api/users — create a user on THIS tenant. Returns plaintext
+// password + signin_url ONCE in the response.
+router.post('/users', requireBusinessAdmin, async (req, res) => {
+  const businessId = tenantId(req);
+  try {
+    const { user, plaintext, generated } = await userMgmt.createUser(businessId, req.body || {});
+    await logEventFromReq(req, {
+      businessId,
+      action: 'user.created_by_admin',
+      targetType: 'business_user',
+      targetId: user.id,
+      meta: {
+        target_email: user.email,
+        target_role: user.role,
+        method: generated ? 'auto_generated' : 'operator_supplied',
+        actor_user_id: req.auth?.user_id || null
+      }
+    }).catch(() => {});
+    const signinUrl = userMgmt.buildSigninUrl(req, user.email);
+    res.status(201).json({
+      ok: true,
+      user,
+      password: plaintext,
+      generated,
+      signin_url: signinUrl,
+      note: 'This password is shown once. Save or share it now — we cannot retrieve it later.'
+    });
+  } catch (err) {
+    mapUserMgmtError(err, res);
+  }
+});
+
+// PATCH /api/users/:userId — toggle is_active.
+router.patch('/users/:userId', requireBusinessAdmin, async (req, res) => {
+  const businessId = tenantId(req);
+  const userId = parseInt(req.params.userId, 10);
+  if (!Number.isInteger(userId) || userId <= 0) {
+    return res.status(400).json({ error: 'invalid user id' });
+  }
+  if (typeof req.body?.is_active !== 'boolean') {
+    return res.status(400).json({ error: 'Body must include { is_active: boolean }' });
+  }
+  try {
+    const user = await userMgmt.setActive(businessId, userId, req.body.is_active);
+    await logEventFromReq(req, {
+      businessId,
+      action: 'user.activation_changed',
+      targetType: 'business_user',
+      targetId: userId,
+      meta: { target_email: user.email, is_active: user.is_active }
+    }).catch(() => {});
+    res.json({ user });
+  } catch (err) {
+    mapUserMgmtError(err, res);
+  }
+});
+
+// DELETE /api/users/:userId — hard-delete with last-admin guard. The
+// guard is critical here because a confused business_admin could
+// otherwise lock themselves (and their team) out by deleting their own
+// row. The service refuses if they're the last active admin.
+router.delete('/users/:userId', requireBusinessAdmin, async (req, res) => {
+  const businessId = tenantId(req);
+  const userId = parseInt(req.params.userId, 10);
+  if (!Number.isInteger(userId) || userId <= 0) {
+    return res.status(400).json({ error: 'invalid user id' });
+  }
+  // Belt-and-braces: don't let an admin delete THEIR OWN row even if
+  // there's another admin around. Forces them to ask another admin to
+  // do it, which is the safer "lock-out-prevention via human in the
+  // loop" pattern.
+  if (Number(req.auth?.user_id) === userId) {
+    return res.status(409).json({
+      error: 'You cannot remove your own account. Ask another admin on this tenant, or use Disable instead.'
+    });
+  }
+  try {
+    const user = await userMgmt.deleteUser(businessId, userId);
+    await logEventFromReq(req, {
+      businessId,
+      action: 'user.deleted_by_admin',
+      targetType: 'business_user',
+      targetId: userId,
+      meta: {
+        target_email: user.email,
+        target_role: user.role,
+        was_active: user.is_active,
+        actor_user_id: req.auth?.user_id || null
+      }
+    }).catch(() => {});
+    res.json({ ok: true, deleted: true, id: userId });
+  } catch (err) {
+    mapUserMgmtError(err, res);
+  }
+});
+
+// POST /api/users/:userId/reset-password — same one-time-reveal contract
+// as the super-admin endpoint.
+router.post('/users/:userId/reset-password', requireBusinessAdmin, async (req, res) => {
+  const businessId = tenantId(req);
+  const userId = parseInt(req.params.userId, 10);
+  if (!Number.isInteger(userId) || userId <= 0) {
+    return res.status(400).json({ error: 'invalid user id' });
+  }
+  try {
+    const { user, plaintext, generated } = await userMgmt.resetPassword(businessId, userId, req.body || {});
+    await logEventFromReq(req, {
+      businessId,
+      action: 'user.password_reset_by_admin',
+      targetType: 'business_user',
+      targetId: userId,
+      meta: {
+        target_email: user.email,
+        target_role: user.role,
+        method: generated ? 'auto_generated' : 'operator_supplied',
+        actor_user_id: req.auth?.user_id || null
+      }
+    }).catch(() => {});
+    res.json({
+      ok: true,
+      user: { id: user.id, email: user.email, name: user.name, role: user.role, is_active: user.is_active },
+      password: plaintext,
+      generated,
+      note: 'This password is shown once. Save or share it now — we cannot retrieve it later.'
+    });
+  } catch (err) {
+    mapUserMgmtError(err, res);
+  }
+});
+
+// POST /api/users/:userId/send-credentials-sms — texts the new
+// credentials FROM the tenant's primary Twilio number.
+router.post('/users/:userId/send-credentials-sms', requireBusinessAdmin, async (req, res) => {
+  const businessId = tenantId(req);
+  const userId = parseInt(req.params.userId, 10);
+  if (!Number.isInteger(userId) || userId <= 0) {
+    return res.status(400).json({ error: 'invalid user id' });
+  }
+  try {
+    const { user, to, message_sid, from } = await userMgmt.dispatchCredentialsSms(businessId, userId, {
+      to: req.body?.to,
+      password: req.body?.password,
+      signinUrl: req.body?.signin_url
+    });
+    await logEventFromReq(req, {
+      businessId,
+      action: 'user.credentials_sms_sent',
+      targetType: 'business_user',
+      targetId: userId,
+      meta: {
+        target_email: user.email,
+        target_phone: to,
+        message_sid,
+        actor_user_id: req.auth?.user_id || null
+      }
+    }).catch(() => {});
+    res.json({ ok: true, message_sid, to, from });
+  } catch (err) {
+    mapUserMgmtError(err, res);
   }
 });
 

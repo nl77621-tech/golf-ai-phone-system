@@ -1692,6 +1692,7 @@ function SettingsPage() {
     { id: 'general', label: 'General' },
     { id: 'phones', label: '📞 Phones' },
     { id: 'team', label: '👥 Team' },
+    { id: 'users', label: '\uD83D\uDD11 Users' },
     { id: 'knowledge', label: 'Knowledge' },
     { id: 'hours', label: 'Hours' },
     { id: 'pricing', label: 'Pricing' },
@@ -1781,6 +1782,11 @@ function SettingsPage() {
 
       // TEAM TAB \u2014 directory of named people the AI can leave a message for.
       activeTab === 'team' && React.createElement(TeamDirectoryManager, null),
+
+      // USERS — login accounts for this tenant. Same component
+      // as the super-admin Edit Tenant modal; with no businessId
+      // prop it defaults to the self-service /api/users endpoints.
+      activeTab === 'users' && React.createElement(TenantUsersPanel, null),
 
       // PROMPT TAB
       activeTab === 'prompt' && React.createElement('div', null,
@@ -2957,7 +2963,15 @@ function BusinessCard({ business, onActAs, onManagePhones, onManageVoice, onEdit
 // it and shares the new one out-of-band. That's the same flow every
 // reputable platform uses (banks, GitHub, Twilio, etc.) and is a hard
 // requirement of password hashing.
-function TenantUsersPanel({ businessId }) {
+function TenantUsersPanel({ businessId, endpointBase: endpointBaseProp }) {
+  // Two callers, one component:
+  //   - Super Admin → Edit Tenant modal: passes businessId, hits
+  //     /api/super/businesses/:id/users/* (cross-tenant management).
+  //   - In-tenant Settings → Users tab: passes neither, defaults to
+  //     /api/users/* (self-service for the signed-in tenant).
+  // Whichever is set wins; the rest of the component is identical.
+  const endpointBase = endpointBaseProp
+    || (businessId ? `/api/super/businesses/${businessId}/users` : '/api/users');
   const [users, setUsers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -2982,7 +2996,7 @@ function TenantUsersPanel({ businessId }) {
 
   const reload = () => {
     setLoading(true);
-    api(`/api/super/businesses/${businessId}/users`)
+    api(`${endpointBase}`)
       .then(d => setUsers(d?.users || []))
       .catch(err => setError(err.message || 'Failed to load users'))
       .finally(() => setLoading(false));
@@ -3005,7 +3019,7 @@ function TenantUsersPanel({ businessId }) {
         ? { generate: true }
         : { password: manualPwd };
       const result = await api(
-        `/api/super/businesses/${businessId}/users/${resetTarget.id}/reset-password`,
+        `${endpointBase}/${resetTarget.id}/reset-password`,
         { method: 'POST', body: JSON.stringify(body) }
       );
       setRevealed({
@@ -3047,7 +3061,7 @@ function TenantUsersPanel({ businessId }) {
     setSmsStatus(null);
     try {
       const result = await api(
-        `/api/super/businesses/${businessId}/users/${revealed.userId}/send-credentials-sms`,
+        `${endpointBase}/${revealed.userId}/send-credentials-sms`,
         {
           method: 'POST',
           body: JSON.stringify({
@@ -3089,7 +3103,7 @@ function TenantUsersPanel({ businessId }) {
 
   const toggleActive = async (user) => {
     try {
-      await api(`/api/super/businesses/${businessId}/users/${user.id}`, {
+      await api(`${endpointBase}/${user.id}`, {
         method: 'PATCH',
         body: JSON.stringify({ is_active: !user.is_active })
       });
@@ -3106,7 +3120,7 @@ function TenantUsersPanel({ businessId }) {
     );
     if (!confirmed) return;
     try {
-      await api(`/api/super/businesses/${businessId}/users/${user.id}`, {
+      await api(`${endpointBase}/${user.id}`, {
         method: 'DELETE'
       });
       reload();
@@ -3129,7 +3143,7 @@ function TenantUsersPanel({ businessId }) {
       } else {
         body.generate = true;
       }
-      const result = await api(`/api/super/businesses/${businessId}/users`, {
+      const result = await api(`${endpointBase}`, {
         method: 'POST',
         body: JSON.stringify(body)
       });
@@ -5816,6 +5830,7 @@ function PersonalSettingsPage() {
   const tabs = [
     { id: 'phones',        label: '\uD83D\uDCDE Phones' },
     { id: 'team',          label: '\uD83D\uDC65 Team' },
+    { id: 'users',         label: '\uD83D\uDD11 Users' },
     { id: 'greetings',     label: 'Greetings' },
     { id: 'prompt',        label: 'Prompt' },
     { id: 'notifications', label: 'Notifications' },
@@ -5855,6 +5870,11 @@ function PersonalSettingsPage() {
 
       // TEAM
       activeTab === 'team' && React.createElement(TeamDirectoryManager, null),
+
+      // USERS — login accounts for this tenant. Same component
+      // as the super-admin Edit Tenant modal; with no businessId
+      // prop it defaults to the self-service /api/users endpoints.
+      activeTab === 'users' && React.createElement(TenantUsersPanel, null),
 
       // GREETINGS
       activeTab === 'greetings' && React.createElement('div', null,
@@ -6081,6 +6101,7 @@ function RestaurantSettingsPage() {
     { id: 'reservations',  label: '\uD83D\uDCC5 Reservations' },
     { id: 'phones',        label: '\uD83D\uDCDE Phones' },
     { id: 'team',          label: '\uD83D\uDC65 Team' },
+    { id: 'users',         label: '\uD83D\uDD11 Users' },
     { id: 'greetings',     label: 'Greetings' },
     { id: 'prompt',        label: 'Prompt' },
     { id: 'notifications', label: 'Notifications' },
@@ -6244,6 +6265,11 @@ function RestaurantSettingsPage() {
 
       // TEAM
       activeTab === 'team' && React.createElement(TeamDirectoryManager, null),
+
+      // USERS — login accounts for this tenant. Same component
+      // as the super-admin Edit Tenant modal; with no businessId
+      // prop it defaults to the self-service /api/users endpoints.
+      activeTab === 'users' && React.createElement(TenantUsersPanel, null),
 
       // GREETINGS — same KV store as golf / personal so behaviour is identical.
       activeTab === 'greetings' && React.createElement('div', null,

@@ -285,17 +285,22 @@ function DashboardPage() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    Promise.all([
+    const refetch = () => Promise.all([
       api('/api/dashboard'),
       api('/api/analytics').catch(() => null)
     ]).then(([d, a]) => { setData(d); setAnalytics(a); })
-      .catch(console.error)
-      .finally(() => setLoading(false));
-    const interval = setInterval(() => {
-      api('/api/dashboard').then(setData).catch(console.error);
-      api('/api/analytics').then(setAnalytics).catch(() => {});
-    }, 30000);
-    return () => clearInterval(interval);
+      .catch(console.error);
+    refetch().finally(() => setLoading(false));
+    const interval = setInterval(refetch, 30000);
+    // Live refresh — App's EventSource broadcasts a window event whenever
+    // the server pushes a booking/modification update. Polling stays in
+    // place as a belt-and-braces fallback if the SSE stream drops.
+    const onLive = () => refetch();
+    window.addEventListener('cmdcenter:refresh', onLive);
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('cmdcenter:refresh', onLive);
+    };
   }, []);
 
   if (loading) return React.createElement('div', { className: 'p-8 text-gray-500' }, 'Loading dashboard...');
@@ -545,7 +550,14 @@ function BookingsPage() {
     finally { setLoading(false); }
   }, [filter]);
 
-  useEffect(() => { loadData(); }, [loadData]);
+  useEffect(() => {
+    loadData();
+    // Live refresh — refetch when the server pushes a booking or
+    // modification event over SSE.
+    const onLive = () => loadData();
+    window.addEventListener('cmdcenter:refresh', onLive);
+    return () => window.removeEventListener('cmdcenter:refresh', onLive);
+  }, [loadData]);
 
   const updateStatus = async (id, status) => {
     const notes = status === 'rejected' ? prompt('Reason for rejection:') : '';
@@ -2003,7 +2015,14 @@ function TeeSheetPage() {
       .finally(() => setLoading(false));
   };
 
-  useEffect(() => { loadBookings(); }, [selectedDate]);
+  useEffect(() => {
+    loadBookings();
+    // Live refresh — refetch the tee sheet whenever the server pushes a
+    // booking event so a brand-new booking shows up without a reload.
+    const onLive = () => loadBookings();
+    window.addEventListener('cmdcenter:refresh', onLive);
+    return () => window.removeEventListener('cmdcenter:refresh', onLive);
+  }, [selectedDate]);
 
   // Generate time slots from startHour:startMin to endHour:endMin by selected interval
   const slots = [];
@@ -5710,6 +5729,51 @@ function App() {
   useEffect(() => {
     refreshBusinessList();
   }, [refreshBusinessList]);
+
+  // ─── Live updates via Server-Sent Events ──────────────────────────────
+  // One persistent connection to /api/events per signed-in tab. The
+  // server pushes booking/modification events as they happen; we
+  // re-broadcast them as a window event so individual pages can refetch
+  // their data without a page reload. Tab visibility is irrelevant —
+  // EventSource keeps the stream alive in the background and
+  // auto-reconnects on drop. Auth is via ?token= because EventSource
+  // can't set custom headers in browsers (requireAuth accepts both).
+  // Super-admins viewing their own dashboard (no selected tenant) skip
+  // the connection — there's no per-tenant stream to attach to.
+  useEffect(() => {
+    if (!authenticated || !session) return undefined;
+    if (session.role === 'super_admin' && !selectedBusinessId) return undefined;
+    const token = getToken();
+    if (!token) return undefined;
+
+    // EventSource doesn't support custom headers, so we attach the JWT
+    // to the URL. Header takes precedence in requireAuth, so a future
+    // header-aware EventSource polyfill would also work.
+    const headers = {};
+    if (selectedBusinessId) headers['X-Business-Id'] = String(selectedBusinessId);
+    const url = `/api/events?token=${encodeURIComponent(token)}` +
+      (selectedBusinessId ? `&business_id=${encodeURIComponent(selectedBusinessId)}` : '');
+    const es = new EventSource(url);
+
+    const dispatch = (eventName, raw) => {
+      let data = null;
+      try { data = JSON.parse(raw); } catch (_) { data = null; }
+      window.dispatchEvent(new CustomEvent('cmdcenter:refresh', {
+        detail: { type: eventName, data }
+      }));
+    };
+    es.addEventListener('booking.created',      e => dispatch('booking.created', e.data));
+    es.addEventListener('booking.updated',      e => dispatch('booking.updated', e.data));
+    es.addEventListener('modification.created', e => dispatch('modification.created', e.data));
+    es.addEventListener('modification.updated', e => dispatch('modification.updated', e.data));
+    es.addEventListener('ready',                e => dispatch('ready', e.data));
+
+    es.onerror = (err) => {
+      // EventSource auto-reconnects; just log so we don't lose visibility.
+      console.warn('[live] SSE connection error — browser will retry.', err);
+    };
+    return () => es.close();
+  }, [authenticated, session, selectedBusinessId]);
 
   const handleLogin = (data) => {
     setSessionState({

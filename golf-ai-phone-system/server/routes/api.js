@@ -53,6 +53,7 @@ const {
   deleteTeamMember,
   sendMessageToTeamMember
 } = require('../services/team-directory');
+const eventBus = require('../services/event-bus');
 
 // Apply auth + tenant hydration to every route in this router.
 router.use(requireAuth);
@@ -1144,6 +1145,65 @@ router.delete('/team/:id', requireBusinessAdmin, async (req, res) => {
     console.error(`[tenant:${businessId}] Team delete error:`, err.message);
     res.status(500).json({ error: 'Failed to delete team member' });
   }
+});
+
+// ============================================
+// LIVE EVENTS — Server-Sent Events stream
+// ============================================
+//
+// One persistent HTTP connection per tab. Server pushes booking-related
+// events as they happen so the dashboard / tee sheet / bookings list
+// can refetch without polling.
+//
+// Auth: piggybacks on requireAuth above (Bearer header OR ?token= query
+// — EventSource can't set custom headers in browsers). Tenant scope is
+// enforced via attachTenantFromAuth, so each connection only receives
+// its own tenant's events.
+//
+// Event format (standard SSE):
+//   event: booking.created
+//   data: {"id":42,"customer_name":"Bob",...}
+//
+// The browser EventSource auto-reconnects on drop. Server-side: if the
+// client disconnects, we run the unsubscribe returned by event-bus so
+// we don't leak handlers. Heartbeat comments every 25s keep proxies
+// (Railway, Cloudflare, etc.) from idling out the connection.
+router.get('/events', (req, res) => {
+  const businessId = tenantId(req);
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // disable proxy buffering
+  res.flushHeaders?.();
+
+  // Friendly hello so the client knows the stream is live.
+  res.write(`event: ready\ndata: {"businessId":${businessId},"ts":${Date.now()}}\n\n`);
+
+  const send = (event) => {
+    try {
+      res.write(`event: ${event.type}\ndata: ${JSON.stringify(event.payload)}\n\n`);
+    } catch (err) {
+      // Connection probably gone; teardown will follow.
+      console.warn(`[tenant:${businessId}] SSE write failed:`, err.message);
+    }
+  };
+
+  const unsubscribe = eventBus.subscribe(businessId, send);
+
+  // Heartbeat — SSE comment lines (": ...") are ignored by the client
+  // but keep the TCP connection warm against idle timeouts.
+  const heartbeat = setInterval(() => {
+    try { res.write(`: ping ${Date.now()}\n\n`); } catch (_) { /* will tear down */ }
+  }, 25000);
+
+  const cleanup = () => {
+    clearInterval(heartbeat);
+    try { unsubscribe(); } catch (_) { /* noop */ }
+    try { res.end(); } catch (_) { /* noop */ }
+  };
+  req.on('close', cleanup);
+  req.on('error', cleanup);
 });
 
 // POST /api/team/:id/test-sms — fire a test SMS to verify the phone number.

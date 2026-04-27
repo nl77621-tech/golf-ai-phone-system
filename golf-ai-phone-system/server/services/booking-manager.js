@@ -10,6 +10,7 @@ const {
   requireBusinessId,
   requireBusinessIdOrSuperAdmin
 } = require('../context/tenant-context');
+const eventBus = require('./event-bus');
 const {
   sendBookingNotification,
   sendModificationNotification,
@@ -94,6 +95,19 @@ async function createBookingRequest({
       console.error(`[tenant:${businessId}] Failed to send booking notification:`, err.message);
     }
 
+    // Live broadcast — every browser tab open on this tenant's Command
+    // Center gets a 'booking.created' SSE event so the dashboard / tee
+    // sheet / bookings list can refetch without a page reload. Best-
+    // effort; a publish failure must not roll back the booking.
+    eventBus.publish(businessId, 'booking.created', {
+      id: booking.id,
+      customer_name: booking.customer_name,
+      requested_date: booking.requested_date,
+      requested_time: booking.requested_time,
+      party_size: booking.party_size,
+      status: booking.status
+    });
+
     return booking;
   } catch (err) {
     console.error(`[tenant:${businessId}] Failed to create booking:`, err.message, {
@@ -132,6 +146,17 @@ async function createModificationRequest({
   } catch (err) {
     console.error(`[tenant:${businessId}] Failed to send modification notification:`, err.message);
   }
+  // Live broadcast — same as bookings, so the Pending Changes tile
+  // updates as soon as a caller asks to modify or cancel.
+  eventBus.publish(businessId, 'modification.created', {
+    id: modification.id,
+    request_type: modification.request_type,
+    customer_name: modification.customer_name,
+    original_date: modification.original_date,
+    original_time: modification.original_time,
+    new_date: modification.new_date,
+    new_time: modification.new_time
+  });
   return modification;
 }
 
@@ -193,6 +218,16 @@ async function updateBookingStatus(businessId, id, status, staffNotes) {
     } catch (err) {
       console.error(`[tenant:${businessId}] Status-change SMS failed:`, err.message);
     }
+    // Broadcast the transition so other open browser tabs can re-render
+    // their list / dashboard counters without polling.
+    eventBus.publish(businessId, 'booking.updated', {
+      id: booking.id,
+      from_status: prevStatus,
+      to_status: status,
+      requested_date: booking.requested_date,
+      requested_time: booking.requested_time,
+      customer_name: booking.customer_name
+    });
   }
 
   return booking;
@@ -238,6 +273,15 @@ async function updateModificationStatus(businessId, id, status, staffNotes) {
       console.error(`[tenant:${businessId}] Auto-cancel failed:`, err.message);
     }
   }
+
+  // Live broadcast — Pending Changes tile + modifications list refetch
+  // when staff marks a request processed/rejected.
+  eventBus.publish(businessId, 'modification.updated', {
+    id: mod.id,
+    status: mod.status,
+    request_type: mod.request_type,
+    customer_name: mod.customer_name
+  });
 
   return mod;
 }

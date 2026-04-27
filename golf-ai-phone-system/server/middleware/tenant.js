@@ -53,8 +53,16 @@ function attachTenantFromAuth(req, res, next) {
   // `X-Business-Id` header. This powers the Business Switcher in the
   // Command Center UI. Without the header, `req.business` stays null
   // and only /api/admin + /api/super endpoints are useful to them.
+  //
+  // Browser EventSource (SSE) can't set custom headers, so for that one
+  // call site we also accept the same value as `?business_id=` in the
+  // query string. Header still wins if both are present.
   if (auth.role === SUPER_ADMIN_ROLE) {
-    const headerId = parseInt(req.headers['x-business-id'], 10);
+    let headerId = parseInt(req.headers['x-business-id'], 10);
+    if (!Number.isInteger(headerId) || headerId <= 0) {
+      const queryId = parseInt(req.query?.business_id, 10);
+      if (Number.isInteger(queryId) && queryId > 0) headerId = queryId;
+    }
     if (Number.isInteger(headerId) && headerId > 0) {
       return getBusinessById(headerId)
         .then(business => {

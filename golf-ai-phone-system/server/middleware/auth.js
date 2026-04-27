@@ -51,12 +51,22 @@ function normalizeRole(raw) {
  * Rejects the request with 401 if the token is missing, invalid, or expired.
  */
 function requireAuth(req, res, next) {
+  // Token resolution order:
+  //   1. Authorization: Bearer <jwt>     (the normal path used by every fetch)
+  //   2. ?token=<jwt> in the query string (for browser EventSource / SSE,
+  //      which can't set custom headers in vanilla EventSource).
+  // Query-string tokens are intentionally last-resort — they show up in
+  // access logs — and we only honor them when the header is absent.
   const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+  let token = null;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    token = authHeader.split(' ')[1];
+  } else if (typeof req.query?.token === 'string' && req.query.token.length > 0) {
+    token = req.query.token;
+  }
+  if (!token) {
     return res.status(401).json({ error: 'Authentication required' });
   }
-
-  const token = authHeader.split(' ')[1];
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     const role = normalizeRole(decoded.role);

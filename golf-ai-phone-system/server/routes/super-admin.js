@@ -2005,6 +2005,81 @@ router.post('/businesses/:id/users/:userId/reset-password', async (req, res) => 
   }
 });
 
+// DELETE — hard-remove a user from a tenant. Permanent: their
+// business_users row is gone. Their email becomes available for re-add
+// on the same tenant immediately. Audit metadata captures the deletion
+// so the trail isn't lost.
+//
+// Safety rail: refuse to delete the LAST active business_admin on a
+// tenant — that would lock the tenant out of their own dashboard. The
+// super-admin can still recover by adding a new admin first, then
+// deleting the old one. Inactive admins (active=false) don't count
+// toward the floor since they can't sign in anyway.
+router.delete('/businesses/:id/users/:userId', async (req, res) => {
+  const businessId = parseInt(req.params.id, 10);
+  const userId = parseInt(req.params.userId, 10);
+  if (!Number.isInteger(businessId) || businessId <= 0 ||
+      !Number.isInteger(userId) || userId <= 0) {
+    return res.status(400).json({ error: 'invalid id(s)' });
+  }
+  try {
+    const { rows: [user] } = await query(
+      `SELECT id, email, name, role, active
+         FROM business_users
+        WHERE id = $1 AND business_id = $2
+        LIMIT 1`,
+      [userId, businessId]
+    );
+    if (!user) return res.status(404).json({ error: 'User not found in this tenant' });
+
+    // Last-admin guard — only fires if the target IS an active admin.
+    // Counting active admins ONLY ensures we don't false-positive on a
+    // tenant that already has all-disabled admins (they're already
+    // locked out, deleting one more doesn't change that).
+    if (user.role === 'business_admin' && user.active) {
+      const { rows: [count] } = await query(
+        `SELECT COUNT(*)::int AS n
+           FROM business_users
+          WHERE business_id = $1 AND role = 'business_admin' AND active = TRUE`,
+        [businessId]
+      );
+      if ((count?.n || 0) <= 1) {
+        return res.status(409).json({
+          error: 'Cannot delete the last active business admin — this would lock the tenant out. Add another admin first, then remove this one.',
+          field: 'role'
+        });
+      }
+    }
+
+    await query(
+      `DELETE FROM business_users WHERE id = $1 AND business_id = $2`,
+      [userId, businessId]
+    );
+
+    await logEventFromReq(req, {
+      businessId,
+      action: 'user.deleted_by_super',
+      targetType: 'business_user',
+      targetId: userId,
+      meta: {
+        target_email: user.email,
+        target_role: user.role,
+        was_active: user.active,
+        actor_super_admin_id: req.auth?.user_id || null
+      }
+    }).catch(() => {});
+
+    console.log(
+      `[super] Deleted business_user ${userId} (${user.email}, ${user.role}) ` +
+      `from tenant ${businessId} by super_admin ${req.auth?.user_id || '?'}`
+    );
+    res.json({ ok: true, deleted: true, id: userId });
+  } catch (err) {
+    console.error(`[super] delete user ${userId} error:`, err.message);
+    res.status(500).json({ error: err.message || 'Failed to delete user' });
+  }
+});
+
 // PATCH — toggle a user's is_active flag. Useful for "lock the account
 // until they confirm" workflows or for revoking access without losing
 // audit history. Only is_active is editable here; for email/name changes

@@ -3099,6 +3099,22 @@ function TenantUsersPanel({ businessId }) {
     }
   };
 
+  const removeUser = async (user) => {
+    const confirmed = window.confirm(
+      `Permanently remove ${user.email} from this tenant?\n\n` +
+      `This deletes their account row entirely. They will lose access immediately and their email will be free for re-add. This cannot be undone — only the audit log will retain the record.`
+    );
+    if (!confirmed) return;
+    try {
+      await api(`/api/super/businesses/${businessId}/users/${user.id}`, {
+        method: 'DELETE'
+      });
+      reload();
+    } catch (err) {
+      alert(err.message || 'Failed to remove user');
+    }
+  };
+
   const submitAdd = async () => {
     setAdding(true);
     setError('');
@@ -3177,7 +3193,11 @@ function TenantUsersPanel({ businessId }) {
                     React.createElement('button', {
                       onClick: () => toggleActive(u),
                       className: 'text-xs px-2 py-1 rounded bg-gray-100 text-gray-700 hover:bg-gray-200'
-                    }, u.is_active ? 'Disable' : 'Enable')
+                    }, u.is_active ? 'Disable' : 'Enable'),
+                    React.createElement('button', {
+                      onClick: () => removeUser(u),
+                      className: 'text-xs px-2 py-1 rounded bg-red-50 text-red-700 hover:bg-red-100'
+                    }, 'Remove')
                   )
                 )
               )

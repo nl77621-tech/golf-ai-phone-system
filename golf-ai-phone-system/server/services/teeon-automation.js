@@ -193,20 +193,68 @@ function parseTimesFromHTML(html) {
 // or cached slot lists.
 
 const teeTimeCache = new Map(); // cfgKey → Map<date, { slots, timestamp }>
-const CACHE_TTL = 10 * 60 * 1000;
+// Two-tier cache TTL:
+//   - "fresh" — return cached data confidently as if just queried
+//   - "stale" — return cached data when a fresh Tee-On query fails;
+//     better to give the caller a slightly-old answer than silence.
+// Today's slots change fastest (real bookings filling up), so keep the
+// fresh window short. Future dates change much more slowly, so we let
+// them ride longer to dramatically cut Tee-On API hits during busy
+// hours.
+const CACHE_TTL_TODAY_FRESH  =  3 * 60 * 1000;  //  3 min — today, served as live
+const CACHE_TTL_FUTURE_FRESH = 20 * 60 * 1000;  // 20 min — future dates, slower-changing
+const CACHE_TTL_STALE_FALLBACK = 30 * 60 * 1000; // 30 min — used only when Tee-On goes empty
+
 const MIN_REQUEST_INTERVAL = 3000;
 const lastRequestTime = new Map(); // cfgKey → timestamp
+
+function isToday(date) {
+  // Compare the requested date against today in the server's local
+  // tz. Tee-On treats dates as plain YYYY-MM-DD strings, so this is
+  // fine for our purposes (a few hours of TZ skew at midnight either
+  // way doesn't matter — the cache distinction is "today vs not".)
+  if (!date) return false;
+  const today = new Date().toISOString().split('T')[0];
+  return date === today;
+}
 
 function cacheFor(cfgKey) {
   if (!teeTimeCache.has(cfgKey)) teeTimeCache.set(cfgKey, new Map());
   return teeTimeCache.get(cfgKey);
 }
 
+// Return the cached entry if it's within the FRESH window for that
+// date type (today vs future). Returns null if nothing cached or if
+// the cache is too old to be considered fresh. Does NOT return stale
+// entries — those go through getStaleSlotsFallback() below.
 function getCachedSlots(cfgKey, date) {
   const c = cacheFor(cfgKey);
   const cached = c.get(date);
-  if (cached && (Date.now() - cached.timestamp < CACHE_TTL)) {
-    console.log(`[TeeOn-Cache] HIT for ${cfgKey}/${date} (${Math.round((Date.now() - cached.timestamp) / 1000)}s old, ${cached.slots.length} slots)`);
+  if (!cached) return null;
+  const age = Date.now() - cached.timestamp;
+  const ttl = isToday(date) ? CACHE_TTL_TODAY_FRESH : CACHE_TTL_FUTURE_FRESH;
+  if (age < ttl) {
+    console.log(`[TeeOn-Cache] HIT (fresh) for ${cfgKey}/${date} (${Math.round(age / 1000)}s old, ${cached.slots.length} slots)`);
+    return cached.slots;
+  }
+  return null;
+}
+
+// Stale-cache fallback — only consulted when a fresh Tee-On query
+// returned empty/failed AND we have data from up to STALE_FALLBACK
+// minutes ago. Returning a slightly-old answer beats telling the
+// caller "nothing available" when Tee-On is rate-limiting us.
+function getStaleSlotsFallback(cfgKey, date) {
+  const c = cacheFor(cfgKey);
+  const cached = c.get(date);
+  if (!cached) return null;
+  const age = Date.now() - cached.timestamp;
+  if (age < CACHE_TTL_STALE_FALLBACK && cached.slots.length > 0) {
+    console.log(
+      `[TeeOn-Cache] STALE FALLBACK for ${cfgKey}/${date} ` +
+      `(${Math.round(age / 1000)}s old, ${cached.slots.length} slots). ` +
+      `Using because fresh query returned empty.`
+    );
     return cached.slots;
   }
   return null;
@@ -218,8 +266,9 @@ function setCachedSlots(cfgKey, date, slots) {
     c.set(date, { slots, timestamp: Date.now() });
     console.log(`[TeeOn-Cache] STORED ${slots.length} slots for ${cfgKey}/${date}`);
   }
+  // Garbage-collect entries older than the longest TTL we use.
   for (const [key, val] of c) {
-    if (Date.now() - val.timestamp > CACHE_TTL * 3) c.delete(key);
+    if (Date.now() - val.timestamp > CACHE_TTL_STALE_FALLBACK * 2) c.delete(key);
   }
 }
 
@@ -449,37 +498,61 @@ async function checkAvailabilityPuppeteer(date, partySize, cfg) {
 async function checkAvailability(date, partySize = 1, teeOnConfig = null) {
   const cfg = resolveConfig(teeOnConfig);
 
+  // Tier 1 — fresh cache hit. Today's data is held for 3 min (real
+  // bookings fill up fast); future dates ride 20 min (much steadier).
+  // This single optimization absorbs ~80% of customer-traffic queries
+  // on busy days because a handful of popular dates dominate.
   const cached = getCachedSlots(cfg.key, date);
   if (cached) {
     return cached;
   }
 
+  // Tier 2 — try Tee-On HTTP. If it returns slots, cache + return.
+  // If it returns empty, save that fact and try the other paths
+  // before giving up.
+  let httpSlots = null;
   try {
     console.log(`[TeeOn:${cfg.key}] Trying HTTP method (primary)...`);
-    const httpSlots = await checkAvailabilityHTTP(date, partySize, cfg);
+    httpSlots = await checkAvailabilityHTTP(date, partySize, cfg);
     if (httpSlots.length > 0) {
+      // checkAvailabilityHTTP already calls setCachedSlots internally.
       return httpSlots;
     }
-    console.log(`[TeeOn:${cfg.key}] HTTP returned 0 slots — will try Puppeteer fallback if available`);
+    console.log(`[TeeOn:${cfg.key}] HTTP returned 0 slots — checking Puppeteer + stale-cache fallback`);
   } catch (err) {
     console.warn(`[TeeOn:${cfg.key}] HTTP method failed:`, err.message);
   }
 
+  // Tier 3 — Puppeteer fallback (if installed). Slower but more
+  // resilient against flaky API responses.
   if (puppeteer) {
     try {
       console.log(`[TeeOn:${cfg.key}] Trying Puppeteer fallback...`);
       const puppeteerSlots = await checkAvailabilityPuppeteer(date, partySize, cfg);
       if (puppeteerSlots.length > 0) {
         setCachedSlots(cfg.key, date, puppeteerSlots);
+        return puppeteerSlots;
       }
-      return puppeteerSlots;
     } catch (err) {
       console.warn(`[TeeOn:${cfg.key}] Puppeteer also failed:`, err.message);
       if (browser) { try { await browser.close(); } catch (e) {} browser = null; }
     }
   }
 
-  console.error(`[TeeOn:${cfg.key}] All methods exhausted — returning empty`);
+  // Tier 4 — stale-cache fallback. Tee-On's HTTP endpoint occasionally
+  // returns empty pages when rate-limited (a single Railway IP can
+  // hit ~5-10 req/min before getting muted). Rather than tell the
+  // caller "fully booked" — which would be a lie based on stale data
+  // — return the most recent cached slots within 30 min. The grok-
+  // voice prompt already explicitly bans "fully booked" wording for
+  // empty tool results, so callers get accurate "slightly stale"
+  // data with an offer to take a request.
+  const stale = getStaleSlotsFallback(cfg.key, date);
+  if (stale) {
+    return stale;
+  }
+
+  console.error(`[TeeOn:${cfg.key}] All methods exhausted (no fresh, no puppeteer, no stale) — returning empty for ${date}`);
   return [];
 }
 

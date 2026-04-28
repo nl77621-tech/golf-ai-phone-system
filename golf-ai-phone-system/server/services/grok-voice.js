@@ -349,11 +349,28 @@ ${callerLine}
         speed: voiceCfg.speed,
         input_audio_format: 'pcm16',
         output_audio_format: 'pcm16',
+        // Voice Activity Detection — controls how snappy the AI feels.
+        //   threshold: lower = AI cuts itself off faster when the caller
+        //     starts talking. 0.25 is responsive without firing on
+        //     background noise (passing cars, AC hum). 0.30 was the prior
+        //     value and felt sluggish; below 0.20 starts false-positiving
+        //     on phone-line noise.
+        //   prefix_padding_ms: how much audio BEFORE detected speech to
+        //     capture. 50ms is already minimal — going lower can clip the
+        //     first phoneme.
+        //   silence_duration_ms: how long the caller must be silent
+        //     before we consider their turn done and ask Grok to reply.
+        //     200ms makes turn-taking feel like a real conversation.
+        //     Below ~150ms makes the AI cut off callers who pause to
+        //     think mid-sentence ("I'd like... uh... a tee time").
+        // Pair this with the existing speech_started handler at line
+        // ~402 which fires response.cancel + buffer clear the moment
+        // Grok detects the caller's voice — that's the actual barge-in.
         turn_detection: {
           type: 'server_vad',
-          threshold: 0.30,
+          threshold: 0.25,
           prefix_padding_ms: 50,
-          silence_duration_ms: 300
+          silence_duration_ms: 200
         },
         tools: tools,
         tool_choice: 'auto',

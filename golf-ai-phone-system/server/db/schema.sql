@@ -332,6 +332,7 @@ CREATE TABLE IF NOT EXISTS booking_requests (
     requested_time TIME,
     party_size INTEGER NOT NULL DEFAULT 1,
     num_carts INTEGER NOT NULL DEFAULT 0,
+    holes INTEGER CHECK (holes IS NULL OR holes IN (9, 18)),  -- NULL for legacy rows; 9 or 18 going forward
     special_requests TEXT,
     status VARCHAR(20) NOT NULL DEFAULT 'pending',     -- pending, confirmed, rejected, cancelled
     card_last_four VARCHAR(4),

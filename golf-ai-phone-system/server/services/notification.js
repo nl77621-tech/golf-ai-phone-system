@@ -187,6 +187,20 @@ async function sendBookingNotification(businessId, booking) {
     weekday: 'long', month: 'long', day: 'numeric'
   });
 
+  // Holes — explicit row + value when known. "Unknown" when null so staff
+  // see the gap and can ask the caller before approving (rather than
+  // assuming 18, which is what bit us with the original incident).
+  const holesRowValue = (booking.holes === 18 || booking.holes === '18')
+    ? '18 holes'
+    : (booking.holes === 9 || booking.holes === '9')
+      ? '9 holes (back nine)'
+      : 'Unknown — confirm with caller';
+  const holesSmsValue = (booking.holes === 18 || booking.holes === '18')
+    ? '18 holes'
+    : (booking.holes === 9 || booking.holes === '9')
+      ? '9 holes'
+      : 'holes UNKNOWN';
+
   if (emailEnabled && settings.email_to) {
     const html = `
       <h2>🏌️ New Tee Time Request — ${businessName}</h2>
@@ -197,6 +211,7 @@ async function sendBookingNotification(businessId, booking) {
         <tr><td style="padding:4px 12px; font-weight:bold;">Date:</td><td style="padding:4px 12px;">${dateStr}</td></tr>
         <tr><td style="padding:4px 12px; font-weight:bold;">Time:</td><td style="padding:4px 12px;">${booking.requested_time || 'Flexible'}</td></tr>
         <tr><td style="padding:4px 12px; font-weight:bold;">Players:</td><td style="padding:4px 12px;">${booking.party_size}</td></tr>
+        <tr><td style="padding:4px 12px; font-weight:bold;">Holes:</td><td style="padding:4px 12px;">${holesRowValue}</td></tr>
         <tr><td style="padding:4px 12px; font-weight:bold;">Carts:</td><td style="padding:4px 12px;">${booking.num_carts || 0}</td></tr>
         ${booking.card_last_four ? `<tr><td style="padding:4px 12px; font-weight:bold;">Card:</td><td style="padding:4px 12px;">****${booking.card_last_four}</td></tr>` : ''}
         ${booking.special_requests ? `<tr><td style="padding:4px 12px; font-weight:bold;">Notes:</td><td style="padding:4px 12px;">${booking.special_requests}</td></tr>` : ''}
@@ -213,7 +228,7 @@ async function sendBookingNotification(businessId, booking) {
 
   if (smsEnabled && settings.sms_to) {
     const ccNote = booking.card_last_four ? ` Card: ****${booking.card_last_four}.` : '';
-    const sms = `[${businessName}] New tee time request: ${booking.customer_name || 'Unknown'}, ${dateStr} ${booking.requested_time || ''}, ${booking.party_size} players.${ccNote} Check Command Center to confirm.`;
+    const sms = `[${businessName}] New tee time request: ${booking.customer_name || 'Unknown'}, ${dateStr} ${booking.requested_time || ''}, ${booking.party_size} players, ${holesSmsValue}.${ccNote} Check Command Center to confirm.`;
     await sendSMS(businessId, settings.sms_to, sms);
   }
 }
@@ -339,6 +354,24 @@ function transferTail(transferNumber) {
   return transferNumber ? ` call us at ${transferNumber}` : ' call us back';
 }
 
+/**
+ * Format the holes count for customer-facing copy.
+ *
+ * A real customer booked 9 holes and the staff confirmed it as 18 because
+ * we never wrote that distinction anywhere visible. The booking record now
+ * carries a `holes` integer (9 or 18, or null for legacy rows) — we surface
+ * that explicitly in every SMS/email so the caller can self-correct before
+ * they show up at the course.
+ *
+ * Returns "" when holes is null (legacy rows) so older bookings don't grow
+ * a misleading "(undefined-hole)" tail.
+ */
+function holesLabel(holes) {
+  if (holes === 18 || holes === '18') return '18-hole';
+  if (holes === 9 || holes === '9') return '9-hole';
+  return '';
+}
+
 // Send booking confirmation SMS to the CUSTOMER (not staff)
 async function sendBookingConfirmationToCustomer(businessId, booking) {
   requireBusinessId(businessId, 'sendBookingConfirmationToCustomer');
@@ -353,7 +386,9 @@ async function sendBookingConfirmationToCustomer(businessId, booking) {
     const when = formatShortDateTime(booking.requested_date, booking.requested_time, timezone);
     const players = booking.party_size || 1;
     const playerWord = players === 1 ? 'player' : 'players';
-    const msg = `${name}: Tee time request for ${when}, ${players} ${playerWord}. Your booking is not confirmed until you receive a confirmation text!! If plans change please${transferTail(transferNumber)}.`;
+    const holes = holesLabel(booking.holes);
+    const holesPart = holes ? ` (${holes})` : '';
+    const msg = `${name}: Tee time request for ${when}, ${players} ${playerWord}${holesPart}. Your booking is not confirmed until you receive a confirmation text!! If plans change please${transferTail(transferNumber)}.`;
 
     return await sendSMS(businessId, smsPhone, msg);
   } catch (err) {
@@ -376,7 +411,9 @@ async function sendBookingConfirmedToCustomer(businessId, booking) {
     const when = formatShortDateTime(booking.requested_date, booking.requested_time, timezone);
     const players = booking.party_size || 1;
     const playerWord = players === 1 ? 'player' : 'players';
-    const msg = `${name}: Tee time CONFIRMED for ${when}, ${players} ${playerWord}. See you then! If plans change please${transferTail(transferNumber)}.`;
+    const holes = holesLabel(booking.holes);
+    const holesPart = holes ? ` (${holes})` : '';
+    const msg = `${name}: Tee time CONFIRMED for ${when}, ${players} ${playerWord}${holesPart}. See you then! If plans change please${transferTail(transferNumber)}.`;
 
     return await sendSMS(businessId, smsPhone, msg);
   } catch (err) {

@@ -669,9 +669,24 @@ function BookingsPage() {
                   // Main booking row
                   React.createElement('div', { className: 'p-4 flex items-center justify-between hover:bg-gray-50' },
                     React.createElement('div', { className: 'flex-1' },
-                      React.createElement('div', { className: 'flex items-center gap-3' },
+                      React.createElement('div', { className: 'flex items-center gap-3 flex-wrap' },
                         React.createElement('span', { className: 'font-semibold' }, b.customer_name || 'Unknown'),
                         React.createElement('span', { className: `px-2 py-0.5 rounded-full text-xs ${statusColors[b.status] || ''}` }, b.status),
+                        // Holes badge \u2014 most visible discriminator. Color-coded
+                        // so 9 vs 18 stands out at a glance (a real customer
+                        // got booked for the wrong number of holes when this
+                        // wasn't surfaced; staff was burned). NULL on rows
+                        // booked before migration 010.
+                        b.holes === 18 && React.createElement('span', {
+                          className: 'px-2 py-0.5 rounded-full text-xs font-bold bg-emerald-100 text-emerald-800'
+                        }, '\u26f3 18 holes'),
+                        b.holes === 9 && React.createElement('span', {
+                          className: 'px-2 py-0.5 rounded-full text-xs font-bold bg-amber-100 text-amber-800'
+                        }, '\u26f3 9 holes (back nine)'),
+                        b.holes == null && React.createElement('span', {
+                          className: 'px-2 py-0.5 rounded-full text-xs bg-gray-100 text-gray-600',
+                          title: 'Holes not captured at booking time \u2014 confirm with caller before approving'
+                        }, '\u26f3 holes: ?'),
                         b.no_show && React.createElement('span', { className: 'px-2 py-0.5 rounded-full text-xs bg-red-100 text-red-800 font-medium' }, 'NO-SHOW')
                       ),
                       React.createElement('div', { className: 'text-sm text-gray-600 font-medium mt-1' },

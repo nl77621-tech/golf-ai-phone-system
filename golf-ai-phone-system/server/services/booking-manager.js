@@ -34,7 +34,8 @@ async function getBusinessTimezone(businessId) {
 // Create a new booking request
 async function createBookingRequest({
   businessId, customerId, customerName, customerPhone, customerEmail,
-  requestedDate, requestedTime, partySize, numCarts, specialRequests, cardLastFour, callId
+  requestedDate, requestedTime, partySize, numCarts, specialRequests, cardLastFour, callId,
+  holes
 }) {
   requireBusinessId(businessId, 'createBookingRequest');
 
@@ -59,18 +60,27 @@ async function createBookingRequest({
   }
   const carts = parseInt(numCarts) || 0;
 
+  // 9 or 18 only — anything else (incl. undefined / null / 0) gets stored
+  // as NULL so old client paths and pre-tee-on tenants still work. The DB
+  // CHECK constraint enforces the same; this is just defense-in-depth so
+  // the INSERT never fails on the constraint.
+  let normalizedHoles = null;
+  if (holes === 9 || holes === 18 || holes === '9' || holes === '18') {
+    normalizedHoles = parseInt(holes, 10);
+  }
+
   try {
     const cardDigits = cardLastFour ? String(cardLastFour).replace(/\D/g, '').slice(-4) : null;
 
     const res = await query(
       `INSERT INTO booking_requests
        (business_id, customer_id, customer_name, customer_phone, customer_email,
-        requested_date, requested_time, party_size, num_carts, special_requests, card_last_four, call_id, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'pending')
+        requested_date, requested_time, party_size, num_carts, holes, special_requests, card_last_four, call_id, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'pending')
        RETURNING *`,
       [businessId, customerId || null, customerName.trim(), customerPhone || null,
        customerEmail || null, normalizedDate, requestedTime || null, size, carts,
-       specialRequests || null, cardDigits, callId || null]
+       normalizedHoles, specialRequests || null, cardDigits, callId || null]
     );
 
     const booking = res.rows[0];
@@ -105,6 +115,7 @@ async function createBookingRequest({
       requested_date: booking.requested_date,
       requested_time: booking.requested_time,
       party_size: booking.party_size,
+      holes: booking.holes,
       status: booking.status
     });
 

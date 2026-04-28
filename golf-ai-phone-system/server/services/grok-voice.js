@@ -737,7 +737,7 @@ function buildToolDefinitions() {
     {
       type: 'function',
       name: 'book_tee_time',
-      description: 'REQUIRED to create a booking — you MUST call this tool to submit the booking request. The booking does NOT exist until this tool is called. Never tell the caller the booking was submitted without calling this first. Collect name, date, time, and party size, then call this immediately.',
+      description: 'REQUIRED to create a booking — you MUST call this tool to submit the booking request. The booking does NOT exist until this tool is called. Never tell the caller the booking was submitted without calling this first. Collect name, date, time, party size, AND whether they want 9 or 18 holes (CRITICAL — confirm this verbally before booking; staff has been burned by ambiguous holes assumptions). Then call this immediately.',
       parameters: {
         type: 'object',
         properties: {
@@ -748,10 +748,11 @@ function buildToolDefinitions() {
           time: { type: 'string', description: 'Requested time in HH:MM format (24h)' },
           party_size: { type: 'integer', description: 'Number of players (1-8)' },
           num_carts: { type: 'integer', description: 'Number of golf carts requested' },
+          holes: { type: 'integer', enum: [9, 18], description: '18 for full course (start hole 1) or 9 for back-nine only (start hole 10). REQUIRED — must match what the slot in check_tee_times offered. If the caller did not specify, ask them before calling this tool.' },
           special_requests: { type: 'string', description: 'Any special requests or notes' },
           card_last_four: { type: 'string', description: 'Last 4 digits of the credit card provided by the caller (only when credit card is required)' }
         },
-        required: ['customer_name', 'date', 'party_size']
+        required: ['customer_name', 'date', 'party_size', 'holes']
       }
     },
     {
@@ -1094,6 +1095,12 @@ async function executeToolCall(toolName, args, ctx) {
         });
 
         try {
+          // Coerce holes to 9 or 18 if the AI passed it; otherwise null
+          // and the column stays NULL (legacy behaviour). The AI tool
+          // schema has it as required + enum, but defense-in-depth.
+          const holesArg = args.holes === 9 || args.holes === '9' ? 9
+                         : args.holes === 18 || args.holes === '18' ? 18
+                         : null;
           const booking = await createBookingRequest({
             businessId,
             customerId: callerContext.customerId,
@@ -1104,6 +1111,7 @@ async function executeToolCall(toolName, args, ctx) {
             requestedTime: args.time,
             partySize: args.party_size,
             numCarts: args.num_carts || 0,
+            holes: holesArg,
             specialRequests: args.special_requests,
             cardLastFour: args.card_last_four || null,
             callId: callLogId

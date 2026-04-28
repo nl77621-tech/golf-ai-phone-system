@@ -51,7 +51,9 @@ const {
   createTeamMember,
   updateTeamMember,
   deleteTeamMember,
-  sendMessageToTeamMember
+  sendMessageToTeamMember,
+  listTeamMessages,
+  markTeamMessageRead
 } = require('../services/team-directory');
 const eventBus = require('../services/event-bus');
 const userMgmt = require('../services/business-user-management');
@@ -1145,6 +1147,45 @@ router.delete('/team/:id', requireBusinessAdmin, async (req, res) => {
   } catch (err) {
     console.error(`[tenant:${businessId}] Team delete error:`, err.message);
     res.status(500).json({ error: 'Failed to delete team member' });
+  }
+});
+
+// ============================================
+// TEAM MESSAGES — persisted history of messages the AI took on behalf
+// of team members. Drives the "Messages" page in Command Center for
+// the Business template (and is also visible on personal_assistant
+// tenants since the data model is shared).
+// ============================================
+
+// GET /api/messages — recent messages, newest first.
+// Optional ?status= filter (pending|sent|partial|failed|read|dashboard_only)
+// and ?limit= (default 100, max 500).
+router.get('/messages', async (req, res) => {
+  const businessId = tenantId(req);
+  try {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+    const status = typeof req.query.status === 'string' ? req.query.status : null;
+    const messages = await listTeamMessages(businessId, { limit, status });
+    res.json(messages);
+  } catch (err) {
+    console.error(`[tenant:${businessId}] Messages list error:`, err.message);
+    res.status(500).json({ error: 'Failed to load messages' });
+  }
+});
+
+// PATCH /api/messages/:id/read — mark a single message as read.
+// Idempotent — re-reading is a no-op.
+router.patch('/messages/:id/read', async (req, res) => {
+  const businessId = tenantId(req);
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+  try {
+    const row = await markTeamMessageRead(businessId, id);
+    if (!row) return res.status(404).json({ error: 'Message not found' });
+    res.json(row);
+  } catch (err) {
+    console.error(`[tenant:${businessId}] Mark-read error:`, err.message);
+    res.status(500).json({ error: 'Failed to mark message read' });
   }
 });
 

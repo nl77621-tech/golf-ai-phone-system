@@ -218,9 +218,21 @@ function sidebarItemsFor(templateKey, plan) {
   if (templateKey === 'personal_assistant') {
     return [
       { id: 'dashboard', label: 'Personal Assistant', icon: '\ud83d\udc64' },
+      { id: 'messages',  label: 'Messages',           icon: '\ud83d\udce8' },
       { id: 'calls',     label: 'Call History',       icon: '\ud83d\udcde' },
       { id: 'my_info',   label: 'My Info',            icon: '\ud83d\udccb' },
       { id: 'settings',  label: 'Settings',           icon: '\u2699\ufe0f' }
+    ];
+  }
+  // Business switchboard template \u2014 pure messaging operation.
+  // No bookings, no customers list (those are golf-shaped concepts).
+  // Just: Dashboard (call summary), Messages (the heart), Calls, Settings.
+  if (templateKey === 'business') {
+    return [
+      { id: 'dashboard', label: 'Dashboard',  icon: '\ud83d\udcca' },
+      { id: 'messages',  label: 'Messages',   icon: '\ud83d\udce8' },
+      { id: 'calls',     label: 'Call Logs',  icon: '\ud83d\udcde' },
+      { id: 'settings',  label: 'Settings',   icon: '\u2699\ufe0f' }
     ];
   }
   // Restaurant — same general shape as golf (dashboard + booking-flavoured
@@ -2476,7 +2488,13 @@ function TeamDirectoryManager() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [testing, setTesting] = useState(null);
-  const [draft, setDraft] = useState({ name: '', role: '', sms_phone: '', email: '', aliases: '' });
+  // Draft includes the new fields: per-channel toggles + default-recipient.
+  // sms_phone is now optional — an email-only contact is allowed as long as
+  // email is provided. The DB enforces this with a CHECK constraint.
+  const [draft, setDraft] = useState({
+    name: '', role: '', sms_phone: '', email: '', aliases: '',
+    sms_enabled: true, email_enabled: true, is_default_recipient: false
+  });
   const [adding, setAdding] = useState(false);
 
   const reload = () => {
@@ -2489,8 +2507,12 @@ function TeamDirectoryManager() {
   useEffect(reload, []);
 
   const addMember = async () => {
-    if (!draft.name.trim() || !draft.sms_phone.trim()) {
-      setError('Name and phone number are required.');
+    if (!draft.name.trim()) {
+      setError('Name is required.');
+      return;
+    }
+    if (!draft.sms_phone.trim() && !draft.email.trim()) {
+      setError('Provide at least a phone number or an email — every teammate needs one channel.');
       return;
     }
     setAdding(true);
@@ -2504,13 +2526,27 @@ function TeamDirectoryManager() {
         body: JSON.stringify({
           name: draft.name.trim(),
           role: draft.role.trim() || null,
-          sms_phone: draft.sms_phone.trim(),
+          sms_phone: draft.sms_phone.trim() || null,
           email: draft.email.trim() || null,
+          sms_enabled: !!draft.sms_enabled,
+          email_enabled: !!draft.email_enabled,
+          is_default_recipient: !!draft.is_default_recipient,
           aliases
         })
       });
-      setMembers(prev => [...prev, created]);
-      setDraft({ name: '', role: '', sms_phone: '', email: '', aliases: '' });
+      setMembers(prev => {
+        // If we just set a new default, clear the flag on any other row in
+        // local state so the UI doesn't briefly show two defaults before
+        // the next reload.
+        const next = created.is_default_recipient
+          ? prev.map(m => ({ ...m, is_default_recipient: false }))
+          : [...prev];
+        return [...next, created];
+      });
+      setDraft({
+        name: '', role: '', sms_phone: '', email: '', aliases: '',
+        sms_enabled: true, email_enabled: true, is_default_recipient: false
+      });
     } catch (err) {
       setError(err.message || 'Failed to add team member');
     } finally {
@@ -2521,7 +2557,13 @@ function TeamDirectoryManager() {
   const updateField = async (id, patch) => {
     try {
       const updated = await api(`/api/team/${id}`, { method: 'PATCH', body: JSON.stringify(patch) });
-      setMembers(prev => prev.map(m => (m.id === id ? updated : m)));
+      // If we just promoted this row to default, clear the flag on every
+      // other row in local state so we don't briefly render two defaults.
+      setMembers(prev => prev.map(m => {
+        if (m.id === id) return updated;
+        if (updated?.is_default_recipient) return { ...m, is_default_recipient: false };
+        return m;
+      }));
     } catch (err) {
       alert(err.message || 'Failed to update team member');
     }
@@ -2571,25 +2613,45 @@ function TeamDirectoryManager() {
             },
               React.createElement('div', { className: 'flex items-start justify-between gap-3' },
                 React.createElement('div', { className: 'flex-1 min-w-0' },
-                  React.createElement('div', { className: 'flex items-center gap-2' },
+                  React.createElement('div', { className: 'flex items-center gap-2 flex-wrap' },
                     React.createElement('span', { className: 'font-semibold text-gray-800' }, m.name),
                     m.role && React.createElement('span', { className: 'text-xs text-gray-500' }, '• ' + m.role),
+                    m.is_default_recipient && React.createElement('span', {
+                      className: 'text-xs bg-amber-100 text-amber-800 px-2 py-0.5 rounded font-semibold',
+                      title: 'When the AI can’t match a caller’s spoken name, the message routes here.'
+                    }, 'Default inbox'),
                     !m.is_active && React.createElement('span', { className: 'text-xs bg-gray-200 text-gray-600 px-2 py-0.5 rounded' }, 'inactive')
                   ),
-                  React.createElement('div', { className: 'text-xs text-gray-500 mt-1' },
-                    React.createElement('span', null, '📞 ' + m.sms_phone),
-                    m.email && React.createElement('span', { className: 'ml-3' }, '✉️ ' + m.email)
+                  React.createElement('div', { className: 'text-xs text-gray-500 mt-1 flex flex-wrap gap-x-3 gap-y-1' },
+                    m.sms_phone && React.createElement('span', {
+                      className: m.sms_enabled ? '' : 'opacity-50 line-through',
+                      title: m.sms_enabled ? 'SMS enabled' : 'SMS disabled — texts will not be sent'
+                    }, '📞 ' + m.sms_phone),
+                    m.email && React.createElement('span', {
+                      className: m.email_enabled ? '' : 'opacity-50 line-through',
+                      title: m.email_enabled ? 'Email enabled' : 'Email disabled — emails will not be sent'
+                    }, '✉️ ' + m.email)
                   ),
                   Array.isArray(m.aliases) && m.aliases.length > 0 && React.createElement('div', { className: 'text-xs text-gray-400 mt-1' },
                     'Also called: ' + m.aliases.join(', ')
                   )
                 ),
                 React.createElement('div', { className: 'flex flex-col gap-1 shrink-0' },
-                  React.createElement('button', {
+                  m.sms_phone && React.createElement('button', {
                     onClick: () => testSms(m.id, m.name),
-                    disabled: !m.is_active || testing === m.id,
+                    disabled: !m.is_active || !m.sms_enabled || testing === m.id,
                     className: 'text-xs px-2 py-1 rounded bg-golf-50 text-golf-700 hover:bg-golf-100 disabled:opacity-50'
                   }, testing === m.id ? 'Sending…' : 'Test SMS'),
+                  !m.is_default_recipient && m.is_active && React.createElement('button', {
+                    onClick: () => updateField(m.id, { is_default_recipient: true }),
+                    className: 'text-xs px-2 py-1 rounded bg-amber-50 text-amber-700 hover:bg-amber-100',
+                    title: 'Make this the inbox-fallback when the AI can’t match a name'
+                  }, 'Set default'),
+                  m.is_default_recipient && React.createElement('button', {
+                    onClick: () => updateField(m.id, { is_default_recipient: false }),
+                    className: 'text-xs px-2 py-1 rounded bg-amber-100 text-amber-800 hover:bg-amber-200',
+                    title: 'Remove default-recipient status from this teammate'
+                  }, 'Unset default'),
                   React.createElement('button', {
                     onClick: () => updateField(m.id, { is_active: !m.is_active }),
                     className: 'text-xs px-2 py-1 rounded bg-gray-100 text-gray-700 hover:bg-gray-200'
@@ -2618,12 +2680,12 @@ function TeamDirectoryManager() {
           className: 'border rounded-lg px-3 py-2 text-sm'
         }),
         React.createElement('input', {
-          type: 'tel', placeholder: 'SMS phone (E.164 — +14165551234)',
+          type: 'tel', placeholder: 'SMS phone (E.164 — +14165551234) — optional if email set',
           value: draft.sms_phone, onChange: e => setDraft({ ...draft, sms_phone: e.target.value }),
           className: 'border rounded-lg px-3 py-2 text-sm'
         }),
         React.createElement('input', {
-          type: 'email', placeholder: 'Email (optional)',
+          type: 'email', placeholder: 'Email (optional if phone set)',
           value: draft.email, onChange: e => setDraft({ ...draft, email: e.target.value }),
           className: 'border rounded-lg px-3 py-2 text-sm'
         }),
@@ -2633,10 +2695,191 @@ function TeamDirectoryManager() {
           className: 'border rounded-lg px-3 py-2 text-sm md:col-span-2'
         })
       ),
+      // Per-channel preferences + default-recipient toggle. Drafted as
+      // checkboxes so the operator can opt this teammate out of one
+      // channel even when both columns are populated (e.g. accounting
+      // gets emails but no texts).
+      React.createElement('div', { className: 'flex flex-wrap gap-x-5 gap-y-2 text-sm mb-3 px-1' },
+        React.createElement('label', { className: 'inline-flex items-center gap-2' },
+          React.createElement('input', {
+            type: 'checkbox', checked: !!draft.sms_enabled,
+            onChange: e => setDraft({ ...draft, sms_enabled: e.target.checked })
+          }),
+          React.createElement('span', null, 'Send SMS')
+        ),
+        React.createElement('label', { className: 'inline-flex items-center gap-2' },
+          React.createElement('input', {
+            type: 'checkbox', checked: !!draft.email_enabled,
+            onChange: e => setDraft({ ...draft, email_enabled: e.target.checked })
+          }),
+          React.createElement('span', null, 'Send email')
+        ),
+        React.createElement('label', {
+          className: 'inline-flex items-center gap-2',
+          title: 'When the AI can’t match a caller’s spoken name, route the message here.'
+        },
+          React.createElement('input', {
+            type: 'checkbox', checked: !!draft.is_default_recipient,
+            onChange: e => setDraft({ ...draft, is_default_recipient: e.target.checked })
+          }),
+          React.createElement('span', { className: 'text-amber-800' }, 'Make this the default inbox')
+        )
+      ),
       React.createElement('button', {
         onClick: addMember, disabled: adding,
         className: 'bg-golf-600 hover:bg-golf-700 text-white px-4 py-2 rounded-lg text-sm disabled:opacity-50'
       }, adding ? 'Adding…' : 'Add team member')
+    )
+  );
+}
+
+// ============================================
+// MessagesPage  —  history of every message the AI took on behalf of a
+// teammate, with delivery status and a mark-as-read button. Drives the
+// "Messages" tab in the Command Center for tenants on the Business
+// (or Personal Assistant) template. Reads from /api/messages.
+// ============================================
+function MessagesPage() {
+  const [messages, setMessages] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [filter, setFilter] = useState('all'); // 'all' | 'unread' | 'failed'
+
+  const reload = () => {
+    setLoading(true);
+    api('/api/messages?limit=200')
+      .then(rows => setMessages(Array.isArray(rows) ? rows : []))
+      .catch(err => setError(err.message || 'Failed to load messages'))
+      .finally(() => setLoading(false));
+  };
+  useEffect(() => { reload(); }, []);
+
+  // Subscribe to live SSE updates so newly-taken messages appear
+  // without a manual refresh. Reuses the existing /api/events stream.
+  useEffect(() => {
+    let es = null;
+    try {
+      const token = localStorage.getItem('gc_token') || '';
+      const url = token ? `/api/events?token=${encodeURIComponent(token)}` : '/api/events';
+      es = new EventSource(url);
+      const onAnything = () => reload();
+      es.addEventListener('team_message.created', onAnything);
+      es.addEventListener('team_message.updated', onAnything);
+    } catch (_) { /* SSE disabled — we'll just rely on manual reload */ }
+    return () => { try { es && es.close(); } catch (_) {} };
+  }, []);
+
+  const markRead = async (id) => {
+    try {
+      const updated = await api(`/api/messages/${id}/read`, { method: 'PATCH' });
+      setMessages(prev => prev.map(m => m.id === id ? updated : m));
+    } catch (err) {
+      alert(err.message || 'Failed to mark read');
+    }
+  };
+
+  const filtered = messages.filter(m => {
+    if (filter === 'unread') return m.status !== 'read';
+    if (filter === 'failed') return m.status === 'failed' || m.status === 'partial';
+    return true;
+  });
+
+  const statusBadge = (status) => {
+    const styles = {
+      sent:           'bg-emerald-100 text-emerald-800',
+      partial:        'bg-amber-100 text-amber-800',
+      failed:         'bg-red-100 text-red-800',
+      pending:        'bg-blue-100 text-blue-800',
+      read:           'bg-gray-100 text-gray-600',
+      dashboard_only: 'bg-gray-100 text-gray-600'
+    };
+    const label = {
+      sent: 'Delivered',
+      partial: 'Partial',
+      failed: 'Failed',
+      pending: 'Sending…',
+      read: 'Read',
+      dashboard_only: 'Dashboard only'
+    }[status] || status;
+    return React.createElement('span', {
+      className: `text-xs px-2 py-0.5 rounded font-semibold ${styles[status] || 'bg-gray-100 text-gray-600'}`
+    }, label);
+  };
+
+  return React.createElement('div', null,
+    React.createElement('div', { className: 'flex items-center justify-between mb-4 flex-wrap gap-2' },
+      React.createElement('div', null,
+        React.createElement('h2', { className: 'text-2xl font-bold text-gray-800' }, 'Messages'),
+        React.createElement('p', { className: 'text-sm text-gray-500' },
+          'Every message the AI has taken for a teammate. SMS / email delivery status is tracked per row.'
+        )
+      ),
+      React.createElement('div', { className: 'flex items-center gap-2 text-sm' },
+        ['all', 'unread', 'failed'].map(f =>
+          React.createElement('button', {
+            key: f,
+            onClick: () => setFilter(f),
+            className: `px-3 py-1.5 rounded-lg ${filter === f ? 'bg-golf-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`
+          }, f === 'all' ? 'All' : f === 'unread' ? 'Unread' : 'Failed / Partial')
+        ),
+        React.createElement('button', {
+          onClick: reload,
+          className: 'px-3 py-1.5 rounded-lg bg-gray-100 text-gray-700 hover:bg-gray-200'
+        }, 'Refresh')
+      )
+    ),
+    error && React.createElement('div', { className: 'mb-3 text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2' }, error),
+    loading && React.createElement('div', { className: 'text-sm text-gray-500' }, 'Loading messages…'),
+    !loading && filtered.length === 0 && React.createElement('div', { className: 'text-sm text-gray-400 italic py-8 text-center' },
+      filter === 'all' ? 'No messages yet — the AI will populate this list as callers leave messages.' : `No ${filter} messages.`
+    ),
+    !loading && filtered.length > 0 && React.createElement('div', { className: 'space-y-3' },
+      filtered.map(m => React.createElement('div', {
+        key: m.id,
+        className: `border rounded-lg p-4 ${m.status === 'failed' || m.status === 'partial' ? 'border-red-200 bg-red-50/40' : m.status === 'read' ? 'bg-gray-50' : 'bg-white'}`
+      },
+        React.createElement('div', { className: 'flex items-start justify-between gap-3 flex-wrap' },
+          React.createElement('div', { className: 'flex-1 min-w-0' },
+            React.createElement('div', { className: 'flex items-center gap-2 flex-wrap mb-1' },
+              React.createElement('span', { className: 'text-xs text-gray-500' },
+                new Date(m.created_at).toLocaleString()
+              ),
+              React.createElement('span', { className: 'text-sm' },
+                'For: ',
+                React.createElement('strong', null, m.recipient_name)
+              ),
+              m.routed_to_default && React.createElement('span', {
+                className: 'text-xs bg-amber-100 text-amber-800 px-2 py-0.5 rounded',
+                title: 'The caller didn’t name a specific person, so this routed to the default inbox.'
+              }, 'Default routing'),
+              statusBadge(m.status)
+            ),
+            React.createElement('div', { className: 'text-sm text-gray-700 mb-2' },
+              'From: ',
+              React.createElement('strong', null, m.caller_name || 'Unknown caller'),
+              m.caller_phone && React.createElement('a', {
+                href: `tel:${m.caller_phone}`,
+                className: 'ml-2 text-blue-600 hover:underline'
+              }, m.caller_phone)
+            ),
+            React.createElement('div', { className: 'text-sm text-gray-800 whitespace-pre-wrap bg-white border rounded px-3 py-2' }, m.body)
+          ),
+          m.status !== 'read' && React.createElement('button', {
+            onClick: () => markRead(m.id),
+            className: 'text-xs px-2 py-1 rounded bg-gray-100 text-gray-700 hover:bg-gray-200 shrink-0'
+          }, 'Mark read')
+        ),
+        // When a delivery_detail blob has an error reason, surface it so
+        // ops can debug a failed SMS without going to Twilio logs.
+        (m.status === 'failed' || m.status === 'partial') && m.delivery_detail && (
+          (m.delivery_detail.sms?.error || m.delivery_detail.email?.error)
+            ? React.createElement('div', { className: 'mt-2 text-xs text-red-700 bg-red-100 border border-red-200 rounded px-2 py-1' },
+                m.delivery_detail.sms?.error && React.createElement('div', null, 'SMS: ' + m.delivery_detail.sms.error),
+                m.delivery_detail.email?.error && React.createElement('div', null, 'Email: ' + m.delivery_detail.email.error)
+              )
+            : null
+        )
+      ))
     )
   );
 }
@@ -3821,6 +4064,7 @@ function EditTenantModal({ business, onClose, onSaved }) {
                             { key: 'driving_range', label: 'Driving Range' },
                             { key: 'restaurant', label: 'Restaurant' },
                             { key: 'personal_assistant', label: 'Personal Assistant' },
+                            { key: 'business', label: 'Business' },
                             { key: 'other', label: 'Other / Generic' }
                           ]
                       ).map(t =>
@@ -6626,8 +6870,23 @@ function tenantPagesFor(templateKey, plan) {
   if (templateKey === 'personal_assistant') {
     return {
       dashboard: PersonalAssistantPage,
+      messages:  MessagesPage,
       calls:     CallLogsPage,
       my_info:   MyInfoPage,
+      settings:  PersonalSettingsPage
+    };
+  }
+  // Business switchboard template — purpose-built for team message-taking.
+  // Reuses the generic DashboardPage for the call-summary tile and CallLogsPage
+  // for the call history. Settings reuses the personal-assistant Settings page
+  // because both templates share the same setting keys (no booking_settings,
+  // pricing, etc). The Messages tab is the heart — it shows every message the
+  // AI has taken, with delivery status per row.
+  if (templateKey === 'business') {
+    return {
+      dashboard: DashboardPage,
+      messages:  MessagesPage,
+      calls:     CallLogsPage,
       settings:  PersonalSettingsPage
     };
   }

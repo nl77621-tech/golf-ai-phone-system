@@ -9,6 +9,7 @@
 const { getSetting, getBusinessById } = require('../config/database');
 const { requireBusinessId } = require('../context/tenant-context');
 const { buildPersonalAssistantPrompt } = require('./personal-assistant-prompt');
+const { buildBusinessSwitchboardPrompt } = require('./business-prompt');
 const { listTeamMembers } = require('./team-directory');
 
 async function buildSystemPrompt(businessId, callerContext = {}) {
@@ -27,6 +28,10 @@ async function buildSystemPrompt(businessId, callerContext = {}) {
 
   if (templateKey === 'personal_assistant') {
     return buildPersonalAssistantPrompt(businessId, callerContext);
+  }
+
+  if (templateKey === 'business') {
+    return buildBusinessSwitchboardPrompt(businessId, callerContext);
   }
 
   const [

@@ -11,9 +11,9 @@
  * defense-in-depth for the same reason every other service in this folder
  * does so. A route-level missing predicate would still be safe.
  */
-const { query } = require('../config/database');
+const { pool, query } = require('../config/database');
 const { requireBusinessId } = require('../context/tenant-context');
-const { sendSMS } = require('./notification');
+const { sendSMS, sendEmail } = require('./notification');
 const { normalizeToE164 } = require('./caller-lookup');
 
 const NAME_MAX = 80;
@@ -41,19 +41,25 @@ function normalizeAliases(aliases) {
  * surfaces disabled rows for the management UI; the call-time lookup
  * always filters to active rows.
  */
+// Columns we always read back. Centralized so a future column doesn't get
+// silently omitted from one query — every consumer expects the full row.
+const MEMBER_COLUMNS = `
+  id, business_id, name, role, sms_phone, email,
+  sms_enabled, email_enabled, is_default_recipient,
+  aliases, notes, is_active, created_at, updated_at
+`.trim();
+
 async function listTeamMembers(businessId, { includeInactive = true } = {}) {
   requireBusinessId(businessId, 'listTeamMembers');
   const sql = includeInactive
-    ? `SELECT id, business_id, name, role, sms_phone, email, aliases, notes,
-              is_active, created_at, updated_at
+    ? `SELECT ${MEMBER_COLUMNS}
          FROM business_team_members
         WHERE business_id = $1
-        ORDER BY is_active DESC, LOWER(name) ASC`
-    : `SELECT id, business_id, name, role, sms_phone, email, aliases, notes,
-              is_active, created_at, updated_at
+        ORDER BY is_default_recipient DESC, is_active DESC, LOWER(name) ASC`
+    : `SELECT ${MEMBER_COLUMNS}
          FROM business_team_members
         WHERE business_id = $1 AND is_active = TRUE
-        ORDER BY LOWER(name) ASC`;
+        ORDER BY is_default_recipient DESC, LOWER(name) ASC`;
   const { rows } = await query(sql, [businessId]);
   return rows;
 }
@@ -76,8 +82,7 @@ async function findTeamMemberByName(businessId, spokenName) {
   const needle = spokenName.trim().toLowerCase();
 
   const { rows } = await query(
-    `SELECT id, business_id, name, role, sms_phone, email, aliases, notes,
-            is_active, created_at, updated_at
+    `SELECT ${MEMBER_COLUMNS}
        FROM business_team_members
       WHERE business_id = $1 AND is_active = TRUE`,
     [businessId]
@@ -110,8 +115,7 @@ async function findTeamMemberByName(businessId, spokenName) {
 async function getTeamMember(businessId, memberId) {
   requireBusinessId(businessId, 'getTeamMember');
   const { rows } = await query(
-    `SELECT id, business_id, name, role, sms_phone, email, aliases, notes,
-            is_active, created_at, updated_at
+    `SELECT ${MEMBER_COLUMNS}
        FROM business_team_members
       WHERE business_id = $1 AND id = $2`,
     [businessId, memberId]
@@ -119,29 +123,94 @@ async function getTeamMember(businessId, memberId) {
   return rows[0] || null;
 }
 
+/**
+ * Return the active default-recipient row for a tenant, or null.
+ * Used by the AI's take-message executor: when a spoken name doesn't
+ * match anyone, the message routes here so nothing is dropped.
+ */
+async function getDefaultRecipient(businessId) {
+  requireBusinessId(businessId, 'getDefaultRecipient');
+  const { rows } = await query(
+    `SELECT ${MEMBER_COLUMNS}
+       FROM business_team_members
+      WHERE business_id = $1
+        AND is_default_recipient = TRUE
+        AND is_active = TRUE
+      LIMIT 1`,
+    [businessId]
+  );
+  return rows[0] || null;
+}
+
+/**
+ * Create a team member.
+ *
+ * sms_phone is now optional — an email-only contact (e.g. accounting) is
+ * fine, but at least one of sms_phone or email must be present (the DB
+ * also enforces this via business_team_members_at_least_one_channel).
+ *
+ * is_default_recipient: if true and another active default exists for
+ * this tenant, the existing default is cleared first inside a single
+ * transaction so the partial unique index doesn't reject the insert.
+ */
 async function createTeamMember(businessId, input) {
   requireBusinessId(businessId, 'createTeamMember');
   const name = trimOrNull(input?.name, NAME_MAX);
   if (!name) throw new Error('name is required');
 
   const role = trimOrNull(input?.role, ROLE_MAX);
-  const rawSms = typeof input?.sms_phone === 'string' ? input.sms_phone : '';
-  const smsPhone = normalizeToE164(rawSms);
-  if (!smsPhone) throw new Error('sms_phone must be a valid phone number');
+
+  // Phone is optional now — only validate format when something was supplied.
+  let smsPhone = null;
+  if (input?.sms_phone && String(input.sms_phone).trim()) {
+    smsPhone = normalizeToE164(input.sms_phone);
+    if (!smsPhone) throw new Error('sms_phone must be a valid phone number');
+  }
 
   const email = trimOrNull(input?.email, 120);
+  if (!smsPhone && !email) {
+    throw new Error('Provide a phone number or an email — every team member needs at least one channel.');
+  }
+
   const notes = trimOrNull(input?.notes, NOTES_MAX);
   const aliases = normalizeAliases(input?.aliases);
   const isActive = input?.is_active === false ? false : true;
+  const smsEnabled = input?.sms_enabled === false ? false : !!smsPhone;
+  const emailEnabled = input?.email_enabled === false ? false : !!email;
+  const isDefault = !!input?.is_default_recipient;
 
-  const { rows } = await query(
-    `INSERT INTO business_team_members
-        (business_id, name, role, sms_phone, email, aliases, notes, is_active)
-     VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8)
-     RETURNING *`,
-    [businessId, name, role, smsPhone, email, JSON.stringify(aliases), notes, isActive]
-  );
-  return rows[0];
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    if (isDefault) {
+      // Clear any existing default for this tenant first so the partial
+      // unique index doesn't reject the insert.
+      await client.query(
+        `UPDATE business_team_members
+            SET is_default_recipient = FALSE, updated_at = NOW()
+          WHERE business_id = $1 AND is_default_recipient = TRUE`,
+        [businessId]
+      );
+    }
+    const { rows } = await client.query(
+      `INSERT INTO business_team_members
+          (business_id, name, role, sms_phone, email,
+           sms_enabled, email_enabled, is_default_recipient,
+           aliases, notes, is_active)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11)
+       RETURNING *`,
+      [businessId, name, role, smsPhone, email,
+       smsEnabled, emailEnabled, isDefault,
+       JSON.stringify(aliases), notes, isActive]
+    );
+    await client.query('COMMIT');
+    return rows[0];
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 async function updateTeamMember(businessId, memberId, input) {
@@ -160,31 +229,77 @@ async function updateTeamMember(businessId, memberId, input) {
   }
   if ('role' in (input || {})) push('role', trimOrNull(input.role, ROLE_MAX));
   if ('sms_phone' in (input || {})) {
-    const smsPhone = normalizeToE164(input.sms_phone);
-    if (!smsPhone) throw new Error('sms_phone must be a valid phone number');
-    push('sms_phone', smsPhone);
+    // Allow clearing the phone (email-only contact) by passing '' or null.
+    if (input.sms_phone === null || input.sms_phone === '') {
+      push('sms_phone', null);
+    } else {
+      const smsPhone = normalizeToE164(input.sms_phone);
+      if (!smsPhone) throw new Error('sms_phone must be a valid phone number');
+      push('sms_phone', smsPhone);
+    }
   }
   if ('email' in (input || {})) push('email', trimOrNull(input.email, 120));
+  if ('sms_enabled' in (input || {})) push('sms_enabled', !!input.sms_enabled);
+  if ('email_enabled' in (input || {})) push('email_enabled', !!input.email_enabled);
   if ('notes' in (input || {})) push('notes', trimOrNull(input.notes, NOTES_MAX));
   if ('aliases' in (input || {})) {
     push('aliases', JSON.stringify(normalizeAliases(input.aliases)));
   }
   if ('is_active' in (input || {})) push('is_active', !!input.is_active);
 
-  if (sets.length === 0) {
+  // is_default_recipient toggle is special — switching ON requires clearing
+  // the previous default to satisfy the partial unique index. We do that
+  // inside a transaction so the tenant never has zero or two defaults.
+  const flippingDefaultOn = 'is_default_recipient' in (input || {}) && !!input.is_default_recipient;
+  const flippingDefaultOff = 'is_default_recipient' in (input || {}) && !input.is_default_recipient;
+
+  if (sets.length === 0 && !flippingDefaultOn && !flippingDefaultOff) {
     return await getTeamMember(businessId, memberId);
   }
-  sets.push(`updated_at = NOW()`);
-  params.push(businessId, memberId);
 
-  const sql = `
-    UPDATE business_team_members
-       SET ${sets.join(', ')}
-     WHERE business_id = $${params.length - 1}
-       AND id = $${params.length}
-     RETURNING *`;
-  const { rows } = await query(sql, params);
-  return rows[0] || null;
+  if (flippingDefaultOff) {
+    push('is_default_recipient', false);
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    if (flippingDefaultOn) {
+      await client.query(
+        `UPDATE business_team_members
+            SET is_default_recipient = FALSE, updated_at = NOW()
+          WHERE business_id = $1
+            AND is_default_recipient = TRUE
+            AND id <> $2`,
+        [businessId, memberId]
+      );
+      push('is_default_recipient', true);
+    }
+
+    if (sets.length === 0) {
+      // Only the no-op "set default off when it was already off" path —
+      // re-fetch and return.
+      await client.query('COMMIT');
+      return await getTeamMember(businessId, memberId);
+    }
+
+    sets.push(`updated_at = NOW()`);
+    params.push(businessId, memberId);
+    const sql = `
+      UPDATE business_team_members
+         SET ${sets.join(', ')}
+       WHERE business_id = $${params.length - 1}
+         AND id = $${params.length}
+       RETURNING *`;
+    const { rows } = await client.query(sql, params);
+    await client.query('COMMIT');
+    return rows[0] || null;
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 async function deleteTeamMember(businessId, memberId) {
@@ -213,8 +328,45 @@ function formatTeamMessageSms({ recipientName, callerName, callerPhone, message,
 }
 
 /**
- * Send a transcript-of-message SMS to a specific team member. Caller passes
- * the resolved row OR the memberId; we re-fetch for safety either way.
+ * Format an HTML email body for a message-taken handoff. Plain enough that
+ * a recipient can scan it on their phone, but readable on desktop too.
+ */
+function formatTeamMessageEmail({ recipientName, callerName, callerPhone, message, businessName, routedToDefault }) {
+  const safe = (s) => String(s || '').replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+  const headerNote = routedToDefault
+    ? `<p style="margin:0 0 12px; color:#92400e; background:#fef3c7; padding:8px 12px; border-radius:6px; font-size:13px;">⚠️ The caller didn't name a specific person, so this was routed to you as the default recipient.</p>`
+    : '';
+  return `
+    <div style="font-family:-apple-system,BlinkMacSystemFont,Helvetica,Arial,sans-serif; max-width:520px; color:#111;">
+      <h2 style="margin:0 0 8px; font-size:18px;">📞 New message at ${safe(businessName || 'your business')}</h2>
+      ${headerNote}
+      <table style="border-collapse:collapse; font-size:14px; margin-top:8px;">
+        <tr><td style="padding:4px 12px 4px 0; font-weight:600;">For:</td><td style="padding:4px 0;">${safe(recipientName)}</td></tr>
+        ${callerName ? `<tr><td style="padding:4px 12px 4px 0; font-weight:600;">From:</td><td style="padding:4px 0;">${safe(callerName)}</td></tr>` : ''}
+        ${callerPhone ? `<tr><td style="padding:4px 12px 4px 0; font-weight:600;">Callback:</td><td style="padding:4px 0;"><a href="tel:${safe(callerPhone)}" style="color:#2563eb; text-decoration:none;">${safe(callerPhone)}</a></td></tr>` : ''}
+      </table>
+      <div style="margin-top:14px; padding:12px; background:#f3f4f6; border-radius:8px; white-space:pre-wrap; font-size:14px; line-height:1.5;">${safe(message || '(no transcript captured)')}</div>
+    </div>
+  `;
+}
+
+/**
+ * Persist + dispatch a message taken on behalf of a team member.
+ *
+ * Two reasons we always insert into team_messages BEFORE attempting
+ * SMS/email:
+ *   1. Audit trail — if the carrier eats the SMS we still have the row.
+ *   2. The Messages page in Command Center is the source of truth so
+ *      ops can re-deliver from the dashboard if a recipient missed it.
+ *
+ * Channel selection per member:
+ *   - sms_enabled  + sms_phone present → SMS attempted
+ *   - email_enabled + email present    → email attempted
+ *   - if neither attempt is possible (member has no enabled channel),
+ *     status stays 'dashboard_only' so the message lives in the UI.
+ *
+ * Caller passes either the resolved row OR memberId; we re-fetch for
+ * safety so a stale `member` object can't bypass the active check.
  */
 async function sendMessageToTeamMember(businessId, memberId, payload) {
   requireBusinessId(businessId, 'sendMessageToTeamMember');
@@ -222,25 +374,169 @@ async function sendMessageToTeamMember(businessId, memberId, payload) {
   if (!member) throw new Error(`Team member ${memberId} not found for business ${businessId}`);
   if (!member.is_active) throw new Error(`Team member ${memberId} is inactive — message not sent`);
 
-  const body = formatTeamMessageSms({
-    recipientName: member.name,
-    callerName: payload?.callerName,
-    callerPhone: payload?.callerPhone,
-    message: payload?.message,
-    businessName: payload?.businessName
-  });
+  const callerName = payload?.callerName || null;
+  const callerPhone = payload?.callerPhone || null;
+  const messageBody = (payload?.message || '').toString();
+  const businessName = payload?.businessName || null;
+  const routedToDefault = !!payload?.routedToDefault;
+  const callId = Number.isInteger(payload?.callId) ? payload.callId : null;
 
-  const result = await sendSMS(businessId, member.sms_phone, body);
-  return { delivered: !!result, message_sid: result?.sid || null, recipient: member };
+  // Decide which channels we'll try.
+  const willSendSms = !!(member.sms_enabled && member.sms_phone);
+  const willSendEmail = !!(member.email_enabled && member.email);
+  const channelLabel =
+    willSendSms && willSendEmail ? 'both'
+    : willSendSms ? 'sms'
+    : willSendEmail ? 'email'
+    : 'dashboard_only';
+
+  // 1) Persist the row up front — even before dispatch attempts. If the
+  //    Twilio API call hangs, we still have the message in the dashboard.
+  const insertRes = await query(
+    `INSERT INTO team_messages
+        (business_id, recipient_id, recipient_name, caller_name, caller_phone,
+         body, channel, status, routed_to_default, call_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9)
+     RETURNING id`,
+    [businessId, member.id, member.name, callerName, callerPhone,
+     messageBody, channelLabel, routedToDefault, callId]
+  );
+  const messageRowId = insertRes.rows[0].id;
+
+  // 2) Fire each channel best-effort. Failures don't throw — they get
+  //    captured into delivery_detail and the row's final status reflects
+  //    the partial state ("sent" / "partial" / "failed" / "dashboard_only").
+  const detail = {};
+  let smsOk = null;
+  let emailOk = null;
+
+  if (willSendSms) {
+    try {
+      const smsBody = formatTeamMessageSms({
+        recipientName: member.name,
+        callerName,
+        callerPhone,
+        message: messageBody,
+        businessName
+      });
+      const result = await sendSMS(businessId, member.sms_phone, smsBody);
+      smsOk = !!result;
+      detail.sms = { ok: smsOk, sid: result?.sid || null, to: member.sms_phone };
+    } catch (err) {
+      smsOk = false;
+      detail.sms = { ok: false, error: err.message, to: member.sms_phone };
+    }
+  }
+
+  if (willSendEmail) {
+    try {
+      const html = formatTeamMessageEmail({
+        recipientName: member.name,
+        callerName,
+        callerPhone,
+        message: messageBody,
+        businessName,
+        routedToDefault
+      });
+      const subject = `New message for ${member.name}${callerName ? ` from ${callerName}` : ''}`;
+      const result = await sendEmail(businessId, member.email, subject, html);
+      emailOk = !!result;
+      detail.email = { ok: emailOk, message_id: result?.messageId || null, to: member.email };
+    } catch (err) {
+      emailOk = false;
+      detail.email = { ok: false, error: err.message, to: member.email };
+    }
+  }
+
+  // 3) Decide final status. Both channels successful → sent. Both
+  //    attempted but mixed → partial. None succeeded → failed (unless
+  //    we never tried, in which case it's dashboard_only).
+  let finalStatus;
+  if (channelLabel === 'dashboard_only') {
+    finalStatus = 'dashboard_only';
+  } else if (channelLabel === 'both') {
+    if (smsOk && emailOk) finalStatus = 'sent';
+    else if (smsOk || emailOk) finalStatus = 'partial';
+    else finalStatus = 'failed';
+  } else {
+    // single-channel
+    finalStatus = (smsOk || emailOk) ? 'sent' : 'failed';
+  }
+
+  await query(
+    `UPDATE team_messages
+        SET status = $1, delivery_detail = $2::jsonb, updated_at = NOW()
+      WHERE id = $3 AND business_id = $4`,
+    [finalStatus, JSON.stringify(detail), messageRowId, businessId]
+  );
+
+  return {
+    delivered: finalStatus === 'sent' || finalStatus === 'partial',
+    status: finalStatus,
+    message_id: messageRowId,
+    message_sid: detail.sms?.sid || null,
+    recipient: member,
+    delivery_detail: detail
+  };
+}
+
+/**
+ * List recent team_messages for a tenant — drives the Messages page in
+ * the Command Center. Joins recipient name from the directory when
+ * available (recipient_id may be NULL after a hard-delete; recipient_name
+ * snapshot in the row keeps the message readable either way).
+ */
+async function listTeamMessages(businessId, { limit = 100, status = null } = {}) {
+  requireBusinessId(businessId, 'listTeamMessages');
+  const params = [businessId];
+  let whereStatus = '';
+  if (status) {
+    params.push(status);
+    whereStatus = ` AND tm.status = $${params.length}`;
+  }
+  params.push(Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500));
+  const sql = `
+    SELECT tm.id, tm.business_id, tm.recipient_id, tm.recipient_name,
+           tm.caller_name, tm.caller_phone, tm.body,
+           tm.channel, tm.status, tm.delivery_detail, tm.routed_to_default,
+           tm.call_id, tm.created_at, tm.updated_at,
+           btm.is_active AS recipient_active
+      FROM team_messages tm
+      LEFT JOIN business_team_members btm ON btm.id = tm.recipient_id
+     WHERE tm.business_id = $1${whereStatus}
+     ORDER BY tm.created_at DESC
+     LIMIT $${params.length}`;
+  const { rows } = await query(sql, params);
+  return rows;
+}
+
+/**
+ * Mark a message as read. Returns the updated row, or null if the
+ * message belongs to a different tenant / doesn't exist.
+ */
+async function markTeamMessageRead(businessId, messageId) {
+  requireBusinessId(businessId, 'markTeamMessageRead');
+  const { rows } = await query(
+    `UPDATE team_messages
+        SET status = 'read', updated_at = NOW()
+      WHERE id = $1 AND business_id = $2
+      RETURNING *`,
+    [messageId, businessId]
+  );
+  return rows[0] || null;
 }
 
 module.exports = {
   listTeamMembers,
   findTeamMemberByName,
   getTeamMember,
+  getDefaultRecipient,
   createTeamMember,
   updateTeamMember,
   deleteTeamMember,
   sendMessageToTeamMember,
-  formatTeamMessageSms
+  listTeamMessages,
+  markTeamMessageRead,
+  formatTeamMessageSms,
+  formatTeamMessageEmail
 };

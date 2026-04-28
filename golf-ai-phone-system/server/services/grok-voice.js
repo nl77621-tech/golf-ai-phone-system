@@ -42,7 +42,7 @@ const { query, getSetting, getBusinessById } = require('../config/database');
 const { requireBusinessId } = require('../context/tenant-context');
 const { recordCallUsage } = require('./credits');
 const { resolveVoiceConfigFromSettings } = require('./voice-tiers');
-const { findTeamMemberByName, sendMessageToTeamMember } = require('./team-directory');
+const { findTeamMemberByName, sendMessageToTeamMember, getDefaultRecipient } = require('./team-directory');
 const teeon = require('./teeon-automation');
 require('dotenv').config();
 
@@ -1376,20 +1376,47 @@ async function executeToolCall(toolName, args, ctx) {
           return { success: false, error: 'lookup_failed', message: 'I’m having trouble looking that up — let me take a general message and someone will follow up.' };
         }
 
-        if (!match) {
-          return {
-            success: false,
-            error: 'not_found',
-            message: `I don’t have ${spokenName} on my list of people I can leave a message for. I can take a general message and pass it along, or transfer you if you’d like.`
-          };
-        }
-        if (match.ambiguous) {
+        // Default-recipient fallback. When we can't match a name (or the
+        // match was ambiguous and we'd rather just deliver than pingpong),
+        // route to the tenant's marked default recipient if one exists.
+        // This is what makes the new "Business" template's switchboard
+        // actually trustworthy — no message is ever silently dropped.
+        let routedToDefault = false;
+        let resolvedMember = null;
+
+        if (match && !match.ambiguous) {
+          resolvedMember = match;
+        } else if (match && match.ambiguous) {
+          // Ambiguity — keep the existing "ask the caller to pick" flow.
+          // Falling back to default here would mask a name collision the
+          // caller almost certainly meant a specific person to receive.
           return {
             success: false,
             error: 'ambiguous',
             candidates: match.candidates,
             message: `I have a couple of people by that name — ${match.candidates.map(c => c.name + (c.role ? ` (${c.role})` : '')).join(' or ')}. Which one?`
           };
+        } else {
+          // No match — try the default recipient.
+          let fallback = null;
+          try {
+            fallback = await getDefaultRecipient(businessId);
+          } catch (err) {
+            console.warn(`[tenant:${businessId}][${callLogId}] default recipient lookup failed:`, err.message);
+          }
+          if (fallback) {
+            resolvedMember = fallback;
+            routedToDefault = true;
+            console.log(
+              `[tenant:${businessId}][${callLogId}] No match for "${spokenName}" — routing to default recipient ${fallback.name} (id=${fallback.id})`
+            );
+          } else {
+            return {
+              success: false,
+              error: 'not_found',
+              message: `I don’t have ${spokenName} on my list of people I can leave a message for. I can take a general message and pass it along, or transfer you if you’d like.`
+            };
+          }
         }
 
         // Resolve callback number — caller-supplied beats the inbound DID,
@@ -1406,29 +1433,35 @@ async function executeToolCall(toolName, args, ctx) {
 
         try {
           const business = await getBusinessById(businessId);
-          const result = await sendMessageToTeamMember(businessId, match.id, {
+          const result = await sendMessageToTeamMember(businessId, resolvedMember.id, {
             callerName,
             callerPhone,
             message: args.message,
-            businessName: business?.name
+            businessName: business?.name,
+            routedToDefault,
+            callId: callLogId
           });
           console.log(
-            `[tenant:${businessId}][${callLogId}] Routed message to ${match.name} (id=${match.id}) — sid=${result.message_sid}`
+            `[tenant:${businessId}][${callLogId}] Routed message to ${resolvedMember.name} (id=${resolvedMember.id})${routedToDefault ? ' [default fallback]' : ''} — status=${result.status}, sid=${result.message_sid || 'n/a'}`
           );
           // Note: the per-call action log is appended at the WebSocket
           // dispatch site (see `callState.actions.push` near the
           // function_call_arguments.done handler) — no need to do it here.
           return {
             success: true,
-            recipient: match.name,
-            message: `I’ll get that to ${match.name} right away.`
+            recipient: resolvedMember.name,
+            routed_to_default: routedToDefault,
+            status: result.status,
+            message: routedToDefault
+              ? `I’ve noted your message — I’ll make sure the right person gets it.`
+              : `I’ll get that to ${resolvedMember.name} right away.`
           };
         } catch (err) {
-          console.error(`[tenant:${businessId}][${callLogId}] team SMS dispatch failed:`, err.message);
+          console.error(`[tenant:${businessId}][${callLogId}] team message dispatch failed:`, err.message);
           return {
             success: false,
-            error: 'sms_failed',
-            message: `I’ll make sure ${match.name} gets your message — there was a hiccup with the text right now, but I’ve noted it.`
+            error: 'dispatch_failed',
+            message: `I’ll make sure ${resolvedMember.name} gets your message — there was a hiccup just now, but I’ve noted it.`
           };
         }
       }

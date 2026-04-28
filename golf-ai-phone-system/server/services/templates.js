@@ -379,6 +379,74 @@ const PERSONAL_ASSISTANT = {
   ]
 };
 
+/* ------------------------------------------------------------------
+ * BUSINESS  —  team switchboard / message-taking template.
+ *
+ * Designed for small businesses where the AI's job is to act as a
+ * front-desk receptionist for a TEAM of named people: caller asks for
+ * Nelson, AI takes a message, AI texts/emails Nelson the message.
+ *
+ * Diverges from `personal_assistant` (which models a single owner) and
+ * from `golf_course` (which models a transactional booking flow). The
+ * actual team members live in the `business_team_members` table — not
+ * in settings — because they have their own CRUD lifecycle, per-channel
+ * preferences, and a default-recipient toggle. Settings here just seed
+ * the AI personality and the operating-hours / after-hours copy.
+ *
+ * The AI tool `take_message_for_team_member` is already wired up in
+ * grok-voice.js. The system-prompt branch for this template injects
+ * the team list and tells the AI to use that tool for every
+ * message-taking flow.
+ * ------------------------------------------------------------------ */
+
+const BUSINESS = {
+  key: 'business',
+  meta: {
+    label: 'Business',
+    tagline: 'Switchboard for a small team — caller asks for someone, AI takes a message.',
+    description: 'Built for small businesses where multiple people answer different things. The AI greets the caller, asks who the message is for, looks the person up in your team directory, takes the message, and forwards it to that teammate by SMS or email per their preferences. Unmatched names route to a default “inbox” person so nothing is dropped. Add teammates in the Team panel — each one has their own phone, email, and channel preferences.',
+    icon: 'briefcase',
+    icon_emoji: '💼',
+    recommended_plan: 'starter',
+    default_timezone: 'America/Toronto',
+    features: [
+      'Take messages for any teammate',
+      'Per-teammate SMS / email preferences',
+      'Default “inbox” fallback recipient',
+      'Messages page with full history'
+    ]
+  },
+  settings: [
+    ['business_hours', weeklyHours({ open: '09:00', close: '17:00' }),
+      'When the team is generally available'],
+    ['pricing', {}, 'Pricing — only relevant if the AI quotes anything'],
+    ['course_info', {}, 'General business info'],
+    ['policies', {}, 'Policies and rules'],
+    ['memberships', {}, 'Memberships / loyalty — optional'],
+    ['tournaments', {}, 'Group bookings — optional'],
+    ['amenities', {}, 'Facilities — optional'],
+    ['notifications', standardNotifications(),
+      'How to notify the owner of administrative events. Per-message routing uses the Team directory instead.'],
+    ['ai_personality', personality({
+      name: 'Receptionist',
+      style: 'Warm, professional, efficient — like a great front-desk receptionist who knows everyone on the team. Confirms names back to the caller before taking a message. Never pretends to be one of the teammates.',
+      language: 'English primary. Switch if the caller prefers another language.',
+      weather_behavior: 'Don’t mention weather unless the caller asks.',
+      booking_limit: 1,
+      after_hours_message: "The team isn’t here right now — I can take your message and make sure the right person gets it first thing."
+    }), 'AI voice agent personality'],
+    ['announcements', [], 'Active announcements the AI should mention'],
+    ['booking_settings', { require_credit_card: false }, 'Booking behavior (kept for dashboard compatibility)'],
+    ['test_mode', { enabled: false, test_phone: '' }, 'Test phone number configuration'],
+    ['voice_config', { tier: 'standard' }, 'Voice tier — economy | standard | premium (wizard overrides this)']
+  ],
+  greetings: [
+    ['Hi, thanks for calling. How can I help you today?', false],
+    ['Hello — you’ve reached the team. What can I do for you?', false],
+    ['Hi {name}! Welcome back — who can I get a message to?', true]
+  ]
+};
+
 const GENERIC = {
   key: 'other',
   meta: {
@@ -418,6 +486,7 @@ const TEMPLATES = {
   [DRIVING_RANGE.key]: DRIVING_RANGE,
   [RESTAURANT.key]: RESTAURANT,
   [PERSONAL_ASSISTANT.key]: PERSONAL_ASSISTANT,
+  [BUSINESS.key]: BUSINESS,
   [GENERIC.key]: GENERIC
 };
 

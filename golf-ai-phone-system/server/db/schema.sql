@@ -139,25 +139,78 @@ CREATE TRIGGER trg_business_phone_numbers_touch
 -- ============================================
 -- Named people the AI can leave a message for. The AI's
 -- `take_message_for_team_member` tool looks up by (business_id, lower(name))
--- and dispatches an SMS with the transcript to `sms_phone`.
+-- and dispatches a message via SMS and/or email per the member's prefs.
+--
+-- sms_phone is NULLABLE so an email-only contact (e.g. accounting) can
+-- exist; the table-level CHECK below requires at least one channel.
+-- is_default_recipient marks the inbox-fallback for the Business template:
+-- when the AI can't match a spoken name, the message routes here so we
+-- never drop a caller's message. Enforced at-most-one-active per tenant
+-- via the partial unique index further down (migration 011).
 CREATE TABLE IF NOT EXISTS business_team_members (
     id SERIAL PRIMARY KEY,
     business_id INTEGER NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
     name VARCHAR(80) NOT NULL,
     role VARCHAR(80),
-    sms_phone VARCHAR(20) NOT NULL,
+    sms_phone VARCHAR(20),
     email VARCHAR(120),
+    sms_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    email_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    is_default_recipient BOOLEAN NOT NULL DEFAULT FALSE,
     aliases JSONB NOT NULL DEFAULT '[]'::jsonb,
     notes TEXT,
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    CONSTRAINT business_team_members_at_least_one_channel
+        CHECK (sms_phone IS NOT NULL OR email IS NOT NULL)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_team_members_unique_name
     ON business_team_members (business_id, LOWER(name));
 CREATE INDEX IF NOT EXISTS idx_team_members_business
     ON business_team_members (business_id, is_active);
+
+-- At-most-one default recipient per tenant (active rows only). The
+-- application is responsible for ensuring at-LEAST-one when the tenant
+-- uses the 'business' switchboard template; this index just stops
+-- accidental duplicates from coexisting.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_business_team_members_one_default
+    ON business_team_members (business_id)
+    WHERE is_default_recipient = TRUE AND is_active = TRUE;
+
+-- Persisted record of every message taken on behalf of a team member —
+-- powers the Messages page in Command Center and gives ops an audit
+-- trail when SMS/email delivery fails or a recipient's phone is dead.
+CREATE TABLE IF NOT EXISTS team_messages (
+    id SERIAL PRIMARY KEY,
+    business_id INTEGER NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+    recipient_id INTEGER REFERENCES business_team_members(id) ON DELETE SET NULL,
+    recipient_name VARCHAR(120) NOT NULL,
+    caller_name VARCHAR(120),
+    caller_phone VARCHAR(20),
+    body TEXT NOT NULL,
+    channel VARCHAR(20) NOT NULL DEFAULT 'sms',
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    delivery_detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+    routed_to_default BOOLEAN NOT NULL DEFAULT FALSE,
+    call_id INTEGER REFERENCES call_logs(id) ON DELETE SET NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    CONSTRAINT team_messages_channel_check
+        CHECK (channel IN ('sms', 'email', 'both', 'dashboard_only')),
+    CONSTRAINT team_messages_status_check
+        CHECK (status IN ('pending', 'sent', 'partial', 'failed', 'read'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_team_messages_business_created
+    ON team_messages (business_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_team_messages_recipient
+    ON team_messages (recipient_id)
+    WHERE recipient_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_team_messages_attention
+    ON team_messages (business_id, status)
+    WHERE status IN ('pending', 'failed', 'partial');
 
 -- ============================================
 -- Tenant staff users

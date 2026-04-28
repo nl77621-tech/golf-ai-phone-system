@@ -916,31 +916,16 @@ async function executeToolCall(toolName, args, ctx) {
           const morningBack9 = back9.filter(s => s.time.includes('AM'));
           const fitsParty = openSlots.filter(s => s.maxPlayers >= partySize).length;
 
-          // Highlight the earliest 18-hole slots so the AI can lead with
-          // them. Without this the AI tends to pick "earliest with all
-          // seats" and silently drop the partial slots — operators want
-          // both surfaced ("6:50 has 3 seats, 7:30 fits all 4").
+          // Highlights — used in the rules section below so the AI can
+          // lead its answer with the right facts. Compute these BEFORE
+          // assembling the main message so they're always available to
+          // the AI, not gated on a "different slot" branch that might
+          // confuse the model.
           const earliestAny18 = full18[0] || null;
           const earliestFits18 = full18.find(s => s.maxPlayers >= partySize) || null;
-          const sameSlot = earliestAny18 && earliestFits18 && earliestAny18.time === earliestFits18.time;
+          const fitsList = openSlots.filter(s => s.maxPlayers >= partySize).map(s => s.time);
 
-          let message = `LIVE tee sheet for ${args.date} — ${openSlots.length} open slot${openSlots.length === 1 ? '' : 's'}, ${fitsParty} fit your group of ${partySize}:\n`;
-
-          // Headline section the AI should read FIRST when the caller asks
-          // about "earliest" or "what's open". Forces the AI to mention
-          // partial-capacity slots instead of skipping straight to the
-          // first full-fit slot.
-          if (earliestAny18 && !sameSlot) {
-            message += `\nEARLIEST OPEN 18-HOLE SLOT: ${earliestAny18.time} (${earliestAny18.maxPlayers} of 4 seats open — caller's party of ${partySize} would need to split)`;
-            if (earliestFits18) {
-              message += `\nEARLIEST 18-HOLE WITH ALL ${partySize} SEATS: ${earliestFits18.time}`;
-            } else {
-              message += `\nNO 18-HOLE SLOT TODAY HAS ALL ${partySize} SEATS — every open slot is partial. Suggest splitting the group, picking a smaller booking, or trying tomorrow.`;
-            }
-            message += `\n\n`;
-          }
-          // (If sameSlot is true, the earliest open IS the earliest fit —
-          // no need to pre-headline; the regular listing below covers it.)
+          let message = `LIVE tee sheet for ${args.date}: ${openSlots.length} open slot${openSlots.length === 1 ? '' : 's'} on the sheet right now.\n`;
 
 
           if (morning18.length > 0) {
@@ -967,9 +952,29 @@ async function executeToolCall(toolName, args, ctx) {
             if (morningBack9[0].price) message += ` (${morningBack9[0].price} each)`;
           }
 
+          // Summary section — flat facts the AI can quote directly without
+          // having to interpret. Always present, regardless of capacity.
+          message += `\n\nKEY FACTS:`;
+          if (earliestAny18) {
+            const seatNote = earliestAny18.maxPlayers >= partySize
+              ? `(fits all ${partySize})`
+              : `(only ${earliestAny18.maxPlayers} of 4 seats — party of ${partySize} would need to split)`;
+            message += `\n• Earliest open 18-hole slot: ${earliestAny18.time} ${seatNote}`;
+          }
+          if (earliestFits18 && (!earliestAny18 || earliestFits18.time !== earliestAny18.time)) {
+            message += `\n• Earliest 18-hole that fits all ${partySize} players: ${earliestFits18.time}`;
+          }
+          if (fitsList.length > 0) {
+            const sample = fitsList.slice(0, 6).join(', ');
+            message += `\n• 18-hole times that fit all ${partySize} players today: ${sample}${fitsList.length > 6 ? ` and ${fitsList.length - 6} more` : ''}`;
+          } else if (openSlots.length > 0) {
+            message += `\n• No 18-hole slot today has all ${partySize} seats open, but ${openSlots.length} slot${openSlots.length === 1 ? '' : 's'} have partial seats. Offer to split the group, downsize, or try a different day — DO NOT say "no tee times available" because the slots ARE open, just not for a full party of ${partySize}.`;
+          }
+
           message += `\n\nRULES:
 - Times shown as "7:30" have all 4 seats open. Times shown as "7:14 (3 seats)" have fewer seats.
-- When the caller asks for the "earliest" tee time today (or the earliest for their party), ALWAYS mention BOTH: (1) the absolute earliest open slot with its seat count, AND (2) the earliest slot that fits the full party — if those are different. Don't silently skip the earlier partial slots; the caller may want to split their group or downsize.
+- ALWAYS use the actual data above to answer. NEVER say "no available times" if there are any open slots, even partial ones — describe what IS open and offer the caller a path (split, downsize, switch dates).
+- When the caller asks for "earliest" — lead with the earliest open slot (any capacity) and its seat count, then mention the earliest full-fit slot if different.
 - If they ask about a specific time, just answer for that time directly.
 - 18 holes = start hole 1, full course. 9 holes = start hole 10, back nine only.
 - ONLY offer times from this list.`;

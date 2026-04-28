@@ -892,28 +892,34 @@ async function executeToolCall(toolName, args, ctx) {
 
           console.log(`[tenant:${businessId}][${callLogId}] Tee times for ${args.date}: ${allSlots.length} total slots, ${slots.length} fit party of ${partySize}`);
 
-          if (slots.length === 0 && allSlots.length > 0) {
-            const maxAvail = Math.max(...allSlots.map(s => s.maxPlayers));
-            return {
-              available: false,
-              message: `No tee times available for a group of ${partySize} on ${args.date}. The open time slots only have room for ${maxAvail} or fewer players. Each tee time holds a maximum of 4 golfers, and some spots are already booked. You could suggest the caller split into smaller groups or try a different date.`
-            };
+          // Show every slot that has ANY open seats — don't pre-filter by
+          // requested party_size. Operators want the AI to be a transparent
+          // reporter of the live tee sheet, not a strict filter that hides
+          // partial-capacity slots. We annotate each slot with its remaining
+          // seats; the AI explains what fits the caller's party (and offers
+          // to split if needed).
+          const openSlots = allSlots.filter(s => s.maxPlayers > 0);
+
+          if (openSlots.length === 0) {
+            return { available: false, message: `No open tee times showing on the live tee sheet for ${args.date}. This could mean the tee sheet is fully booked, or the online system may not have updated yet. Offer to take a booking request with their preferred date and time — staff will check directly and confirm by text or phone call.` };
           }
 
-          if (slots.length === 0) {
-            return { available: false, message: `No available tee times showing online for ${args.date}. This could mean the tee sheet is fully booked, or the online system may not have updated yet. Offer to take a booking request with their preferred date and time — staff will check directly and confirm by text or phone call.` };
-          }
+          // Format each slot with its remaining capacity. Slots that fit the
+          // requested party get just the time; tighter slots get "(N seats)"
+          // so the AI can describe them honestly.
+          const fmt = (s) => s.maxPlayers >= partySize ? s.time : `${s.time} (${s.maxPlayers} seat${s.maxPlayers === 1 ? '' : 's'})`;
 
-          const full18 = slots.filter(s => s.holes === 18);
-          const back9 = slots.filter(s => s.holes === 9);
+          const full18 = openSlots.filter(s => s.holes === 18);
+          const back9 = openSlots.filter(s => s.holes === 9);
           const morning18 = full18.filter(s => s.time.includes('AM'));
           const afternoon18 = full18.filter(s => s.time.includes('PM'));
           const morningBack9 = back9.filter(s => s.time.includes('AM'));
+          const fitsParty = openSlots.filter(s => s.maxPlayers >= partySize).length;
 
-          let message = `AVAILABLE tee times for ${args.date} (${partySize} players):\n`;
+          let message = `LIVE tee sheet for ${args.date} — ${openSlots.length} open slot${openSlots.length === 1 ? '' : 's'}, ${fitsParty} fit your group of ${partySize}:\n`;
 
           if (morning18.length > 0) {
-            message += `\nMorning 18-hole times: ${morning18.map(s => s.time).join(', ')}`;
+            message += `\nMorning 18-hole times: ${morning18.map(fmt).join(', ')}`;
             if (morning18[0].price) message += ` (${morning18[0].price} each)`;
           }
 
@@ -924,7 +930,7 @@ async function executeToolCall(toolName, args, ctx) {
               const isPM = s.time.includes('PM');
               return isPM && h >= 3 && h < 6;
             });
-            message += `\nAfternoon 18-hole times: ${earlyPM.map(s => s.time).join(', ')}`;
+            message += `\nAfternoon 18-hole times: ${earlyPM.map(fmt).join(', ')}`;
             if (afternoon18.length > 6) message += ` and ${afternoon18.length - 6} more`;
             if (latePM.length > 0 && latePM[0].price && latePM[0].price !== morning18?.[0]?.price) {
               message += ` (twilight rate ${latePM[0].price} starts around 3 PM)`;
@@ -932,21 +938,14 @@ async function executeToolCall(toolName, args, ctx) {
           }
 
           if (morningBack9.length > 0) {
-            message += `\nMorning 9-hole only (back nine, starts hole 10): ${morningBack9.map(s => s.time).join(', ')}`;
+            message += `\nMorning 9-hole only (back nine, starts hole 10): ${morningBack9.map(fmt).join(', ')}`;
             if (morningBack9[0].price) message += ` (${morningBack9[0].price} each)`;
           }
 
-          if (morning18.length === 0 && morningBack9.length > 0) {
-            message += '\nNOTE: No morning 18-hole times for this group size, but morning 9-hole back nine is available.';
-          }
-          if (full18.length === 0 && back9.length > 0) {
-            message += '\nNOTE: No 18-hole times for this group size today. Only 9-hole back nine available.';
-          }
+          message += `\n\nRULES: Times shown as "7:30" have all 4 seats open. Times shown as "7:14 (3 seats)" have fewer seats — the caller's party of ${partySize} won't all fit at that slot, but you can offer to split the group across times or suggest a different time. 18 holes = start hole 1, full course. 9 holes = start hole 10, back nine only. ONLY offer times from this list.`;
 
-          message += '\n\nRULES: 18 holes = start hole 1, full course. 9 holes = start hole 10, back nine only. ONLY offer times from this list.';
-
-          console.log(`[tenant:${businessId}][${callLogId}] Tee times for ${args.date}: ${full18.length} x 18-hole, ${back9.length} x 9-hole (party of ${partySize})`);
-          return { available: true, date: args.date, partySize, total: slots.length, message };
+          console.log(`[tenant:${businessId}][${callLogId}] Tee times for ${args.date}: ${openSlots.length} open (${fitsParty} fit ${partySize}); ${full18.length} 18-hole / ${back9.length} 9-hole`);
+          return { available: true, date: args.date, partySize, total: openSlots.length, fits_party: fitsParty, message };
         } catch (err) {
           console.error(`[tenant:${businessId}][TeeOn] checkAvailability error:`, err.message);
           return { available: null, message: 'Unable to check live availability right now. I can take a booking request.' };

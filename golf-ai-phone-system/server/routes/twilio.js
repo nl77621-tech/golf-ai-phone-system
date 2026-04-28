@@ -186,12 +186,19 @@ router.post('/transfer', attachTenantFromCallSid, async (req, res) => {
   const business = req.business;
   const businessId = business.id;
   try {
-    let rawNumber = business.transfer_number || null;
+    // Settings → column precedence. The in-tenant Settings UI is the
+    // place a tenant admin actually sets their dispatcher number, so
+    // it should win over the auto-populated business.transfer_number
+    // column. Originally we read the column first; that meant a
+    // tenant updating their number from inside the Settings UI saw
+    // their change get silently ignored on real calls. (Mirror
+    // change in services/grok-voice.js transfer_call tool executor.)
+    const fromSettings = await getSetting(businessId, 'transfer_number').catch(() => null);
+    let rawNumber = typeof fromSettings === 'string'
+      ? fromSettings
+      : (fromSettings?.number || fromSettings?.value || null);
     if (!rawNumber) {
-      const fromSettings = await getSetting(businessId, 'transfer_number').catch(() => null);
-      rawNumber = typeof fromSettings === 'string'
-        ? fromSettings
-        : (fromSettings?.number || fromSettings?.value || null);
+      rawNumber = business.transfer_number || null;
     }
 
     const transferNumber = toE164(rawNumber);

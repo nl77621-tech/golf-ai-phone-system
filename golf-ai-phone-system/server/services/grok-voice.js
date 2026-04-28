@@ -1244,14 +1244,25 @@ async function executeToolCall(toolName, args, ctx) {
       }
 
       case 'transfer_call': {
-        // Prefer the denormalized business.transfer_number; fall back to the
-        // per-tenant settings row.
-        const business = await getBusinessById(businessId).catch(() => null);
-        let transferNumber = business?.transfer_number || null;
+        // Settings → column precedence. The Settings UI writes to the
+        // settings.transfer_number row; Edit Tenant writes to the
+        // businesses.transfer_number column. Originally we read the
+        // column first and fell through to settings only if empty —
+        // which meant the in-tenant Settings UI was effectively
+        // ignored when the column had a stale auto-populated value.
+        // Settings wins now because that's the more-recent operator
+        // intent in the common case (tenant admin setting their own
+        // dispatcher number from inside the tenant UI).
+        const fromSettingsRaw = await getSetting(businessId, 'transfer_number').catch(() => null);
+        const fromSettings = typeof fromSettingsRaw === 'string'
+          ? fromSettingsRaw
+          : (fromSettingsRaw?.number || fromSettingsRaw?.value || null);
+        let transferNumber = fromSettings || null;
         if (!transferNumber) {
-          transferNumber = await getSetting(businessId, 'transfer_number').catch(() => null);
+          const business = await getBusinessById(businessId).catch(() => null);
+          transferNumber = business?.transfer_number || null;
         }
-        console.log(`[tenant:${businessId}][${callLogId}] 📞 Transfer setting: ${JSON.stringify(transferNumber)}`);
+        console.log(`[tenant:${businessId}][${callLogId}] 📞 Transfer setting: ${JSON.stringify(transferNumber)} (source: ${fromSettings ? 'settings' : 'column'})`);
         if (!transferNumber) {
           return {
             success: false,

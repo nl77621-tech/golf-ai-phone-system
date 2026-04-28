@@ -901,7 +901,25 @@ async function executeToolCall(toolName, args, ctx) {
           const openSlots = allSlots.filter(s => s.maxPlayers > 0);
 
           if (openSlots.length === 0) {
-            return { available: false, message: `No open tee times showing on the live tee sheet for ${args.date}. This could mean the tee sheet is fully booked, or the online system may not have updated yet. Offer to take a booking request with their preferred date and time — staff will check directly and confirm by text or phone call.` };
+            // Diagnostic logging so ops can see in Railway logs what Tee-On
+            // actually returned. The most common reasons for empty
+            // allSlots: (a) Tee-On's API filters past times so a same-day
+            // query late in the day is empty, (b) advance-booking cutoff
+            // (public callers often can't see >7 days out), (c) a real
+            // tournament/maintenance day, (d) Tee-On session issue.
+            // Without this log we can't tell which.
+            console.log(
+              `[tenant:${businessId}][${callLogId}] check_tee_times empty result for ${args.date} ` +
+              `(party=${partySize}). Raw slot count from teeon=${allSlots.length}, after-holds open=${openSlots.length}. ` +
+              `pendingHoldsCount=${pendingHolds.length}.`
+            );
+            // Friendlier message — never tell the caller "fully booked"
+            // when we genuinely don't know; offer to submit a request and
+            // get staff to confirm directly.
+            return {
+              available: false,
+              message: `I'm not seeing any open tee times for ${args.date} in our online system right now. That could mean a busy day, a private event, an advance-booking window, or the system hasn't refreshed. DO NOT tell the caller "fully booked" — instead, offer to either (1) take a booking request and have staff confirm by text or call, or (2) try a different date. Lead with the offer to take their request.`
+            };
           }
 
           // Format each slot with its remaining capacity. Slots that fit the

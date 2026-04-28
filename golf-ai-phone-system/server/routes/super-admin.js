@@ -793,6 +793,36 @@ router.patch('/businesses/:id', async (req, res) => {
     }
   }
 
+  // ── plan='legacy' lock ─────────────────────────────────────────────────
+  // The audit reviewer flagged this exact path: today's Valleymede outage
+  // was caused by an old (pre-dirty-check) Edit modal silently re-saving
+  // plan='pro' over plan='legacy'. The legacy plan is the safety lock for
+  // the platform's grandfather tenant — once a row is set to legacy, the
+  // credit gate, sidebar branching, and several other paths short-circuit
+  // for it. Letting the PATCH handler change it away from legacy means
+  // any future modal bug, stale client, or curl typo can re-trigger the
+  // same outage. Belt-and-braces refusal at the API layer.
+  //
+  // Going INTO legacy via PATCH is also blocked — legacy is reserved for
+  // id=1 and shouldn't be applied to other tenants by accident. Any
+  // intentional grant of legacy on a new tenant should be a deliberate
+  // SQL UPDATE by ops, not a routine PATCH.
+  if ('plan' in patches) {
+    const newPlan = patches.plan;
+    if (existing.plan === 'legacy' && newPlan !== 'legacy') {
+      return res.status(403).json({
+        error: `Tenant ${id} is on the 'legacy' plan and cannot be moved off it via the API. The legacy plan is the platform's grandfather safety lock; if you need to change it, do so via direct SQL with full awareness of the consequences.`,
+        field: 'plan'
+      });
+    }
+    if (newPlan === 'legacy' && existing.plan !== 'legacy') {
+      return res.status(403).json({
+        error: `'legacy' plan cannot be applied via the API. It's reserved for the platform's grandfather tenant (id=1).`,
+        field: 'plan'
+      });
+    }
+  }
+
   // Settings map. Every entry upserts into settings(business_id, key).
   const settingsMap =
     body.settings && typeof body.settings === 'object' && !Array.isArray(body.settings)

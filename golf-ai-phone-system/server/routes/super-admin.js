@@ -824,11 +824,44 @@ router.patch('/businesses/:id', async (req, res) => {
   }
 
   // Settings map. Every entry upserts into settings(business_id, key).
+  // The audit reviewer flagged that this used to filter only by string
+  // length — meaning any super-admin error or stale modal could write
+  // arbitrary garbage keys (or wrong shapes for known keys) into the
+  // settings table. We now allow-list the known keys actually consumed
+  // by services/system-prompt.js, services/grok-voice.js, and the
+  // various tenant Settings UIs. New keys must be added here AND in the
+  // consuming code, which is the right friction for a multi-tenant SaaS.
+  const ALLOWED_SETTING_KEYS = new Set([
+    // Voice + AI behavior
+    'voice_config', 'ai_personality', 'custom_prompt',
+    // Notifications + delivery
+    'notifications', 'post_call_sms', 'transfer_number', 'test_mode',
+    // Golf-specific (used by buildSystemPrompt)
+    'course_info', 'pricing', 'business_hours', 'policies', 'memberships',
+    'tournaments', 'amenities', 'announcements', 'daily_instructions',
+    'general_knowledge', 'faq', 'seasonal_notes', 'booking_settings',
+    'greetings', 'teeon',
+    // Personal-assistant template specifics
+    'owner_profile', 'schedule_preferences', 'important_contacts',
+    'call_handling_rules',
+    // Restaurant template specifics
+    'restaurant_info', 'menu', 'reservation_policy'
+  ]);
   const settingsMap =
     body.settings && typeof body.settings === 'object' && !Array.isArray(body.settings)
       ? body.settings
       : null;
-  const settingKeys = settingsMap ? Object.keys(settingsMap).filter(k => typeof k === 'string' && k.length > 0 && k.length <= 100) : [];
+  const requestedKeys = settingsMap
+    ? Object.keys(settingsMap).filter(k => typeof k === 'string' && k.length > 0 && k.length <= 100)
+    : [];
+  const rejectedKeys = requestedKeys.filter(k => !ALLOWED_SETTING_KEYS.has(k));
+  const settingKeys = requestedKeys.filter(k => ALLOWED_SETTING_KEYS.has(k));
+  if (rejectedKeys.length > 0) {
+    return res.status(400).json({
+      error: `Unknown settings key(s): ${rejectedKeys.join(', ')}. Allowed keys are managed in routes/super-admin.js. Add the key there + in the consumer if you need a new one.`,
+      rejected_keys: rejectedKeys
+    });
+  }
 
   if (Object.keys(patches).length === 0 && settingKeys.length === 0) {
     return res.status(400).json({ error: 'no recognised fields to update' });

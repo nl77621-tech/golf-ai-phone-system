@@ -14,6 +14,18 @@
  * Audio format: Twilio sends/receives mulaw 8kHz mono. Grok accepts pcm16/24kHz.
  */
 const WebSocket = require('ws');
+// Twilio REST client — used to inject a graceful "we're having trouble"
+// TwiML mid-call when the Grok WebSocket fails. Without this the caller
+// hears 5+ seconds of dead silence before Twilio drops the call.
+let twilioClient = null;
+function getTwilioClient() {
+  if (twilioClient) return twilioClient;
+  if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) return null;
+  try {
+    twilioClient = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+    return twilioClient;
+  } catch (_) { return null; }
+}
 const { buildSystemPrompt } = require('./system-prompt');
 const { sendPostCallSummary } = require('./notification');
 const { lookupByPhone, lookupByName, registerCall, updateCustomer } = require('./caller-lookup');
@@ -314,11 +326,38 @@ ${callerLine}
     }
   });
 
+  // When Grok fails, redirect the in-progress Twilio call to a static
+  // TwiML that says a short apology and hangs up — instead of just
+  // closing our WS and leaving the caller on a dead-air line. The
+  // audit reviewer flagged this as "5 seconds of silence then drop"
+  // which is a terrible caller experience for a service outage.
+  // failoverFired prevents double-firing if multiple handlers run.
+  let failoverFired = false;
+  const playFailoverAndHangup = async (reason) => {
+    if (failoverFired) return;
+    failoverFired = true;
+    try {
+      const client = getTwilioClient();
+      if (!client || !callSid) return;
+      const business = await getBusinessById(businessId).catch(() => null);
+      const tenantName = business?.name || 'us';
+      const xmlEscape = (s) => String(s).replace(/[&<>"']/g, c =>
+        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[c]);
+      const twiml = `<Response><Say voice="alice">Thanks for calling ${xmlEscape(tenantName)}. Our voice system is having a brief hiccup. Please call back in a minute and we'll get you sorted out.</Say><Hangup/></Response>`;
+      await client.calls(callSid).update({ twiml });
+      console.log(`[tenant:${businessId}][${callSid}] Failover TwiML sent (${reason})`);
+    } catch (err) {
+      console.error(`[tenant:${businessId}][${callSid}] Failover dispatch failed:`, err.message);
+    }
+  };
+
   const grokConnectTimeout = setTimeout(() => {
     if (grokWs.readyState !== WebSocket.OPEN) {
-      console.error(`[tenant:${businessId}][${callSid}] Grok connection timeout — closing call`);
-      grokWs.close();
-      if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
+      console.error(`[tenant:${businessId}][${callSid}] Grok connection timeout — playing failover message`);
+      playFailoverAndHangup('connect_timeout').finally(() => {
+        try { grokWs.close(); } catch (_) {}
+        if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
+      });
     }
   }, 5000);
 
@@ -538,9 +577,16 @@ ${callerLine}
     console.log(`[tenant:${businessId}][${callSid}] Grok connection closed`);
     clearInterval(keepAlive);
     if (conversationActive) {
-      console.warn(`[tenant:${businessId}][${callSid}] Grok disconnected unexpectedly while call was active — closing Twilio connection`);
+      console.warn(`[tenant:${businessId}][${callSid}] Grok disconnected unexpectedly while call was active — playing failover message`);
       conversationActive = false;
-      if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
+      // Fire-and-forget failover so the caller hears something instead
+      // of dead air. We close the Twilio WS afterward so Twilio knows
+      // we're done streaming audio; calls.update() supersedes our
+      // <Stream> with a fresh <Say>+<Hangup> on Twilio's side.
+      playFailoverAndHangup('grok_close').finally(() => {
+        if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
+      });
+      return;
     }
     conversationActive = false;
   });
@@ -548,7 +594,9 @@ ${callerLine}
   grokWs.on('error', (err) => {
     console.error(`[tenant:${businessId}][${callSid}] Grok WebSocket error:`, err.message);
     conversationActive = false;
-    if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
+    playFailoverAndHangup('grok_error').finally(() => {
+      if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
+    });
   });
 
   twilioWs.on('message', (data) => {

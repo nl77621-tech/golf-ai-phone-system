@@ -2501,4 +2501,146 @@ router.get('/analytics', async (req, res) => {
   }
 });
 
+// ============================================================================
+// CREDITS — super-admin grant / view
+// ============================================================================
+//
+// Why this exists: when the audit reviewer ran the production-readiness
+// check before today's launch, they flagged that there was no API path
+// to grant credits to a tenant whose trial expired. The `adminAdjust`
+// helper in services/credits.js had been written but never wired to a
+// route, so any non-legacy tenant who exhausted their 14-day / 1-hour
+// trial was bricked with no recovery short of a direct SQL UPDATE.
+// These two endpoints close that gap.
+//
+// Routes:
+//   GET  /api/super/businesses/:id/credits   — current balance + plan + trial state
+//   POST /api/super/businesses/:id/credits   — grant (or deduct) seconds
+//
+// The grant endpoint accepts BOTH minutes (operator-friendly) and
+// seconds (precise) and converts to seconds for the service. We log
+// every grant to audit_log via the existing logEventFromReq path.
+
+// GET — read balance + plan + trial expiry. Used by the Edit Tenant
+// modal to show the current state next to the grant control.
+router.get('/businesses/:id/credits', async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ error: 'invalid business id' });
+  }
+  try {
+    const biz = await getBusinessById(id, { includeDeleted: true });
+    if (!biz) return res.status(404).json({ error: 'Business not found' });
+    const snap = await getBalance(id);
+    res.json({
+      business_id: id,
+      slug: biz.slug,
+      name: biz.name,
+      plan: snap.plan,
+      seconds_remaining: snap.seconds_remaining,
+      minutes_remaining: Math.floor((snap.seconds_remaining || 0) / 60),
+      trial_granted_at: snap.trial_granted_at,
+      trial_expires_at: snap.trial_expires_at,
+      trial_active: !!snap.trial_active
+    });
+  } catch (err) {
+    console.error(`[super] credits GET for ${id} error:`, err.message);
+    res.status(500).json({ error: err.message || 'Failed to read credits' });
+  }
+});
+
+// POST — grant or deduct credits. Body shape (one form is required):
+//   { minutes: 60, note: "comp for May tournament" }
+//   { seconds: 3600, note: "..." }
+// Negative values are deductions (use sparingly — for clawing back a
+// mis-grant; the audit row makes both directions traceable). The
+// `is_free` flag tags the grant in the ledger note so revenue-vs-comp
+// reporting later can split them. Defaults to free=true since most
+// super-admin grants are make-goods, comp, or onboarding boosts; ops
+// can pass `is_free: false` for paid top-ups they're recording manually.
+router.post('/businesses/:id/credits', async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ error: 'invalid business id' });
+  }
+  const body = req.body || {};
+  let deltaSeconds = null;
+  if (Number.isFinite(Number(body.seconds)) && Number(body.seconds) !== 0) {
+    deltaSeconds = Math.trunc(Number(body.seconds));
+  } else if (Number.isFinite(Number(body.minutes)) && Number(body.minutes) !== 0) {
+    deltaSeconds = Math.trunc(Number(body.minutes) * 60);
+  }
+  if (deltaSeconds === null || deltaSeconds === 0) {
+    return res.status(400).json({
+      error: 'Provide a non-zero amount: { minutes: 60 } or { seconds: 3600 }. Negative values deduct.'
+    });
+  }
+  // Sanity cap — refuse anything > 24 hours in a single call. Real
+  // grants are never that big; this catches a typo (60000 instead of
+  // 60) before it lands in the ledger.
+  if (Math.abs(deltaSeconds) > 24 * 60 * 60) {
+    return res.status(400).json({
+      error: `Single-call grant capped at ${24 * 60} minutes. For larger grants, do it in multiple steps so the audit log stays granular.`
+    });
+  }
+
+  const note = typeof body.note === 'string' ? body.note.trim().slice(0, 200) : '';
+  const isFree = body.is_free === false ? false : true;
+
+  try {
+    const biz = await getBusinessById(id);
+    if (!biz) return res.status(404).json({ error: 'Business not found' });
+
+    // Legacy tenants don't go through the credit gate at all (canAcceptCall
+    // short-circuits on plan='legacy'), so granting them seconds is a no-op
+    // for call routing. Refuse to keep the ledger sensible.
+    if (biz.plan === 'legacy') {
+      return res.status(409).json({
+        error: 'Tenant is on the legacy plan and bypasses the credit gate. Grant has no effect — refusing to clutter the ledger.'
+      });
+    }
+
+    const result = await adminAdjust(id, {
+      deltaSeconds,
+      note,
+      createdByUserId: req.auth?.user_id || null,
+      isFree
+    });
+
+    await logEventFromReq(req, {
+      businessId: id,
+      action: 'credits.granted_by_super',
+      targetType: 'business',
+      targetId: id,
+      meta: {
+        delta_seconds: deltaSeconds,
+        delta_minutes: Math.round(deltaSeconds / 60),
+        balance_after_seconds: result.balanceAfter,
+        ledger_id: result.ledgerId,
+        is_free: isFree,
+        note
+      }
+    }).catch(() => {});
+
+    console.log(
+      `[super] Credit grant on tenant ${id} (${biz.slug}): ` +
+      `${deltaSeconds > 0 ? '+' : ''}${deltaSeconds}s ` +
+      `(now ${result.balanceAfter}s) by super_admin ${req.auth?.user_id || '?'}`
+    );
+    res.json({
+      ok: true,
+      business_id: id,
+      delta_seconds: deltaSeconds,
+      delta_minutes: Math.round(deltaSeconds / 60),
+      balance_after_seconds: result.balanceAfter,
+      balance_after_minutes: Math.floor(result.balanceAfter / 60),
+      ledger_id: result.ledgerId,
+      reason: result.reason
+    });
+  } catch (err) {
+    console.error(`[super] credits POST for ${id} error:`, err.message);
+    res.status(500).json({ error: err.message || 'Failed to grant credits' });
+  }
+});
+
 module.exports = router;

@@ -2963,6 +2963,156 @@ function BusinessCard({ business, onActAs, onManagePhones, onManageVoice, onEdit
 // it and shares the new one out-of-band. That's the same flow every
 // reputable platform uses (banks, GitHub, Twilio, etc.) and is a hard
 // requirement of password hashing.
+// ============================================
+// CREDITS PANEL — read balance + grant credits (Phase 7b)
+// ============================================
+//
+// Mounted inside the Edit Tenant modal. Shows the tenant's plan,
+// remaining seconds (formatted as minutes), trial expiry if any, and
+// gives the super-admin a one-click way to grant more time. Closes the
+// pre-launch gap flagged by the audit reviewer: without this, any
+// non-legacy tenant whose 14-day / 1-hour trial expired had no recovery
+// path other than direct SQL.
+//
+// Legacy-plan tenants (Valleymede id=1) bypass the credit gate entirely
+// in canAcceptCall, so granting them seconds is a no-op. The server
+// returns 409 in that case and we surface it as a helpful banner instead
+// of an error.
+function CreditsPanel({ businessId }) {
+  const [snap, setSnap] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [minutes, setMinutes] = useState(60);
+  const [note, setNote] = useState('');
+  const [isFree, setIsFree] = useState(true);
+  const [granting, setGranting] = useState(false);
+  const [lastGrant, setLastGrant] = useState(null);
+
+  const reload = () => {
+    setLoading(true);
+    api(`/api/super/businesses/${businessId}/credits`)
+      .then(d => setSnap(d))
+      .catch(err => setError(err.message || 'Failed to load credits'))
+      .finally(() => setLoading(false));
+  };
+  useEffect(() => { if (businessId) reload(); }, [businessId]);
+
+  const grant = async () => {
+    const n = parseInt(minutes, 10);
+    if (!Number.isFinite(n) || n === 0) {
+      setError('Enter a non-zero number of minutes (negative deducts).');
+      return;
+    }
+    setGranting(true);
+    setError('');
+    setLastGrant(null);
+    try {
+      const result = await api(`/api/super/businesses/${businessId}/credits`, {
+        method: 'POST',
+        body: JSON.stringify({ minutes: n, note: note.trim() || null, is_free: isFree })
+      });
+      setLastGrant(result);
+      setNote('');
+      reload();
+    } catch (err) {
+      setError(err.message || 'Grant failed');
+    } finally {
+      setGranting(false);
+    }
+  };
+
+  if (loading) return React.createElement('p', { className: 'text-sm text-gray-500' }, 'Loading credits…');
+
+  // Legacy tenants don't go through the credit gate, so the controls
+  // are useless. Show a clear note instead of a broken form.
+  if (snap?.plan === 'legacy') {
+    return React.createElement('div', { className: 'text-sm text-gray-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2' },
+      React.createElement('strong', null, 'Plan: legacy. '),
+      'This tenant bypasses the credit gate (every call is allowed regardless of balance). Granting credits has no effect.'
+    );
+  }
+
+  const minutesRemaining = snap?.minutes_remaining ?? 0;
+  const trialActive = !!snap?.trial_active;
+  const trialExpiry = snap?.trial_expires_at ? new Date(snap.trial_expires_at) : null;
+
+  return React.createElement('div', null,
+    error && React.createElement('div', {
+      className: 'mb-2 text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2'
+    }, error),
+
+    // Current state row
+    React.createElement('div', { className: 'flex items-baseline gap-4 mb-3 text-sm' },
+      React.createElement('span', null,
+        React.createElement('span', { className: 'text-gray-500' }, 'Plan: '),
+        React.createElement('span', { className: 'font-semibold' }, snap?.plan || '—')
+      ),
+      React.createElement('span', null,
+        React.createElement('span', { className: 'text-gray-500' }, 'Balance: '),
+        React.createElement('span', { className: `font-semibold ${minutesRemaining > 0 ? 'text-green-700' : 'text-red-700'}` },
+          `${minutesRemaining} min${minutesRemaining === 1 ? '' : 's'}`)
+      ),
+      trialActive && trialExpiry && React.createElement('span', { className: 'text-xs text-gray-500' },
+        `Trial expires ${trialExpiry.toLocaleString()}`
+      )
+    ),
+
+    // Grant form — minutes + note + free/paid toggle. Negative minutes
+    // deducts (rare; the server caps single grants at 24h to prevent
+    // typos like 60000 instead of 60).
+    React.createElement('div', { className: 'border-t pt-3 space-y-2' },
+      React.createElement('div', { className: 'grid grid-cols-2 gap-2' },
+        React.createElement('div', null,
+          React.createElement('label', { className: 'text-xs text-gray-600 block mb-1' }, 'Minutes to grant'),
+          React.createElement('input', {
+            type: 'number',
+            value: minutes,
+            onChange: e => setMinutes(e.target.value),
+            placeholder: '60',
+            className: 'w-full text-sm border rounded-lg px-3 py-2'
+          })
+        ),
+        React.createElement('div', null,
+          React.createElement('label', { className: 'text-xs text-gray-600 block mb-1' }, 'Type'),
+          React.createElement('select', {
+            value: isFree ? 'free' : 'paid',
+            onChange: e => setIsFree(e.target.value === 'free'),
+            className: 'w-full text-sm border rounded-lg px-3 py-2 bg-white'
+          },
+            React.createElement('option', { value: 'free' }, 'Free / comp'),
+            React.createElement('option', { value: 'paid' }, 'Paid (recorded externally)')
+          )
+        )
+      ),
+      React.createElement('input', {
+        type: 'text',
+        value: note,
+        onChange: e => setNote(e.target.value),
+        placeholder: 'Note (optional, e.g. "comp for May tournament")',
+        className: 'w-full text-sm border rounded-lg px-3 py-2'
+      }),
+      React.createElement('div', { className: 'flex items-center gap-2' },
+        React.createElement('button', {
+          onClick: grant,
+          disabled: granting,
+          className: 'text-sm px-3 py-1.5 rounded-lg bg-golf-600 hover:bg-golf-700 text-white disabled:opacity-50'
+        }, granting ? 'Granting…' : 'Grant credits'),
+        React.createElement('span', { className: 'text-[11px] text-gray-500' },
+          'Negative minutes deducts. Single grant capped at 1440 min (24h).'
+        )
+      )
+    ),
+
+    lastGrant && React.createElement('div', {
+      className: 'mt-3 text-xs text-green-800 bg-green-50 border border-green-200 rounded-lg px-3 py-2'
+    },
+      `✓ Granted ${lastGrant.delta_minutes >= 0 ? '+' : ''}${lastGrant.delta_minutes} min · `,
+      `New balance: ${lastGrant.balance_after_minutes} min · `,
+      `Ledger #${lastGrant.ledger_id}`
+    )
+  );
+}
+
 function TenantUsersPanel({ businessId, endpointBase: endpointBaseProp }) {
   // Two callers, one component:
   //   - Super Admin → Edit Tenant modal: passes businessId, hits
@@ -3765,6 +3915,12 @@ function EditTenantModal({ business, onClose, onSaved }) {
                   React.createElement('span', null, 'Is active (inbound calls accepted)')
                 )
               )
+            ),
+
+            // ---------- Credits (super-admin grant) ----------
+            React.createElement('section', null,
+              React.createElement('h3', { className: 'text-xs font-bold uppercase tracking-wide text-gray-500 mb-2' }, 'Credits'),
+              React.createElement(CreditsPanel, { businessId: business.id })
             ),
 
             // ---------- Users + password reset ----------

@@ -1091,11 +1091,14 @@ router.post('/team', requireBusinessAdmin, async (req, res) => {
     if (err.code === '23505') {
       return res.status(409).json({ error: `A team member named "${req.body?.name}" already exists.` });
     }
-    if (/required|valid phone/i.test(err.message)) {
+    if (/required|valid phone|channel|empty|provide/i.test(err.message)) {
       return res.status(400).json({ error: err.message });
     }
     console.error(`[tenant:${businessId}] Team create error:`, err.message);
-    res.status(500).json({ error: 'Failed to create team member' });
+    // Surface the underlying message so the operator can act on it
+    // (e.g. CHECK constraint violations from the DB show up clearly
+    // instead of being swallowed as a generic 500).
+    res.status(500).json({ error: err.message || 'Failed to create team member' });
   }
 });
 

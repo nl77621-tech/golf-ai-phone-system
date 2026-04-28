@@ -22,7 +22,9 @@ const crypto = require('crypto');
 const { query, getBusinessById } = require('../config/database');
 const { requireBusinessId } = require('../context/tenant-context');
 const { sendSMS } = require('./notification');
-const { normalizeToE164 } = require('./caller-lookup');
+// caller-lookup exports `normalizePhone` (same E.164 formatter, slightly
+// different name). Alias here for readability.
+const { normalizePhone: normalizeToE164 } = require('./caller-lookup');
 
 const BCRYPT_ROUNDS = 10;
 const PASSWORD_MIN = 8;

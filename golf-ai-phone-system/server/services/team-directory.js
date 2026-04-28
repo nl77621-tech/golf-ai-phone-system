@@ -14,7 +14,11 @@
 const { pool, query } = require('../config/database');
 const { requireBusinessId } = require('../context/tenant-context');
 const { sendSMS, sendEmail } = require('./notification');
-const { normalizeToE164 } = require('./caller-lookup');
+// caller-lookup exports `normalizePhone` (not `normalizeToE164`).
+// Both names mean the same thing — accept any reasonable input and
+// return +1XXXXXXXXXX. We alias to E164 here so the rest of this
+// file reads cleanly.
+const { normalizePhone: normalizeToE164 } = require('./caller-lookup');
 
 const NAME_MAX = 80;
 const ROLE_MAX = 80;

@@ -988,80 +988,116 @@ async function executeToolCall(toolName, args, ctx) {
             };
           }
 
-          // Format each slot with its remaining capacity. Slots that fit the
-          // requested party get just the time; tighter slots get "(N seats)"
-          // so the AI can describe them honestly.
-          const fmt = (s) => s.maxPlayers >= partySize ? s.time : `${s.time} (${s.maxPlayers} seat${s.maxPlayers === 1 ? '' : 's'})`;
-
+          // Split every category into "fits the party" vs "partial capacity"
+          // BEFORE building the message. Partial slots can't be the headline
+          // answer for a party of N — they're only useful if the caller is
+          // willing to split or if no full-fit slot exists. Mixing the two
+          // in the same line confused the AI: it would read out the first
+          // few times in time order, which often hits partial slots first
+          // and never warns the caller they don't fit.
           const full18 = openSlots.filter(s => s.holes === 18);
           const back9 = openSlots.filter(s => s.holes === 9);
-          const morning18 = full18.filter(s => s.time.includes('AM'));
-          const afternoon18 = full18.filter(s => s.time.includes('PM'));
-          const morningBack9 = back9.filter(s => s.time.includes('AM'));
-          const fitsParty = openSlots.filter(s => s.maxPlayers >= partySize).length;
 
-          // Highlights — used in the rules section below so the AI can
-          // lead its answer with the right facts. Compute these BEFORE
-          // assembling the main message so they're always available to
-          // the AI, not gated on a "different slot" branch that might
-          // confuse the model.
-          const earliestAny18 = full18[0] || null;
-          const earliestFits18 = full18.find(s => s.maxPlayers >= partySize) || null;
-          const fitsList = openSlots.filter(s => s.maxPlayers >= partySize).map(s => s.time);
+          const full18Fits = full18.filter(s => s.maxPlayers >= partySize);
+          const full18Partial = full18.filter(s => s.maxPlayers < partySize);
+          const back9Fits = back9.filter(s => s.maxPlayers >= partySize);
+          const back9Partial = back9.filter(s => s.maxPlayers < partySize);
 
-          let message = `LIVE tee sheet for ${args.date}: ${openSlots.length} open slot${openSlots.length === 1 ? '' : 's'} on the sheet right now.\n`;
+          const morning18Fits = full18Fits.filter(s => s.time.includes('AM'));
+          const afternoon18Fits = full18Fits.filter(s => s.time.includes('PM'));
+          const morning18Partial = full18Partial.filter(s => s.time.includes('AM'));
+          const afternoon18Partial = full18Partial.filter(s => s.time.includes('PM'));
+          const morningBack9Fits = back9Fits.filter(s => s.time.includes('AM'));
+          const morningBack9Partial = back9Partial.filter(s => s.time.includes('AM'));
 
+          const fitsParty = full18Fits.length + back9Fits.length;
 
-          if (morning18.length > 0) {
-            message += `\nMorning 18-hole times: ${morning18.map(fmt).join(', ')}`;
-            if (morning18[0].price) message += ` (${morning18[0].price} each)`;
+          // Highlights — computed up front so the AI sees them in KEY FACTS
+          // regardless of which category section happened to render.
+          const earliestFits18 = full18Fits[0] || null;
+          const earliestPartial18 = full18Partial[0] || null;
+          const fitsList18 = full18Fits.map(s => s.time);
+
+          // Format helper. For partial slots ALWAYS show seat count so the
+          // AI can never accidentally treat them as full-fit times.
+          const fmtPartial = (s) => `${s.time} (only ${s.maxPlayers} seat${s.maxPlayers === 1 ? '' : 's'})`;
+
+          let message = `LIVE tee sheet for ${args.date}, party of ${partySize}: ${openSlots.length} open slot${openSlots.length === 1 ? '' : 's'} total — ${fitsParty} of those fit your full party of ${partySize}.\n`;
+
+          // ---------- TIMES THAT FIT THE FULL PARTY (the headline answer) ----------
+          if (full18Fits.length > 0 || back9Fits.length > 0) {
+            message += `\n=== TIMES THAT FIT YOUR FULL PARTY OF ${partySize} ===`;
+            if (morning18Fits.length > 0) {
+              message += `\nMorning 18-hole: ${morning18Fits.map(s => s.time).join(', ')}`;
+              if (morning18Fits[0].price) message += ` (${morning18Fits[0].price} each)`;
+            }
+            if (afternoon18Fits.length > 0) {
+              const earlyPM = afternoon18Fits.slice(0, 6);
+              message += `\nAfternoon 18-hole: ${earlyPM.map(s => s.time).join(', ')}`;
+              if (afternoon18Fits.length > 6) message += ` and ${afternoon18Fits.length - 6} more`;
+              const latePM = afternoon18Fits.filter(s => {
+                const h = parseInt(s.time.split(':')[0]);
+                return s.time.includes('PM') && h >= 3 && h < 6;
+              });
+              if (latePM.length > 0 && latePM[0].price && latePM[0].price !== morning18Fits?.[0]?.price) {
+                message += ` (twilight rate ${latePM[0].price} starts around 3 PM)`;
+              }
+            }
+            if (morningBack9Fits.length > 0) {
+              message += `\nMorning 9-hole (back nine, starts hole 10): ${morningBack9Fits.map(s => s.time).join(', ')}`;
+              if (morningBack9Fits[0].price) message += ` (${morningBack9Fits[0].price} each)`;
+            }
+          } else {
+            message += `\n=== NO TIMES FIT ALL ${partySize} PLAYERS TODAY ===`;
+            message += `\nThere are open seats on the sheet but no single slot has ${partySize} consecutive open spots. Options for the caller:`;
+            message += `\n  1. Split the group across two adjacent partial slots (e.g. a pair + a single).`;
+            message += `\n  2. Downsize the party (e.g. 2 of you go now, 1 follows another day).`;
+            message += `\n  3. Try a different date — staff often have moves coming.`;
+            message += `\n  4. Take a booking REQUEST and let staff confirm by text/phone.`;
           }
 
-          if (afternoon18.length > 0) {
-            const earlyPM = afternoon18.slice(0, 6);
-            const latePM = afternoon18.filter(s => {
-              const h = parseInt(s.time.split(':')[0]);
-              const isPM = s.time.includes('PM');
-              return isPM && h >= 3 && h < 6;
-            });
-            message += `\nAfternoon 18-hole times: ${earlyPM.map(fmt).join(', ')}`;
-            if (afternoon18.length > 6) message += ` and ${afternoon18.length - 6} more`;
-            if (latePM.length > 0 && latePM[0].price && latePM[0].price !== morning18?.[0]?.price) {
-              message += ` (twilight rate ${latePM[0].price} starts around 3 PM)`;
+          // ---------- PARTIAL SLOTS (only mention if asked OR if no full-fit) ----------
+          // Always include the data so the AI has it when the caller asks
+          // "what about earlier times?" or volunteers to split — but flag
+          // it loudly so the AI never opens with these.
+          const hasPartial = full18Partial.length + back9Partial.length > 0;
+          if (hasPartial) {
+            message += `\n\n=== PARTIAL-CAPACITY SLOTS (DO NOT OFFER UNLESS CALLER ASKS OR NO FULL-FIT EXISTS) ===`;
+            message += `\nThese are open but have FEWER than ${partySize} seats — your party would need to split or downsize.`;
+            if (morning18Partial.length > 0) {
+              message += `\nMorning 18-hole partial: ${morning18Partial.slice(0, 6).map(fmtPartial).join(', ')}`;
+              if (morning18Partial.length > 6) message += ` and ${morning18Partial.length - 6} more`;
+            }
+            if (afternoon18Partial.length > 0) {
+              message += `\nAfternoon 18-hole partial: ${afternoon18Partial.slice(0, 6).map(fmtPartial).join(', ')}`;
+              if (afternoon18Partial.length > 6) message += ` and ${afternoon18Partial.length - 6} more`;
+            }
+            if (morningBack9Partial.length > 0) {
+              message += `\nMorning 9-hole partial: ${morningBack9Partial.slice(0, 4).map(fmtPartial).join(', ')}`;
             }
           }
 
-          if (morningBack9.length > 0) {
-            message += `\nMorning 9-hole only (back nine, starts hole 10): ${morningBack9.map(fmt).join(', ')}`;
-            if (morningBack9[0].price) message += ` (${morningBack9[0].price} each)`;
-          }
-
-          // Summary section — flat facts the AI can quote directly without
-          // having to interpret. Always present, regardless of capacity.
+          // ---------- KEY FACTS — flat facts the AI can quote directly ----------
           message += `\n\nKEY FACTS:`;
-          if (earliestAny18) {
-            const seatNote = earliestAny18.maxPlayers >= partySize
-              ? `(fits all ${partySize})`
-              : `(only ${earliestAny18.maxPlayers} of 4 seats — party of ${partySize} would need to split)`;
-            message += `\n• Earliest open 18-hole slot: ${earliestAny18.time} ${seatNote}`;
+          if (earliestFits18) {
+            message += `\n• Earliest 18-hole that fits all ${partySize}: ${earliestFits18.time}`;
           }
-          if (earliestFits18 && (!earliestAny18 || earliestFits18.time !== earliestAny18.time)) {
-            message += `\n• Earliest 18-hole that fits all ${partySize} players: ${earliestFits18.time}`;
+          if (fitsList18.length > 0) {
+            const sample = fitsList18.slice(0, 6).join(', ');
+            message += `\n• All 18-hole times that fit ${partySize}: ${sample}${fitsList18.length > 6 ? ` and ${fitsList18.length - 6} more` : ''}`;
           }
-          if (fitsList.length > 0) {
-            const sample = fitsList.slice(0, 6).join(', ');
-            message += `\n• 18-hole times that fit all ${partySize} players today: ${sample}${fitsList.length > 6 ? ` and ${fitsList.length - 6} more` : ''}`;
-          } else if (openSlots.length > 0) {
-            message += `\n• No 18-hole slot today has all ${partySize} seats open, but ${openSlots.length} slot${openSlots.length === 1 ? '' : 's'} have partial seats. Offer to split the group, downsize, or try a different day — DO NOT say "no tee times available" because the slots ARE open, just not for a full party of ${partySize}.`;
+          if (!earliestFits18 && earliestPartial18) {
+            message += `\n• No 18-hole slot fits all ${partySize}. Earliest partial 18-hole is ${earliestPartial18.time} with only ${earliestPartial18.maxPlayers} seat${earliestPartial18.maxPlayers === 1 ? '' : 's'}.`;
           }
 
-          message += `\n\nRULES:
-- Times shown as "7:30" have all 4 seats open. Times shown as "7:14 (3 seats)" have fewer seats.
-- ALWAYS use the actual data above to answer. NEVER say "no available times" if there are any open slots, even partial ones — describe what IS open and offer the caller a path (split, downsize, switch dates).
-- When the caller asks for "earliest" — lead with the earliest open slot (any capacity) and its seat count, then mention the earliest full-fit slot if different.
-- If they ask about a specific time, just answer for that time directly.
+          // ---------- HARD RULES — strongly-worded so the AI doesn't drift ----------
+          message += `\n\nRULES (FOLLOW EXACTLY):
+- The caller asked for a party of ${partySize}. Your default answer MUST come from the "TIMES THAT FIT YOUR FULL PARTY" section above. NEVER offer a partial-capacity slot as if it fits — those slots have FEWER than ${partySize} seats and would force the group to split.
+- When the caller asks for "earliest" or "what's available" — lead with the EARLIEST FULL-FIT time. Do NOT lead with a partial slot. Only mention partial slots if (a) the caller explicitly asks about a different time, (b) the caller volunteers to split the group, or (c) no full-fit slot exists at all.
+- If NO full-fit slot exists today, say so plainly: "I'm not seeing a single tee time that has all ${partySize} of you together on ${args.date}. I have a couple of slots with 1 or 2 seats — would you want to split the group, try a different day, or have me take a request and let staff confirm by text?"
+- If they ask about a SPECIFIC time, answer for that time directly — including its seat count if it's partial.
 - 18 holes = start hole 1, full course. 9 holes = start hole 10, back nine only.
-- ONLY offer times from this list.`;
+- ONLY offer times from the lists above. Never invent a time.`;
 
           console.log(`[tenant:${businessId}][${callLogId}] Tee times for ${args.date}: ${openSlots.length} open (${fitsParty} fit ${partySize}); ${full18.length} 18-hole / ${back9.length} 9-hole`);
           return { available: true, date: args.date, partySize, total: openSlots.length, fits_party: fitsParty, message };

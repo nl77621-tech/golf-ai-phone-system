@@ -1094,11 +1094,14 @@ router.post('/team', requireBusinessAdmin, async (req, res) => {
     if (/required|valid phone|channel|empty|provide/i.test(err.message)) {
       return res.status(400).json({ error: err.message });
     }
+    // Don't echo the raw err.message to the client on 500 — that leaks
+    // Postgres CHECK constraint names, internal stack details, and other
+    // server-side specifics. Validation problems already get caught by
+    // the 400-band matcher above with a friendly message; anything that
+    // falls through to here is an unexpected internal failure that ops
+    // reads from logs, not a value to surface to the caller.
     console.error(`[tenant:${businessId}] Team create error:`, err.message);
-    // Surface the underlying message so the operator can act on it
-    // (e.g. CHECK constraint violations from the DB show up clearly
-    // instead of being swallowed as a generic 500).
-    res.status(500).json({ error: err.message || 'Failed to create team member' });
+    res.status(500).json({ error: 'Failed to create team member' });
   }
 });
 

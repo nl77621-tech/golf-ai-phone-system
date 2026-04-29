@@ -7091,17 +7091,30 @@ function App() {
   //   (looked up from the loaded business list); null when no act-as.
   // - Unset color (Valleymede, generic-template tenants): null →
   //   applyBrand() removes the override so the original golf palette wins.
+  //
+  // Race note: super-admin's businesses[] is empty until /api/super/
+  // businesses resolves on first paint. If we called applyBrand
+  // unconditionally we'd briefly apply null (default green) then flip
+  // to the brand color — a visible flash. So skip the call when
+  // selectedBusinessId is set but the list hasn't loaded yet.
   useEffect(() => {
     let color = null;
+    let skip = false;
     if (session?.role === 'super_admin') {
       if (selectedBusinessId) {
-        const biz = businesses.find(b => b.id === selectedBusinessId);
-        color = biz?.primary_color || null;
+        if (businesses.length === 0) {
+          // Still loading — don't flash. The next render (after the list
+          // arrives) will set the real color.
+          skip = true;
+        } else {
+          const biz = businesses.find(b => b.id === selectedBusinessId);
+          color = biz?.primary_color || null;
+        }
       }
     } else if (session) {
       color = session.primary_color || null;
     }
-    applyBrand(color);
+    if (!skip) applyBrand(color);
   }, [session, selectedBusinessId, businesses]);
 
   // On mount, rehydrate the session from /auth/verify if we have a token

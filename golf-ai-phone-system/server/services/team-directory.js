@@ -19,6 +19,9 @@ const { sendSMS, sendEmail } = require('./notification');
 // return +1XXXXXXXXXX. We alias to E164 here so the rest of this
 // file reads cleanly.
 const { normalizePhone: normalizeToE164 } = require('./caller-lookup');
+// Live updates — same eventBus the booking-manager uses to push booking
+// changes to open Command Center tabs. Failing publish is non-fatal.
+const eventBus = require('./event-bus');
 
 const NAME_MAX = 80;
 const ROLE_MAX = 80;
@@ -336,7 +339,13 @@ function formatTeamMessageSms({ recipientName, callerName, callerPhone, message,
  * a recipient can scan it on their phone, but readable on desktop too.
  */
 function formatTeamMessageEmail({ recipientName, callerName, callerPhone, message, businessName, routedToDefault }) {
-  const safe = (s) => String(s || '').replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+  // Escape every HTML-significant char including quotes — defense-in-depth
+  // for attribute contexts like `href="tel:${safe(callerPhone)}"`. callerPhone
+  // is upstream-normalized to E.164 (digits + leading +) so a `"` here is
+  // theoretical, but a one-char addition closes the gap.
+  const safe = (s) => String(s || '').replace(/[&<>"']/g, c => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
   const headerNote = routedToDefault
     ? `<p style="margin:0 0 12px; color:#92400e; background:#fef3c7; padding:8px 12px; border-radius:6px; font-size:13px;">⚠️ The caller didn't name a specific person, so this was routed to you as the default recipient.</p>`
     : '';
@@ -407,6 +416,21 @@ async function sendMessageToTeamMember(businessId, memberId, payload) {
   );
   const messageRowId = insertRes.rows[0].id;
 
+  // Live broadcast — every Command Center tab open on this tenant
+  // gets a `team_message.created` event so the Messages page can
+  // re-fetch without polling. Best-effort: a publish failure must not
+  // affect SMS/email dispatch below.
+  try {
+    eventBus.publish(businessId, 'team_message.created', {
+      id: messageRowId,
+      recipient_id: member.id,
+      recipient_name: member.name,
+      caller_name: callerName,
+      channel: channelLabel,
+      routed_to_default: routedToDefault
+    });
+  } catch (_) { /* swallow — SSE failure must not break call flow */ }
+
   // 2) Fire each channel best-effort. Failures don't throw — they get
   //    captured into delivery_detail and the row's final status reflects
   //    the partial state ("sent" / "partial" / "failed" / "dashboard_only").
@@ -473,6 +497,17 @@ async function sendMessageToTeamMember(businessId, memberId, payload) {
       WHERE id = $3 AND business_id = $4`,
     [finalStatus, JSON.stringify(detail), messageRowId, businessId]
   );
+
+  // Broadcast the dispatch outcome so the Messages page swaps the row's
+  // "Sending…" badge for "Delivered" / "Partial" / "Failed" without a
+  // manual refresh. Same try/swallow pattern.
+  try {
+    eventBus.publish(businessId, 'team_message.updated', {
+      id: messageRowId,
+      status: finalStatus,
+      channel: channelLabel
+    });
+  } catch (_) { /* non-fatal */ }
 
   return {
     delivered: finalStatus === 'sent' || finalStatus === 'partial',

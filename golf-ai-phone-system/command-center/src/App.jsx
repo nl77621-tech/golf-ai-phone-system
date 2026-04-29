@@ -684,17 +684,19 @@ function BookingsPage() {
                       React.createElement('div', { className: 'flex items-center gap-3 flex-wrap' },
                         React.createElement('span', { className: 'font-semibold' }, b.customer_name || 'Unknown'),
                         React.createElement('span', { className: `px-2 py-0.5 rounded-full text-xs ${statusColors[b.status] || ''}` }, b.status),
-                        // Holes badge \u2014 most visible discriminator. Color-coded
-                        // so 9 vs 18 stands out at a glance (a real customer
-                        // got booked for the wrong number of holes when this
-                        // wasn't surfaced; staff was burned). NULL on rows
-                        // booked before migration 010.
+                        // Holes badge \u2014 LARGE on purpose. A real customer was
+                        // booked for the wrong number of holes when this was
+                        // surfaced as a tiny text-xs pill; staff missed it. We
+                        // upsize the 9 / 18 markers so they\u2019re the most visible
+                        // thing in the row aside from the customer name. NULL
+                        // rows (pre-migration 010) stay subtle so they don\u2019t
+                        // visually compete with real, captured data.
                         b.holes === 18 && React.createElement('span', {
-                          className: 'px-2 py-0.5 rounded-full text-xs font-bold bg-emerald-100 text-emerald-800'
-                        }, '\u26f3 18 holes'),
+                          className: 'px-3 py-1.5 rounded-lg text-base font-bold bg-emerald-100 text-emerald-800 border-2 border-emerald-300 shadow-sm'
+                        }, '\u26f3 18 HOLES'),
                         b.holes === 9 && React.createElement('span', {
-                          className: 'px-2 py-0.5 rounded-full text-xs font-bold bg-amber-100 text-amber-800'
-                        }, '\u26f3 9 holes (back nine)'),
+                          className: 'px-3 py-1.5 rounded-lg text-base font-bold bg-amber-100 text-amber-800 border-2 border-amber-300 shadow-sm'
+                        }, '\u26f3 9 HOLES (back nine)'),
                         b.holes == null && React.createElement('span', {
                           className: 'px-2 py-0.5 rounded-full text-xs bg-gray-100 text-gray-600',
                           title: 'Holes not captured at booking time \u2014 confirm with caller before approving'

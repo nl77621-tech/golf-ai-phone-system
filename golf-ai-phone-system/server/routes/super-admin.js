@@ -162,7 +162,7 @@ router.get('/businesses', async (req, res) => {
     const { rows } = await query(
       `SELECT b.id, b.slug, b.name, b.twilio_phone_number, b.transfer_number,
               b.timezone, b.status, b.is_active, b.plan, b.setup_complete,
-              b.template_key,
+              b.template_key, b.primary_color,
               b.credit_seconds_remaining, b.trial_granted_at, b.trial_expires_at,
               b.deleted_at, b.deleted_by_user_id,
               b.created_at, b.updated_at, b.contact_email, b.contact_phone,

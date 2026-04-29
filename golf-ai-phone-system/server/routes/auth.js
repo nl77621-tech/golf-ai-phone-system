@@ -88,6 +88,11 @@ router.post('/login', async (req, res) => {
           result.template_key = biz.template_key || null;
           result.plan = biz.plan || null;
           result.business_name = biz.name || null;
+          // primary_color drives the tenant's brand UI (sidebar, primary
+          // buttons, active tabs). Null when ops never set one — the
+          // client falls back to the golf-green default so Valleymede
+          // and any unconfigured tenant render identically.
+          result.primary_color = biz.primary_color || null;
         }
       } catch (err) {
         console.warn('[auth/login] template_key lookup failed:', err.message);
@@ -95,6 +100,7 @@ router.post('/login', async (req, res) => {
     } else {
       result.template_key = null;
       result.plan = null;
+      result.primary_color = null;
     }
 
     // Audit — fire-and-forget. The login result contains the role +
@@ -130,6 +136,7 @@ router.get('/verify', requireAuth, async (req, res) => {
   let template_key = null;
   let plan = null;
   let business_name = null;
+  let primary_color = null;
   if (Number.isInteger(req.auth.business_id) && req.auth.business_id > 0) {
     try {
       const biz = await getBusinessById(req.auth.business_id);
@@ -137,6 +144,7 @@ router.get('/verify', requireAuth, async (req, res) => {
         template_key = biz.template_key || null;
         plan = biz.plan || null;
         business_name = biz.name || null;
+        primary_color = biz.primary_color || null;
       }
     } catch (err) {
       // Non-fatal — fall through to null so the UI renders the default
@@ -153,7 +161,8 @@ router.get('/verify', requireAuth, async (req, res) => {
       username: req.auth.username,
       template_key,
       plan,
-      business_name
+      business_name,
+      primary_color
     }
   });
 });

@@ -54,6 +54,154 @@ function clearAuth() {
   localStorage.removeItem('gc_selected_business');
 }
 
+// ============================================
+// Brand color theming
+// ============================================
+//
+// The wizard captures a `primary_color` (hex) per tenant, but every
+// component in this file uses hardcoded Tailwind `golf-XXX` classes
+// (golf-600 backgrounds, golf-700 hover, golf-200 sidebar text, etc.)
+// from a build-time palette. Replacing every class would mean editing
+// hundreds of lines and risking regressions on Valleymede.
+//
+// Instead, we apply the brand at runtime by *remapping* the existing
+// golf classes to the tenant's color via injected CSS:
+//
+//   1. Compute lighter/darker shades from the chosen hex via HSL.
+//   2. Inject one <style> tag whose selectors override the known
+//      golf-XXX background / text / border classes with the new shades.
+//   3. Every component that already uses `bg-golf-600` automatically
+//      picks up the new color — no component-level changes required.
+//
+// Valleymede has primary_color = NULL → applyBrand(null) removes the
+// override sheet, so the original Tailwind palette wins. Pixel-identical
+// to the pre-change UI.
+// ============================================
+
+function _hexToHsl(hex) {
+  if (!hex || typeof hex !== 'string') return null;
+  const m = hex.trim().replace('#', '');
+  if (!/^[0-9a-f]{6}$/i.test(m)) return null;
+  const r = parseInt(m.slice(0, 2), 16) / 255;
+  const g = parseInt(m.slice(2, 4), 16) / 255;
+  const b = parseInt(m.slice(4, 6), 16) / 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  let h = 0, s = 0;
+  const l = (max + min) / 2;
+  if (max !== min) {
+    const d = max - min;
+    s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    switch (max) {
+      case r: h = (g - b) / d + (g < b ? 6 : 0); break;
+      case g: h = (b - r) / d + 2; break;
+      case b: h = (r - g) / d + 4; break;
+    }
+    h *= 60;
+  }
+  return [h, s, l];
+}
+
+function _hslToHex(h, s, l) {
+  s = Math.max(0, Math.min(1, s));
+  l = Math.max(0, Math.min(1, l));
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const hp = (h / 60) % 6;
+  const x = c * (1 - Math.abs((hp % 2) - 1));
+  let r, g, b;
+  if (0 <= hp && hp < 1)      [r, g, b] = [c, x, 0];
+  else if (1 <= hp && hp < 2) [r, g, b] = [x, c, 0];
+  else if (2 <= hp && hp < 3) [r, g, b] = [0, c, x];
+  else if (3 <= hp && hp < 4) [r, g, b] = [0, x, c];
+  else if (4 <= hp && hp < 5) [r, g, b] = [x, 0, c];
+  else                        [r, g, b] = [c, 0, x];
+  const m = l - c / 2;
+  const toHex = (n) => Math.round((n + m) * 255).toString(16).padStart(2, '0');
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+}
+
+/**
+ * Apply (or clear) a brand color override. Pass null/undefined to remove
+ * any previously-injected sheet and let the Tailwind defaults render.
+ *
+ * The shade map below targets the golf-XXX values most commonly used as
+ * brand surfaces (600/700/800 backgrounds, 200 text, 300 borders, 50/100
+ * tints). Light tints stay close to the brand hue but very desaturated
+ * so they don't visually overpower the page.
+ */
+function applyBrand(hex) {
+  if (typeof document === 'undefined') return;
+  const ID = 'brand-override-style';
+  const existing = document.getElementById(ID);
+  if (existing) existing.remove();
+
+  const hsl = _hexToHsl(hex);
+  if (!hsl) {
+    // No / invalid color → leave the Tailwind palette alone (Valleymede default).
+    return;
+  }
+  const [h, s] = hsl;
+
+  // Tailwind-ish lightness ladder. We force a consistent rhythm regardless
+  // of the input lightness so a too-bright or too-dark brand color still
+  // produces a usable palette of states (hover, active, sidebar, tint).
+  const shade = (l) => _hslToHex(h, Math.max(0.25, Math.min(0.85, s)), l);
+  const c50  = shade(0.96);
+  const c100 = shade(0.92);
+  const c200 = shade(0.85);
+  const c300 = shade(0.74);
+  const c500 = shade(0.50);
+  const c600 = shade(0.42);
+  const c700 = shade(0.34);
+  const c800 = shade(0.26);
+  const c900 = shade(0.18);
+
+  // Light text on dark brand backgrounds (sidebar) reads better at a
+  // slightly desaturated, lifted shade. Match the existing golf-200
+  // pattern (a pale tint of the brand hue, not pure white).
+  const cText200 = _hslToHex(h, Math.min(0.4, s), 0.78);
+
+  const css = `
+    :root { --brand: ${hex}; --brand-700: ${c700}; --brand-50: ${c50}; }
+
+    /* Backgrounds */
+    .bg-golf-50  { background-color: ${c50}  !important; }
+    .bg-golf-100 { background-color: ${c100} !important; }
+    .bg-golf-500 { background-color: ${c500} !important; }
+    .bg-golf-600 { background-color: ${c600} !important; }
+    .bg-golf-700 { background-color: ${c700} !important; }
+    .bg-golf-800 { background-color: ${c800} !important; }
+    .bg-golf-900 { background-color: ${c900} !important; }
+
+    /* Hover backgrounds (Tailwind compiles to .hover\\:bg-golf-XXX:hover) */
+    .hover\\:bg-golf-50:hover  { background-color: ${c50}  !important; }
+    .hover\\:bg-golf-100:hover { background-color: ${c100} !important; }
+    .hover\\:bg-golf-600:hover { background-color: ${c600} !important; }
+    .hover\\:bg-golf-700:hover { background-color: ${c700} !important; }
+
+    /* Text */
+    .text-golf-200 { color: ${cText200} !important; }
+    .text-golf-600 { color: ${c600} !important; }
+    .text-golf-700 { color: ${c700} !important; }
+    .text-golf-800 { color: ${c800} !important; }
+    .hover\\:text-golf-700:hover { color: ${c700} !important; }
+
+    /* Borders */
+    .border-golf-200 { border-color: ${c200} !important; }
+    .border-golf-300 { border-color: ${c300} !important; }
+    .border-golf-600 { border-color: ${c600} !important; }
+    .border-golf-700 { border-color: ${c700} !important; }
+    .border-b-golf-600 { border-bottom-color: ${c600} !important; }
+
+    /* Focus rings (Tailwind: ring-golf-XXX) */
+    .focus\\:ring-golf-500:focus { --tw-ring-color: ${c500} !important; }
+  `;
+
+  const tag = document.createElement('style');
+  tag.id = ID;
+  tag.textContent = css;
+  document.head.appendChild(tag);
+}
+
 // Decide whether to attach X-Business-Id for this request. Only super-admin
 // sessions do — tenant users must not try to override their JWT binding.
 function inferBusinessHeader(path) {
@@ -133,6 +281,7 @@ function LoginPage({ onLogin }) {
         business_id: data.business_id,
         business_name: data.business_name || null,
         template_key: data.template_key || null,
+        primary_color: data.primary_color || null,
         username: data.username,
         name: data.name
       });
@@ -6935,6 +7084,26 @@ function App() {
   const [selectedBusinessId, setSelectedBusinessIdState] = useState(() => getSelectedBusinessId());
   const [businesses, setBusinesses] = useState([]);
 
+  // ─── Brand color theming ──────────────────────────────────────────────
+  // Reflect each tenant's wizard-picked primary_color across the UI.
+  // - Tenant users: always use their own tenant's color (session blob).
+  // - Super admins: use the color of the business they're acting-as
+  //   (looked up from the loaded business list); null when no act-as.
+  // - Unset color (Valleymede, generic-template tenants): null →
+  //   applyBrand() removes the override so the original golf palette wins.
+  useEffect(() => {
+    let color = null;
+    if (session?.role === 'super_admin') {
+      if (selectedBusinessId) {
+        const biz = businesses.find(b => b.id === selectedBusinessId);
+        color = biz?.primary_color || null;
+      }
+    } else if (session) {
+      color = session.primary_color || null;
+    }
+    applyBrand(color);
+  }, [session, selectedBusinessId, businesses]);
+
   // On mount, rehydrate the session from /auth/verify if we have a token
   // but no saved session blob (e.g. upgrading from a pre-Phase-3 login).
   useEffect(() => {
@@ -6953,6 +7122,7 @@ function App() {
             business_name: d.user.business_name || null,
             template_key: d.user.template_key || null,
             plan: d.user.plan || null,
+            primary_color: d.user.primary_color || null,
             username: d.user.username
           };
           setSession(s);
@@ -7043,6 +7213,10 @@ function App() {
       // tenantPagesFor — Valleymede (plan='legacy') always keeps the full
       // golf sidebar even if template_key drifts.
       plan: data.plan || null,
+      // primary_color drives the brand color CSS variable applied at
+      // <html>. Null means "use the golf-green default" — same as
+      // Valleymede's experience.
+      primary_color: data.primary_color || null,
       username: data.username,
       name: data.name
     });

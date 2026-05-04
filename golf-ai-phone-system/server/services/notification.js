@@ -165,10 +165,18 @@ async function getTenantNotifications(businessId) {
 async function getTenantDisplay(businessId) {
   const business = await safeGetBusiness(businessId);
   const name = business?.name || 'Golf Course';
-  const transferNumber =
-    business?.transfer_number ||
-    (await getSetting(businessId, 'transfer_number').catch(() => null)) ||
-    '';
+  // Settings → column precedence (matches grok-voice transfer_call,
+  // routes/twilio.js /transfer, and system-prompt.js). Settings is
+  // where operators set this from inside the tenant UI, so it MUST
+  // win — a real tenant updating their dispatcher number was being
+  // silently overridden by the auto-populated column for SMS copy.
+  // Setting value is JSONB so it may be a string OR an object with
+  // {number}/{value}; handle both shapes.
+  const fromSettingsRaw = await getSetting(businessId, 'transfer_number').catch(() => null);
+  const fromSettings = typeof fromSettingsRaw === 'string'
+    ? fromSettingsRaw
+    : (fromSettingsRaw?.number || fromSettingsRaw?.value || '');
+  const transferNumber = fromSettings || business?.transfer_number || '';
   const timezone = business?.timezone || 'America/Toronto';
   return { name, transferNumber, timezone };
 }

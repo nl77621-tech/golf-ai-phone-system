@@ -245,8 +245,20 @@ How to handle "I'd like to leave a message for [name]":
 `;
   }
 
-  // Phone/contact fallback: prefer the business row, then course_info, then transfer_number.
+  // Phone/contact resolution — Settings first, column second, then course_info.
+  //
+  // History: this used to read business.transfer_number FIRST. A real
+  // tenant updated their dispatcher number in the Settings UI but the AI
+  // kept reading the OLD column number out loud (and downstream the
+  // /twilio/transfer route would have dialed it too if not for the
+  // separate fix in routes/twilio.js). Settings is where operators
+  // actually set this — it MUST win over the legacy column.
+  const transferFromSettings = await getSetting(businessId, 'transfer_number').catch(() => null);
+  const transferSettingStr = typeof transferFromSettings === 'string'
+    ? transferFromSettings
+    : (transferFromSettings?.number || transferFromSettings?.value || '');
   const businessPhoneLocal =
+    transferSettingStr ||
     business?.transfer_number ||
     courseInfo?.phone_local ||
     '';

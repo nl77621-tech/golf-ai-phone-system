@@ -173,10 +173,48 @@ router.put('/settings/:key', async (req, res) => {
   const businessId = tenantId(req);
   try {
     const { key } = req.params;
-    const { value, description } = req.body;
+    let { value } = req.body;
+    const { description } = req.body;
     if (value === undefined) {
       return res.status(400).json({ error: 'Value is required' });
     }
+
+    // Phone-number-shaped settings get auto-normalized to E.164 on
+    // write so a tenant pasting "905-410-6130" or "9054106130" doesn't
+    // end up with a non-dialable string in the DB. Without this, the
+    // /twilio/transfer route would have to be defensive forever — and
+    // every consumer would have to remember to normalize. Solving it
+    // at the write boundary is one place, not five.
+    if (key === 'transfer_number') {
+      const raw = typeof value === 'string'
+        ? value
+        : (value?.number || value?.value || '');
+      const digits = String(raw).replace(/[^+\d]/g, '');
+      let e164 = null;
+      if (digits) {
+        if (digits.startsWith('+')) e164 = digits;
+        else if (digits.length === 10) e164 = '+1' + digits;
+        else if (digits.length === 11 && digits.startsWith('1')) e164 = '+' + digits;
+        else e164 = '+' + digits; // fallback: trust caller for non-NA numbers
+      }
+      if (!e164) {
+        return res.status(400).json({ error: 'transfer_number must be a valid phone number' });
+      }
+      value = e164;
+      // Defense-in-depth: also write the column so even a stray
+      // column-first reader (legacy code, future regression) dials the
+      // right number. The column is now a pure mirror of the setting
+      // for transfer_number specifically.
+      try {
+        await query(
+          `UPDATE businesses SET transfer_number = $1, updated_at = NOW() WHERE id = $2`,
+          [e164, businessId]
+        );
+      } catch (mirrorErr) {
+        console.warn(`[tenant:${businessId}] transfer_number column mirror failed:`, mirrorErr.message);
+      }
+    }
+
     const result = await updateSetting(businessId, key, value, description);
     // Audit — intentionally log only the KEY, not the full value. Settings
     // can include credentials/PII-adjacent fields (notification targets,

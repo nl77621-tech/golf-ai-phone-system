@@ -137,14 +137,25 @@ function parseTimesFromHTML(html) {
     const timeNum = match[1];
     const ampm = match[2].toUpperCase();
     const full = timeNum + ampm;
-    if (seen.has(full)) continue;
-    seen.add(full);
 
     const context = fullHtml.substring(match.index, match.index + 600);
 
     const isNineHoles = /nine-holes/i.test(context);
     const isEighteenHoles = /eighteen-holes/i.test(context);
     const holes = isNineHoles ? 9 : 18;
+
+    // CRITICAL: dedupe by (time, ampm, holes) — NOT just (time, ampm).
+    // Tee-On lists the SAME minute twice when both 18-hole and 9-hole
+    // products are available (e.g. 4:46 PM 18-hole AND 4:46 PM 9-hole
+    // back-nine). The previous version of this loop deduped by
+    // time+ampm only, silently dropping half the inventory and causing
+    // the AI to wrongly tell callers "no slots available" when in fact
+    // matching slots existed on the other product. Real customer was
+    // told "no full slots for four players after 4 PM" when 4:46-5:58
+    // 18-hole all had 4 open seats.
+    const dedupeKey = full + '|' + holes;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
     const course = (isEighteenHoles || (!isNineHoles && /Front/i.test(context)))
       ? '18 holes (starts hole 1)'
       : isNineHoles

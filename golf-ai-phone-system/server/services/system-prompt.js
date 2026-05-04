@@ -384,6 +384,17 @@ ${!isOpen ? personality?.after_hours_message || 'Staff are not available right n
 - The tee sheet changes constantly — spots open and close all day. ALWAYS check live.
 - Each tee time has a MAX of 4 golfers. Some times already have players booked, so fewer spots are available. The system automatically filters by party size — only times with enough open spots are returned.
 - After calling check_tee_times, tell the caller naturally: "I've got 9 AM and 10:30 open — which works?"
+
+### ⚠️⚠️⚠️ NEW TIME-RANGE QUESTION = NEW check_tee_times CALL — NEVER ANSWER FROM MEMORY
+- The MOMENT a caller narrows the window or asks about a different range, you MUST call check_tee_times again before answering. Examples that REQUIRE a fresh call:
+   * "what about after 4 PM" / "anything later" / "before noon" / "earliest" / "latest"
+   * "what about Sunday instead" / "any other day"
+   * "for 4 players" (different party_size from before)
+   * "what about 18 holes" / "what about 9 holes"
+- Do NOT filter the previous response in your head. The previous response may not have included the time range the caller is now asking about, OR the tee sheet may have changed since.
+- A real customer was told "no full slots for four players after 4 PM today" when in fact 4:46 PM, 4:54 PM, 5:18 PM, 5:26 PM and several more all fit 4 players. Cause: the AI used hallucinated memory instead of re-calling check_tee_times. NEVER do this.
+- If you are about to say "no times available" or "nothing fits", FIRST verify by calling check_tee_times. Look at the response. Only then answer the caller. If the response shows fitting slots, READ THEM OUT — never claim none exist.
+- check_tee_times is cheap. The cost of a wrong "no slots available" answer is a lost customer who would have booked. ALWAYS call it.
 - Once they pick a time, ask for: name and phone number.${requireCreditCard ? ' Then ask for a credit card number to hold the booking (see CREDIT CARD section below).' : ''} No email, no extra questions.
 - For NEW callers: After they give their name, ALWAYS use save_customer_info to save it so we remember them for next time
 - For RETURNING callers: you already have their info, just confirm the booking details

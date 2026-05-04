@@ -737,7 +737,7 @@ function buildToolDefinitions() {
     {
       type: 'function',
       name: 'book_tee_time',
-      description: 'REQUIRED to create a booking — you MUST call this tool to submit the booking request. The booking does NOT exist until this tool is called. Never tell the caller the booking was submitted without calling this first. Collect name, date, time, party size, AND whether they want 9 or 18 holes (CRITICAL — confirm this verbally before booking; staff has been burned by ambiguous holes assumptions). Then call this immediately.',
+      description: 'REQUIRED to create a booking — you MUST call this tool to submit the booking request. The booking does NOT exist until this tool is called. Never tell the caller the booking was submitted without calling this first. Collect name, date, time, party size, AND whether they want 9 or 18 holes (CRITICAL — confirm this verbally before booking; staff has been burned by ambiguous holes assumptions). Then call this immediately. CRITICAL: the `time` you pass MUST be the EXACT minute of the slot from your most recent check_tee_times response. Tee-On uses 8-minute intervals — slots end in 1:58, 2:06, 2:14, etc. NEVER round to the nearest 5 or 10 minutes. A customer was burned showing up for "2 PM" when the actual slot was 1:58 PM.',
       parameters: {
         type: 'object',
         properties: {
@@ -745,7 +745,7 @@ function buildToolDefinitions() {
           customer_phone: { type: 'string', description: 'Customer phone number' },
           customer_email: { type: 'string', description: 'Customer email address' },
           date: { type: 'string', description: 'Requested date in YYYY-MM-DD format' },
-          time: { type: 'string', description: 'Requested time in HH:MM format (24h)' },
+          time: { type: 'string', description: 'EXACT slot time in HH:MM 24h format — must be character-for-character one of the times from your most recent check_tee_times response. If check_tee_times offered "1:58 PM", pass "13:58" (NOT "14:00"). NEVER round to a friendlier minute. If you don\'t have an exact slot from check_tee_times, do not call this tool — call check_tee_times first.' },
           party_size: { type: 'integer', description: 'Number of players (1-8)' },
           num_carts: { type: 'integer', description: 'Number of golf carts requested' },
           holes: { type: 'integer', enum: [9, 18], description: '18 for full course (start hole 1) or 9 for back-nine only (start hole 10). REQUIRED — must match what the slot in check_tee_times offered. If the caller did not specify, ask them before calling this tool.' },
@@ -1097,7 +1097,8 @@ async function executeToolCall(toolName, args, ctx) {
 - If NO full-fit slot exists today, say so plainly: "I'm not seeing a single tee time that has all ${partySize} of you together on ${args.date}. I have a couple of slots with 1 or 2 seats — would you want to split the group, try a different day, or have me take a request and let staff confirm by text?"
 - If they ask about a SPECIFIC time, answer for that time directly — including its seat count if it's partial.
 - 18 holes = start hole 1, full course. 9 holes = start hole 10, back nine only.
-- ONLY offer times from the lists above. Never invent a time.`;
+- ONLY offer times from the lists above. Never invent a time.
+- ⚠️ CRITICAL — TIMES ARE 8-MINUTE INTERVALS. The slots end in 1:58, 2:06, 2:14 — NOT round numbers. When you say a time aloud, say the EXACT minute. When you eventually call book_tee_time, pass the EXACT slot time character-for-character. If the caller asked for "2 PM" and you offer 1:58 PM, you MUST say "1:58 PM" — never paraphrase as "2 PM" or "around 2".`;
 
           console.log(`[tenant:${businessId}][${callLogId}] Tee times for ${args.date}: ${openSlots.length} open (${fitsParty} fit ${partySize}); ${full18.length} 18-hole / ${back9.length} 9-hole`);
           return { available: true, date: args.date, partySize, total: openSlots.length, fits_party: fitsParty, message };

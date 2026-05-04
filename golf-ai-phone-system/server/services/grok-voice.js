@@ -521,7 +521,11 @@ ${callerLine}
           const result = await executeToolCall(event.name, parsedArgs, {
             businessId,
             callerContext,
-            callLogId
+            callLogId,
+            // Per-call mutable state — used by check_tee_times to stash
+            // the authoritative valid_times list and by book_tee_time to
+            // reject any time not in that list (anti-hallucination guard).
+            callState
           });
           callState.actions.push({ tool: event.name, args: event.arguments });
           const resultStr = JSON.stringify(result);
@@ -891,7 +895,7 @@ function buildToolDefinitions() {
  * Every branch is scoped to the caller's tenant via `ctx.businessId`.
  */
 async function executeToolCall(toolName, args, ctx) {
-  const { businessId, callerContext, callLogId } = ctx;
+  const { businessId, callerContext, callLogId, callState } = ctx;
   requireBusinessId(businessId, `executeToolCall/${toolName}`);
 
   try {
@@ -1091,17 +1095,41 @@ async function executeToolCall(toolName, args, ctx) {
           }
 
           // ---------- HARD RULES — strongly-worded so the AI doesn't drift ----------
+          // ---------- AUTHORITATIVE WHITELIST — every time string the AI is allowed to say ----------
+          // Exhaustive list of every slot returned by Tee-On for this date,
+          // both fits + partials, both 18-hole and 9-hole. The AI is told
+          // (in big letters below, AND in the system prompt, AND in the
+          // book_tee_time tool description) that EVERY time it says aloud
+          // must appear character-for-character in this list. The server-side
+          // book_tee_time validator also rejects times not in this whitelist
+          // (callState.lastValidTimes), so even if the model hallucinates
+          // a time verbally, it can't actually book one.
+          const valid_times = openSlots.map(s => s.time);
+          // Also stash on the per-call state so book_tee_time can validate.
+          if (callState && typeof callState === 'object') {
+            callState.lastValidTimes = valid_times;
+            callState.lastValidTimesDate = args.date;
+            callState.lastValidTimesAt = Date.now();
+          }
+
+          message += `\n\n=== AUTHORITATIVE TIME LIST — EVERY VALID TIME FOR ${args.date} ===
+Below is the EXACT list of times you may speak aloud. NO OTHER TIMES EXIST. NEVER offer a time that isn't in this list. NEVER round, interpolate, extrapolate, or invent times based on patterns from other times.
+
+VALID TIMES: ${valid_times.length === 0 ? '(none)' : valid_times.join(' | ')}
+
+If you are about to say a time and it does NOT appear above, STOP. Either re-call check_tee_times, or tell the caller you don't have that time.`;
+
           message += `\n\nRULES (FOLLOW EXACTLY):
 - The caller asked for a party of ${partySize}. Your default answer MUST come from the "TIMES THAT FIT YOUR FULL PARTY" section above. NEVER offer a partial-capacity slot as if it fits — those slots have FEWER than ${partySize} seats and would force the group to split.
 - When the caller asks for "earliest" or "what's available" — lead with the EARLIEST FULL-FIT time. Do NOT lead with a partial slot. Only mention partial slots if (a) the caller explicitly asks about a different time, (b) the caller volunteers to split the group, or (c) no full-fit slot exists at all.
 - If NO full-fit slot exists today, say so plainly: "I'm not seeing a single tee time that has all ${partySize} of you together on ${args.date}. I have a couple of slots with 1 or 2 seats — would you want to split the group, try a different day, or have me take a request and let staff confirm by text?"
 - If they ask about a SPECIFIC time, answer for that time directly — including its seat count if it's partial.
 - 18 holes = start hole 1, full course. 9 holes = start hole 10, back nine only.
-- ONLY offer times from the lists above. Never invent a time.
-- ⚠️ CRITICAL — TIMES ARE 8-MINUTE INTERVALS. The slots end in 1:58, 2:06, 2:14 — NOT round numbers. When you say a time aloud, say the EXACT minute. When you eventually call book_tee_time, pass the EXACT slot time character-for-character. If the caller asked for "2 PM" and you offer 1:58 PM, you MUST say "1:58 PM" — never paraphrase as "2 PM" or "around 2".`;
+- 🚫 NEVER INVENT TIMES. Tee-On uses an irregular 8-minute grid (e.g. 4:06, 4:22, 4:46, 4:54 — NOT 4:02, 4:10, 4:18). If you don't see a specific time in the AUTHORITATIVE TIME LIST above, that time DOES NOT EXIST. A real customer was nearly told to show up for "4:02 PM" — a slot that never existed. NEVER do that. Read times from the list verbatim.
+- ⚠️ CRITICAL — When you say a time aloud, say the EXACT minute as it appears in the list. When you eventually call book_tee_time, pass the EXACT slot time character-for-character. If the caller asked for "2 PM" and the closest valid time is 1:58 PM, you MUST say "1:58 PM" — never paraphrase as "2 PM" or "around 2".`;
 
-          console.log(`[tenant:${businessId}][${callLogId}] Tee times for ${args.date}: ${openSlots.length} open (${fitsParty} fit ${partySize}); ${full18.length} 18-hole / ${back9.length} 9-hole`);
-          return { available: true, date: args.date, partySize, total: openSlots.length, fits_party: fitsParty, message };
+          console.log(`[tenant:${businessId}][${callLogId}] Tee times for ${args.date}: ${openSlots.length} open (${fitsParty} fit ${partySize}); ${full18.length} 18-hole / ${back9.length} 9-hole; whitelist=${valid_times.length} times`);
+          return { available: true, date: args.date, partySize, total: openSlots.length, fits_party: fitsParty, valid_times, message };
         } catch (err) {
           console.error(`[tenant:${businessId}][TeeOn] checkAvailability error:`, err.message);
           return { available: null, message: 'Unable to check live availability right now. I can take a booking request.' };
@@ -1120,6 +1148,59 @@ async function executeToolCall(toolName, args, ctx) {
         if (!args.party_size || args.party_size < 1 || args.party_size > 8) {
           console.warn(`[tenant:${businessId}][${callLogId}] ⚠️ book_tee_time called with invalid party_size:`, args.party_size);
           return { success: false, message: 'How many players will be in your group?' };
+        }
+
+        // ⚠️ ANTI-HALLUCINATION GUARD ⚠️
+        // The model has been observed inventing tee-time slots that don't
+        // exist on the live tee sheet (e.g. "4:02 PM, 4:10 PM, 4:18 PM"
+        // when Tee-On's real after-4-PM slots are 4:06, 4:22, 4:46, 4:54).
+        // We refuse to write a booking_request for any time that wasn't
+        // returned by check_tee_times during this call.
+        //
+        // The whitelist is stashed on callState by check_tee_times. If
+        // callState has a list AND the date matches AND the time isn't on
+        // the list, we reject the booking and force the AI to re-check.
+        // If callState is empty (e.g. caller hasn't asked about availability
+        // yet — booking-by-request flow), we let it through; the existing
+        // booking flow always treats requests as pending until staff
+        // confirms via Tee-On directly.
+        if (args.time && callState?.lastValidTimes?.length > 0 &&
+            callState.lastValidTimesDate === args.date) {
+          const askedTime = String(args.time).trim();
+          // Match either the raw slot string ("4:46 PM") or 24h equivalent.
+          // The whitelist holds slot strings as Tee-On returned them
+          // ("4:46 PM"); the AI may pass either format.
+          const whitelist = callState.lastValidTimes;
+          const askedAs24h = (() => {
+            const m = askedTime.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)?$/i);
+            if (!m) return askedTime;
+            let h = parseInt(m[1], 10); const min = m[2]; const ampm = (m[3] || '').toUpperCase();
+            if (ampm === 'PM' && h !== 12) h += 12;
+            if (ampm === 'AM' && h === 12) h = 0;
+            return `${String(h).padStart(2, '0')}:${min}`;
+          })();
+          // Convert each whitelist entry to 24h for comparison.
+          const whitelist24 = whitelist.map(t => {
+            const m = String(t).match(/^(\d{1,2}):(\d{2})\s*(AM|PM)?$/i);
+            if (!m) return null;
+            let h = parseInt(m[1], 10); const min = m[2]; const ampm = (m[3] || '').toUpperCase();
+            if (ampm === 'PM' && h !== 12) h += 12;
+            if (ampm === 'AM' && h === 12) h = 0;
+            return `${String(h).padStart(2, '0')}:${min}`;
+          }).filter(Boolean);
+          const matched = whitelist24.includes(askedAs24h);
+          if (!matched) {
+            console.warn(
+              `[tenant:${businessId}][${callLogId}] ⚠️ book_tee_time REJECTED — ` +
+              `time "${askedTime}" (24h=${askedAs24h}) not in whitelist for ${args.date}. ` +
+              `Whitelist had ${whitelist.length} times: ${whitelist.slice(0, 8).join(', ')}${whitelist.length > 8 ? '…' : ''}`
+            );
+            return {
+              success: false,
+              error: 'time_not_in_whitelist',
+              message: `That specific time isn't on the live tee sheet. Re-call check_tee_times with the same date and party size — DO NOT pick a time from memory or pattern. Pass the EXACT slot time you see in the AUTHORITATIVE TIME LIST in the response. Then call book_tee_time again with that exact value.`
+            };
+          }
         }
 
         console.log(`[tenant:${businessId}][${callLogId}] 📅 Processing booking:`, {

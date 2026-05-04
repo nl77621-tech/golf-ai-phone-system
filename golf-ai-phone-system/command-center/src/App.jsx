@@ -1870,6 +1870,7 @@ function SettingsPage() {
     { id: 'general', label: 'General' },
     { id: 'phones', label: '📞 Phones' },
     { id: 'team', label: '👥 Team' },
+    { id: 'topics', label: '\uD83C\uDFF7\uFE0F Custom Topics' },
     { id: 'users', label: '\uD83D\uDD11 Users' },
     { id: 'knowledge', label: 'Knowledge' },
     { id: 'hours', label: 'Hours' },
@@ -1960,6 +1961,12 @@ function SettingsPage() {
 
       // TEAM TAB \u2014 directory of named people the AI can leave a message for.
       activeTab === 'team' && React.createElement(TeamDirectoryManager, null),
+
+      // CUSTOM TOPICS TAB \u2014 operator-defined scenarios (lost & found,
+      // catering, etc). The AI matches caller questions and routes to
+      // take_topic_message which lands a row on the Messages page +
+      // texts the topic\u2019s notify_sms.
+      activeTab === 'topics' && React.createElement(CustomTopicsManager, null),
 
       // USERS — login accounts for this tenant. Same component
       // as the super-admin Edit Tenant modal; with no businessId
@@ -2880,6 +2887,186 @@ function TeamDirectoryManager() {
         onClick: addMember, disabled: adding,
         className: 'bg-golf-600 hover:bg-golf-700 text-white px-4 py-2 rounded-lg text-sm disabled:opacity-50'
       }, adding ? 'Adding…' : 'Add team member')
+    )
+  );
+}
+
+// ============================================
+// CustomTopicsManager — operator-defined scenarios the AI should
+// recognize and route. Each topic stores: name (e.g. "Lost & Found"),
+// trigger_hint (when to fire — free text), ai_instructions (what to
+// do during the call), notify_sms / notify_email (where to send the
+// message). When the AI matches a topic mid-call, take_topic_message
+// fires and the message lands on the Messages page + an SMS goes out.
+// Stored in settings.custom_topics as a JSON array.
+// ============================================
+function CustomTopicsManager() {
+  const [topics, setTopics] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const [draft, setDraft] = useState({
+    name: '', trigger_hint: '', ai_instructions: '',
+    notify_sms: '', notify_email: '', enabled: true
+  });
+  const [adding, setAdding] = useState(false);
+
+  // Load the existing array. settings.custom_topics may be:
+  //   - undefined (never saved) → []
+  //   - { value: [...] } from the settings API wrapper
+  //   - { value: { topics: [...] } } if someone wrapped it
+  // Be defensive about all three.
+  const reload = () => {
+    setLoading(true);
+    // The GET endpoint returns the full settings map keyed by setting
+    // name. Pick out custom_topics; fall back to [] if it doesn't exist.
+    api('/api/settings')
+      .then(all => {
+        const v = all?.custom_topics?.value;
+        const arr = Array.isArray(v) ? v
+          : Array.isArray(v?.topics) ? v.topics
+          : [];
+        setTopics(arr);
+      })
+      .catch(err => {
+        setError(err.message || 'Failed to load custom topics');
+      })
+      .finally(() => setLoading(false));
+  };
+  useEffect(reload, []);
+
+  const persist = async (next) => {
+    setSaving(true); setError('');
+    try {
+      await api('/api/settings/custom_topics', {
+        method: 'PUT',
+        body: JSON.stringify({ value: next, description: 'Operator-defined topics the AI matches and routes' })
+      });
+      setTopics(next);
+    } catch (err) {
+      setError(err.message || 'Failed to save');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const addTopic = async () => {
+    if (!draft.name.trim()) { setError('Name is required.'); return; }
+    if (!draft.trigger_hint.trim()) { setError('Trigger hint is required so the AI knows when to use this topic.'); return; }
+    if (!draft.notify_sms.trim() && !draft.notify_email.trim()) {
+      setError('Add a phone number, an email, or both — otherwise the message has nowhere to go.');
+      return;
+    }
+    setAdding(true); setError('');
+    const next = [...topics, {
+      name: draft.name.trim(),
+      trigger_hint: draft.trigger_hint.trim(),
+      ai_instructions: draft.ai_instructions.trim() || `Politely take a brief message capturing what the caller needs and a callback number, then call take_topic_message.`,
+      notify_sms: draft.notify_sms.trim() || null,
+      notify_email: draft.notify_email.trim() || null,
+      enabled: !!draft.enabled
+    }];
+    await persist(next);
+    setDraft({ name: '', trigger_hint: '', ai_instructions: '', notify_sms: '', notify_email: '', enabled: true });
+    setAdding(false);
+  };
+
+  const updateTopic = async (idx, patch) => {
+    const next = topics.map((t, i) => i === idx ? { ...t, ...patch } : t);
+    await persist(next);
+  };
+
+  const removeTopic = async (idx, name) => {
+    if (!window.confirm(`Remove the "${name}" topic? The AI will no longer recognize callers asking about this.`)) return;
+    await persist(topics.filter((_, i) => i !== idx));
+  };
+
+  if (loading) return React.createElement('div', { className: 'text-sm text-gray-500' }, 'Loading custom topics…');
+
+  return React.createElement('div', null,
+    React.createElement('p', { className: 'text-sm text-gray-500 mb-4' },
+      'Define scenarios the AI should recognize. When a caller’s question matches a topic’s trigger, the AI follows the instructions, takes a message, and routes it to the contact below — both as an SMS and as a row on the Messages page.'
+    ),
+    error && React.createElement('div', { className: 'mb-3 text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2' }, error),
+
+    topics.length === 0
+      ? React.createElement('p', { className: 'text-sm text-gray-400 italic mb-4' }, 'No custom topics yet. Add one below — for example, "Lost & Found" or "Catering Inquiries".')
+      : React.createElement('div', { className: 'space-y-3 mb-6' },
+          topics.map((t, idx) =>
+            React.createElement('div', {
+              key: idx,
+              className: `border rounded-lg p-4 ${t.enabled === false ? 'bg-gray-50 opacity-70' : 'bg-white'}`
+            },
+              React.createElement('div', { className: 'flex items-start justify-between gap-3 mb-2' },
+                React.createElement('div', null,
+                  React.createElement('div', { className: 'flex items-center gap-2 flex-wrap' },
+                    React.createElement('span', { className: 'font-semibold text-gray-800 text-base' }, t.name),
+                    t.enabled === false && React.createElement('span', { className: 'text-xs bg-gray-200 text-gray-600 px-2 py-0.5 rounded' }, 'disabled')
+                  )
+                ),
+                React.createElement('div', { className: 'flex flex-col gap-1 shrink-0' },
+                  React.createElement('button', {
+                    onClick: () => updateTopic(idx, { enabled: !t.enabled }),
+                    disabled: saving,
+                    className: 'text-xs px-2 py-1 rounded bg-gray-100 text-gray-700 hover:bg-gray-200 disabled:opacity-50'
+                  }, t.enabled === false ? 'Enable' : 'Disable'),
+                  React.createElement('button', {
+                    onClick: () => removeTopic(idx, t.name),
+                    disabled: saving,
+                    className: 'text-xs px-2 py-1 rounded bg-red-50 text-red-700 hover:bg-red-100 disabled:opacity-50'
+                  }, 'Remove')
+                )
+              ),
+              React.createElement('div', { className: 'text-sm text-gray-600 mb-1' },
+                React.createElement('span', { className: 'font-medium' }, 'When caller asks: '),
+                t.trigger_hint || React.createElement('em', { className: 'text-gray-400' }, 'no trigger set')
+              ),
+              t.ai_instructions && React.createElement('div', { className: 'text-sm text-gray-600 mb-1' },
+                React.createElement('span', { className: 'font-medium' }, 'AI does: '),
+                t.ai_instructions
+              ),
+              React.createElement('div', { className: 'text-xs text-gray-500 mt-2 flex flex-wrap gap-x-3' },
+                t.notify_sms && React.createElement('span', null, '📱 ' + t.notify_sms),
+                t.notify_email && React.createElement('span', null, '✉️ ' + t.notify_email)
+              )
+            )
+          )
+        ),
+
+    React.createElement('div', { className: 'border-t pt-4' },
+      React.createElement('h3', { className: 'font-semibold text-sm mb-3' }, 'Add a custom topic'),
+      React.createElement('div', { className: 'grid grid-cols-1 md:grid-cols-2 gap-3 mb-3' },
+        React.createElement('input', {
+          type: 'text', placeholder: 'Topic name (e.g. Lost & Found)',
+          value: draft.name, onChange: e => setDraft({ ...draft, name: e.target.value }),
+          className: 'border rounded-lg px-3 py-2 text-sm'
+        }),
+        React.createElement('input', {
+          type: 'tel', placeholder: 'SMS phone (E.164 — +14165551234) — optional if email set',
+          value: draft.notify_sms, onChange: e => setDraft({ ...draft, notify_sms: e.target.value }),
+          className: 'border rounded-lg px-3 py-2 text-sm'
+        }),
+        React.createElement('input', {
+          type: 'text', placeholder: 'When does the AI use this? e.g. caller mentions losing a club, glove, or item',
+          value: draft.trigger_hint, onChange: e => setDraft({ ...draft, trigger_hint: e.target.value }),
+          className: 'border rounded-lg px-3 py-2 text-sm md:col-span-2'
+        }),
+        React.createElement('textarea', {
+          placeholder: 'AI instructions (optional). e.g. "Ask what was lost, when, and where on the course. Get name + callback number. Tell them we\'ll text if it turns up."',
+          value: draft.ai_instructions, onChange: e => setDraft({ ...draft, ai_instructions: e.target.value }),
+          rows: 3,
+          className: 'border rounded-lg px-3 py-2 text-sm md:col-span-2'
+        }),
+        React.createElement('input', {
+          type: 'email', placeholder: 'Email (optional if phone set)',
+          value: draft.notify_email, onChange: e => setDraft({ ...draft, notify_email: e.target.value }),
+          className: 'border rounded-lg px-3 py-2 text-sm md:col-span-2'
+        })
+      ),
+      React.createElement('button', {
+        onClick: addTopic, disabled: adding || saving,
+        className: 'bg-golf-600 hover:bg-golf-700 text-white px-4 py-2 rounded-lg text-sm disabled:opacity-50'
+      }, adding ? 'Adding…' : 'Add custom topic')
     )
   );
 }

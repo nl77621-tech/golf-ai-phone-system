@@ -27,7 +27,7 @@ function getTwilioClient() {
   } catch (_) { return null; }
 }
 const { buildSystemPrompt } = require('./system-prompt');
-const { sendPostCallSummary } = require('./notification');
+const { sendPostCallSummary, sendSMS, sendEmail } = require('./notification');
 const { lookupByPhone, lookupByName, registerCall, updateCustomer } = require('./caller-lookup');
 const {
   createBookingRequest,
@@ -874,6 +874,21 @@ function buildToolDefinitions() {
     },
     {
       type: 'function',
+      name: 'take_topic_message',
+      description: 'Take a message for one of the operator-defined CUSTOM TOPICS in your system prompt (e.g. "Lost & Found", "Catering", "League Sign-Up"). Call this AFTER you have: (1) confirmed the topic name back to the caller, (2) collected the relevant details per the topic\'s instructions, (3) collected the caller\'s callback number. NEVER invent a topic — only call this for topics that appear in your CUSTOM TOPICS list. The summary should be concise (1-3 sentences) and capture the key facts staff need.',
+      parameters: {
+        type: 'object',
+        properties: {
+          topic_name: { type: 'string', description: 'The exact topic name from the CUSTOM TOPICS list (case-insensitive match). Use the canonical name as listed.' },
+          summary: { type: 'string', description: 'Concise 1-3 sentence summary of what the caller needs. Capture key facts (what, when, where, why). Do not paraphrase loosely.' },
+          caller_name: { type: 'string', description: 'The caller\'s name as they gave it. If they declined to share, pass "Unknown caller".' },
+          caller_callback_number: { type: 'string', description: 'A callback number for staff. Default to the caller\'s incoming number unless they gave you a different one.' }
+        },
+        required: ['topic_name', 'summary']
+      }
+    },
+    {
+      type: 'function',
       name: 'take_message_for_team_member',
       description: 'Take a message for a specific team member from the TEAM DIRECTORY in your system prompt and dispatch it as an SMS to that person. Call this AFTER you have: (1) confirmed the recipient name back to the caller, (2) collected the caller\'s name and a callback number, (3) listened to the message. NEVER invent a recipient — only call this for names that appear in your TEAM DIRECTORY. If the directory is empty or the caller asks for a name not on the list, do not call this tool — apologize and offer to take a general message or transfer them.',
       parameters: {
@@ -1468,6 +1483,171 @@ If you are about to say a time and it does NOT appear above, STOP. Either re-cal
           }
         }
         return { success: false, message: 'I had trouble saving that number, but no worries — staff will follow up with you.' };
+      }
+
+      case 'take_topic_message': {
+        // Operator-defined topics (lost & found, catering inquiries, etc.)
+        // are stored in the per-tenant `custom_topics` setting. The AI
+        // recognizes a match in conversation, calls this tool with a
+        // summary, and we (a) persist a row to team_messages so it
+        // shows on the Messages page, (b) fire SMS to the topic's
+        // notify_sms (or fall back to notifications.sms_to).
+        const topicName = typeof args.topic_name === 'string' ? args.topic_name.trim() : '';
+        const summary = typeof args.summary === 'string' ? args.summary.trim() : '';
+        if (!topicName) {
+          return { success: false, error: 'missing_topic', message: 'Tell me which topic, and I’ll take the message.' };
+        }
+        if (!summary) {
+          return { success: false, error: 'missing_summary', message: 'What would you like me to pass along?' };
+        }
+        console.log(
+          `[tenant:${businessId}][${callLogId}] take_topic_message | topic="${topicName}" | from=${args.caller_name || 'n/a'}`
+        );
+
+        // Look up the topic config from settings.
+        let topics = [];
+        try {
+          const raw = await getSetting(businessId, 'custom_topics');
+          topics = Array.isArray(raw) ? raw : (Array.isArray(raw?.topics) ? raw.topics : []);
+        } catch (err) {
+          console.warn(`[tenant:${businessId}][${callLogId}] custom_topics lookup failed:`, err.message);
+        }
+        const topic = topics.find(t => t && t.enabled !== false && typeof t.name === 'string' &&
+          t.name.toLowerCase() === topicName.toLowerCase());
+        if (!topic) {
+          return {
+            success: false,
+            error: 'topic_not_found',
+            message: `That topic isn't in my list. I can take a general message and someone will follow up.`
+          };
+        }
+
+        // Resolve callback. Caller-supplied beats inbound DID.
+        const callerPhone =
+          (typeof args.caller_callback_number === 'string' && args.caller_callback_number.trim()) ||
+          callerContext?.callerPhone ||
+          callerContext?.alternatePhone ||
+          null;
+        const callerName =
+          (typeof args.caller_name === 'string' && args.caller_name.trim()) ||
+          callerContext?.name ||
+          'Unknown caller';
+
+        // Where to SMS: topic's own notify_sms first, fall back to
+        // notifications.sms_to so the message always reaches someone.
+        let notifySmsRaw = topic.notify_sms || null;
+        if (!notifySmsRaw) {
+          try {
+            const notif = await getSetting(businessId, 'notifications').catch(() => null);
+            notifySmsRaw = notif?.sms_to || null;
+          } catch (_) { /* fine — Messages page is still recorded */ }
+        }
+        const notifyEmailRaw = topic.notify_email || null;
+
+        // Persist on Messages page first (audit trail), then dispatch.
+        // Reuses team_messages with recipient_id=NULL (it's a topic, not
+        // a team member) and recipient_name="Topic: <name>" so the dash
+        // can render with a distinct label.
+        let messageRowId = null;
+        try {
+          const business = await getBusinessById(businessId);
+          const businessName = business?.name || null;
+          const body = [
+            `📬 ${topic.name} message at ${businessName || 'your business'}`,
+            callerName ? `From: ${callerName}` : null,
+            callerPhone ? `Callback: ${callerPhone}` : null,
+            '',
+            summary
+          ].filter(x => x !== null).join('\n');
+
+          const insertRes = await query(
+            `INSERT INTO team_messages
+                (business_id, recipient_id, recipient_name, caller_name, caller_phone,
+                 body, channel, status, routed_to_default, call_id)
+             VALUES ($1, NULL, $2, $3, $4, $5, $6, 'pending', FALSE, $7)
+             RETURNING id`,
+            [
+              businessId,
+              `Topic: ${topic.name}`,
+              callerName,
+              callerPhone,
+              body,
+              notifySmsRaw && notifyEmailRaw ? 'both' : notifySmsRaw ? 'sms' : notifyEmailRaw ? 'email' : 'dashboard_only',
+              Number.isInteger(callLogId) ? callLogId : null
+            ]
+          );
+          messageRowId = insertRes.rows[0].id;
+
+          const detail = {};
+          let smsOk = null;
+          if (notifySmsRaw) {
+            try {
+              const r = await sendSMS(businessId, notifySmsRaw, body);
+              smsOk = !!r;
+              detail.sms = { ok: smsOk, sid: r?.sid || null, to: notifySmsRaw };
+            } catch (err) {
+              smsOk = false;
+              detail.sms = { ok: false, error: err.message, to: notifySmsRaw };
+            }
+          }
+          let emailOk = null;
+          if (notifyEmailRaw) {
+            try {
+              const r = await sendEmail(
+                businessId,
+                notifyEmailRaw,
+                `[${businessName || 'Voice'}] ${topic.name} — ${callerName}`,
+                `<pre style="font-family: -apple-system,BlinkMacSystemFont,Helvetica,Arial,sans-serif; white-space: pre-wrap; font-size: 14px;">${String(body).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]))}</pre>`
+              );
+              emailOk = !!r;
+              detail.email = { ok: emailOk, message_id: r?.messageId || null, to: notifyEmailRaw };
+            } catch (err) {
+              emailOk = false;
+              detail.email = { ok: false, error: err.message, to: notifyEmailRaw };
+            }
+          }
+
+          let finalStatus;
+          if (!notifySmsRaw && !notifyEmailRaw) finalStatus = 'dashboard_only';
+          else if (notifySmsRaw && notifyEmailRaw) {
+            finalStatus = (smsOk && emailOk) ? 'sent' : (smsOk || emailOk) ? 'partial' : 'failed';
+          } else {
+            finalStatus = (smsOk || emailOk) ? 'sent' : 'failed';
+          }
+          await query(
+            `UPDATE team_messages
+                SET status = $1, delivery_detail = $2::jsonb, updated_at = NOW()
+              WHERE id = $3 AND business_id = $4`,
+            [finalStatus, JSON.stringify(detail), messageRowId, businessId]
+          );
+          // Live broadcast for the Messages page (matches the
+          // team-directory dispatch flow).
+          try {
+            require('./event-bus').publish(businessId, 'team_message.created', {
+              id: messageRowId, recipient_name: `Topic: ${topic.name}`, caller_name: callerName, status: finalStatus
+            });
+            require('./event-bus').publish(businessId, 'team_message.updated', {
+              id: messageRowId, status: finalStatus
+            });
+          } catch (_) { /* non-fatal */ }
+
+          console.log(
+            `[tenant:${businessId}][${callLogId}] Topic "${topic.name}" message id=${messageRowId} status=${finalStatus}`
+          );
+          return {
+            success: true,
+            topic: topic.name,
+            status: finalStatus,
+            message: `I’ve passed your ${topic.name.toLowerCase()} message along — staff will get it right away.`
+          };
+        } catch (err) {
+          console.error(`[tenant:${businessId}][${callLogId}] take_topic_message dispatch failed:`, err.message);
+          return {
+            success: false,
+            error: 'dispatch_failed',
+            message: `I’ve noted your ${topic.name.toLowerCase()} message — there was a hiccup with the alert just now, but it’s logged.`
+          };
+        }
       }
 
       case 'take_message_for_team_member': {

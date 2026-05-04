@@ -50,7 +50,8 @@ async function buildSystemPrompt(businessId, callerContext = {}) {
     faq,
     seasonalNotes,
     bookingSettings,
-    greetingSettings
+    greetingSettings,
+    customTopicsRaw
   ] = await Promise.all([
     getBusinessById(businessId),
     getSetting(businessId, 'course_info'),
@@ -67,7 +68,8 @@ async function buildSystemPrompt(businessId, callerContext = {}) {
     getSetting(businessId, 'faq'),
     getSetting(businessId, 'seasonal_notes'),
     getSetting(businessId, 'booking_settings'),
-    getSetting(businessId, 'greetings')
+    getSetting(businessId, 'greetings'),
+    getSetting(businessId, 'custom_topics')
   ]);
 
   // Per-tenant team directory — list of named people the AI can leave a
@@ -245,6 +247,38 @@ How to handle "I'd like to leave a message for [name]":
 `;
   }
 
+  // ─── Custom topics — operator-defined intents (lost & found, etc.) ───
+  // Tenants list specific scenarios in Settings → Custom Topics. When the
+  // caller's question matches a topic's trigger_hint, the AI follows the
+  // topic's ai_instructions and calls take_topic_message. Persists to
+  // team_messages + dispatches SMS/email to the topic's contact.
+  let customTopicsSection = '';
+  const topicsArray = Array.isArray(customTopicsRaw)
+    ? customTopicsRaw
+    : (Array.isArray(customTopicsRaw?.topics) ? customTopicsRaw.topics : []);
+  const activeTopics = topicsArray.filter(t => t && t.enabled !== false && typeof t.name === 'string' && t.name.trim());
+  if (activeTopics.length > 0) {
+    const blocks = activeTopics.map(t => {
+      const trig = (typeof t.trigger_hint === 'string' && t.trigger_hint.trim()) || `Caller asks about ${t.name}.`;
+      const inst = (typeof t.ai_instructions === 'string' && t.ai_instructions.trim())
+        || `Politely take a brief message capturing what the caller needs and a callback number, then call take_topic_message.`;
+      return `### ${t.name}\n- TRIGGER: ${trig}\n- WHAT TO DO: ${inst}\n- TOOL: take_topic_message(topic_name="${t.name}", summary, caller_callback_number)`;
+    });
+    customTopicsSection = `
+## CUSTOM TOPICS (operator-defined scenarios)
+The course staff has set up these specific scenarios. If a caller's question matches one of the TRIGGERS below, follow that topic's WHAT TO DO instructions exactly, then call take_topic_message with the EXACT topic name from the heading.
+
+${blocks.join('\n\n')}
+
+Rules for custom topics:
+- ALWAYS call take_topic_message for these — that's how the message lands on staff's phone and on the Messages page. Saying "I've passed it along" without calling the tool means the message is LOST.
+- Confirm the topic back to the caller naturally ("Got it — I'll let our staff know about your lost driver").
+- Capture the SHORT summary the tool needs (1-3 sentences). Don't repeat back the whole conversation.
+- After the tool succeeds, tell the caller "I've passed that along — they'll reach out if/when they have an update."
+- DO NOT invent a topic. If a caller asks about something not in the list above and not covered elsewhere in this prompt, take a general message via the team directory or offer to transfer them.
+`;
+  }
+
   // Phone/contact resolution — Settings first, column second, then course_info.
   //
   // History: this used to read business.transfer_number FIRST. A real
@@ -367,6 +401,7 @@ ${seasonalNotes}
 ${announcementSection}
 ${greetingSection}
 ${teamSection}
+${customTopicsSection}
 ${callerSection}
 
 ## AFTER-HOURS BEHAVIOR

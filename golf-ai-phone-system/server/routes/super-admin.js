@@ -845,7 +845,14 @@ router.patch('/businesses/:id', async (req, res) => {
     'owner_profile', 'schedule_preferences', 'important_contacts',
     'call_handling_rules',
     // Restaurant template specifics
-    'restaurant_info', 'menu', 'reservation_policy'
+    'restaurant_info', 'menu', 'reservation_policy',
+    // Operator-defined intents — array of { name, trigger_hint,
+    // ai_instructions, notify_sms, notify_email, enabled }. The AI
+    // matches incoming questions against trigger_hint and routes
+    // matching calls to a take_topic_message flow. Used for ad-hoc
+    // scenarios the wizard templates don't cover (e.g. lost & found,
+    // catering inquiries, league sign-ups).
+    'custom_topics'
   ]);
   const settingsMap =
     body.settings && typeof body.settings === 'object' && !Array.isArray(body.settings)

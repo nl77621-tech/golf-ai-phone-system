@@ -1096,15 +1096,35 @@ async function executeToolCall(toolName, args, ctx) {
             }
           }
 
-          // ---------- HOLES AVAILABILITY SUMMARY ----------
-          // Real customer feedback: AI was asking "18 or 9 holes?" in the
-          // morning when Tee-On only has 18-hole slots up there. Tee-On
-          // 9-hole back-nine starts only run in the afternoon/twilight
-          // window, never AM at most courses. Surface explicit
-          // morning_18 / morning_9 / afternoon_18 / afternoon_9 counts so
-          // the AI can SEE which products are actually available before
-          // asking the caller a multiple-choice question that has only
-          // one real answer.
+          // ---------- PER-TIME HOLES AVAILABILITY ----------
+          // Real customer feedback: AI was asking "18 or 9 holes?" for
+          // morning slots like 8:06 AM that have NO 9-hole version, just
+          // because 9-hole exists earlier in the morning (6:30-7:26 AM).
+          // The morning_9 / afternoon_9 booleans were too coarse — the AI
+          // needs to know what's available AT THE SPECIFIC TIMES IT'S
+          // OFFERING, not in the broad morning/afternoon bucket.
+          //
+          // Build a map: for each unique time string, which holes options
+          // are listed. Then surface this per-time when the AI is choosing
+          // what to offer. AI rule: only ask "18 or 9?" if AT LEAST ONE of
+          // the offered times has BOTH listed.
+          const holesByTime = {};
+          for (const s of openSlots) {
+            const t = s.time;
+            if (!holesByTime[t]) holesByTime[t] = { eighteen: false, nine: false };
+            if (s.holes === 18) holesByTime[t].eighteen = true;
+            if (s.holes === 9)  holesByTime[t].nine = true;
+          }
+          // Stringify for prompt embedding. Sort by time so AI reads in order.
+          const holesAnnotated = Object.entries(holesByTime)
+            .map(([time, h]) => {
+              const both = h.eighteen && h.nine;
+              const tag = both ? '18+9' : (h.eighteen ? '18-only' : '9-only');
+              return `${time} (${tag})`;
+            });
+
+          // Whole-period booleans — kept for backwards compat, but the
+          // AI is now told NOT to base the holes question on these.
           const has_morning_18  = morning18Fits.length > 0 || morning18Partial.length > 0;
           const has_morning_9   = morningBack9Fits.length > 0 || morningBack9Partial.length > 0;
           const has_afternoon_18 = afternoon18Fits.length > 0 || afternoon18Partial.length > 0;
@@ -1115,10 +1135,18 @@ async function executeToolCall(toolName, args, ctx) {
             afternoon:  { eighteen: has_afternoon_18,  nine: has_afternoon_9 }
           };
 
-          message += `\n\nHOLES AVAILABILITY (use this to decide whether to ask "18 or 9 holes?"):`;
-          message += `\n• Morning: ${has_morning_18 ? '18-hole YES' : '18-hole NO'} | ${has_morning_9 ? '9-hole YES' : '9-hole NO'}`;
-          message += `\n• Afternoon: ${has_afternoon_18 ? '18-hole YES' : '18-hole NO'} | ${has_afternoon_9 ? '9-hole YES' : '9-hole NO'}`;
-          message += `\n→ If only ONE of the two products has slots in the time window the caller asked about, DO NOT ASK the holes question — just say "for 18 holes" or "for 9 holes back nine" and continue. Asking "18 or 9?" when 9 isn't available is misleading.`;
+          message += `\n\nPER-TIME HOLES AVAILABILITY (CRITICAL — use this, NOT the morning/afternoon bucket):`;
+          message += `\nEach time below is annotated with what's actually open at THAT minute:`;
+          message += `\n  • "18+9" — both 18-hole AND 9-hole back-nine are open at this exact time`;
+          message += `\n  • "18-only" — only 18-hole at this minute. NO 9-hole version exists here.`;
+          message += `\n  • "9-only" — only 9-hole back-nine at this minute. NO 18-hole version.`;
+          message += `\n\nAnnotated times: ${holesAnnotated.length === 0 ? '(none)' : holesAnnotated.join(' | ')}`;
+          message += `\n\n⚠️ HOW TO DECIDE WHETHER TO ASK "18 OR 9?":`;
+          message += `\n  1. Look at the SPECIFIC times you are about to offer the caller.`;
+          message += `\n  2. If ALL of those times are tagged "18-only" → DO NOT ASK. Just say "for 18 holes" and continue.`;
+          message += `\n  3. If ALL of those times are tagged "9-only" → DO NOT ASK. Just say "for 9 holes back nine" and continue.`;
+          message += `\n  4. ONLY if AT LEAST ONE offered time is tagged "18+9" should you ask the holes question.`;
+          message += `\n  5. Real example: caller asks for "around 8 AM" and you offer 8:06 AM (18-only), 8:14 AM (18-only), 8:22 AM (18-only) — ALL 18-only — so DON'T ask the holes question. Just say "I've got 8:06, 8:14, and 8:22 open for 18 holes — which works?"`;
 
           // ---------- KEY FACTS — flat facts the AI can quote directly ----------
           message += `\n\nKEY FACTS:`;

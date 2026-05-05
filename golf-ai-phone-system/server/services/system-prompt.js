@@ -51,7 +51,8 @@ async function buildSystemPrompt(businessId, callerContext = {}) {
     seasonalNotes,
     bookingSettings,
     greetingSettings,
-    customTopicsRaw
+    customTopicsRaw,
+    nineHolePolicy
   ] = await Promise.all([
     getBusinessById(businessId),
     getSetting(businessId, 'course_info'),
@@ -69,7 +70,8 @@ async function buildSystemPrompt(businessId, callerContext = {}) {
     getSetting(businessId, 'seasonal_notes'),
     getSetting(businessId, 'booking_settings'),
     getSetting(businessId, 'greetings'),
-    getSetting(businessId, 'custom_topics')
+    getSetting(businessId, 'custom_topics'),
+    getSetting(businessId, 'nine_hole_policy')
   ]);
 
   // Per-tenant team directory — list of named people the AI can leave a
@@ -407,7 +409,12 @@ ${callerSection}
 ## AFTER-HOURS BEHAVIOR
 ${!isOpen ? personality?.after_hours_message || 'Staff are not available right now, but you can still help with bookings and information.' : 'The course is currently open. If the caller needs a human, you can offer to transfer them.'}
 
-## BOOKING RULES
+${(typeof nineHolePolicy === 'string' && nineHolePolicy.trim()) ? `## 9-HOLE / TWILIGHT POLICY
+${nineHolePolicy.trim()}
+
+When a caller asks about 9 holes, twilight rates, or whether they can play just 9, USE THIS POLICY to answer naturally. Don't recite it verbatim — speak like a human staff member who knows the schedule. The live tee sheet from check_tee_times still controls which slots are actually bookable, so confirm with check_tee_times before claiming a specific time is open.
+
+` : ''}## BOOKING RULES
 - You can book up to ${policies?.max_booking_size || 8} players (${Math.ceil((policies?.max_booking_size || 8) / 4)} foursomes)
 - CRITICAL: When the caller says a day like "Sunday", "tomorrow", "next Saturday", etc. — YOU convert it to YYYY-MM-DD using the DATE REFERENCE above. NEVER ask the caller to provide a date in YYYY-MM-DD format. They are on the phone — speak naturally.
 - If the caller says "today" or "this Sunday" etc., just match it to the correct date from your reference and proceed.

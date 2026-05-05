@@ -862,7 +862,15 @@ router.patch('/businesses/:id', async (req, res) => {
     // end_hour, end_min, interval_min }. Persists the operator's
     // chosen Start / End / Interval so the same grid layout shows
     // every day. Read-only with respect to Tee-On's actual slot data.
-    'tee_sheet_config'
+    'tee_sheet_config',
+    // Free-form policy text the AI consults when callers ask about
+    // 9-hole availability / twilight rates. Example:
+    //   "9-hole back-nine runs during twilight only. May–Sept after
+    //    4 PM, Oct 1+ after 3 PM. Mornings are 18-hole only."
+    // Used to ANSWER "do you offer 9 holes?" naturally — the live
+    // tee sheet from Tee-On still controls which slots can actually
+    // be booked.
+    'nine_hole_policy'
   ]);
   const settingsMap =
     body.settings && typeof body.settings === 'object' && !Array.isArray(body.settings)

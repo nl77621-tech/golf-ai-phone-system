@@ -2297,6 +2297,70 @@ function TeeSheetPage() {
   const [saving, setSaving] = useState(false);
   const [saveMsg, setSaveMsg] = useState('');
 
+  // ─── Tee-sheet grid config persistence ─────────────────────────────────
+  // Per-tenant settings.tee_sheet_config = { start_hour, start_min,
+  // end_hour, end_min, interval_min }. Loaded once on mount; stays in
+  // local state while the operator tweaks; persists when they hit the
+  // new "Save grid" button. Only affects the LOCAL grid display — does
+  // NOT touch Tee-On data, which is read-only and lives elsewhere.
+  // We track the last-saved snapshot so the Save button only enables
+  // when there's a real change (so the operator doesn't double-click
+  // and resave the same config).
+  const [savedConfig, setSavedConfig] = useState(null);
+  const [savingConfig, setSavingConfig] = useState(false);
+  const [configSaveMsg, setConfigSaveMsg] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    api('/api/settings').then(all => {
+      if (cancelled) return;
+      const cfg = all?.tee_sheet_config?.value;
+      if (cfg && typeof cfg === 'object') {
+        if (Number.isInteger(cfg.start_hour) && cfg.start_hour >= 4 && cfg.start_hour <= 22) setStartHour(cfg.start_hour);
+        if (Number.isInteger(cfg.start_min)  && cfg.start_min >= 0 && cfg.start_min <= 59) setStartMin(cfg.start_min);
+        if (Number.isInteger(cfg.end_hour)   && cfg.end_hour >= 5 && cfg.end_hour <= 23) setEndHour(cfg.end_hour);
+        if (Number.isInteger(cfg.end_min)    && cfg.end_min >= 0 && cfg.end_min <= 59) setEndMin(cfg.end_min);
+        if (Number.isInteger(cfg.interval_min) && cfg.interval_min >= 5 && cfg.interval_min <= 60) setInterval2(cfg.interval_min);
+        setSavedConfig({ start_hour: cfg.start_hour, start_min: cfg.start_min, end_hour: cfg.end_hour, end_min: cfg.end_min, interval_min: cfg.interval_min });
+      } else {
+        // No saved config yet — record the defaults as the baseline so
+        // the Save button activates as soon as the operator changes anything.
+        setSavedConfig({ start_hour: 6, start_min: 0, end_hour: 19, end_min: 0, interval_min: 10 });
+      }
+    }).catch(() => {
+      setSavedConfig({ start_hour: 6, start_min: 0, end_hour: 19, end_min: 0, interval_min: 10 });
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  const currentConfig = { start_hour: startHour, start_min: startMin, end_hour: endHour, end_min: endMin, interval_min: interval };
+  const configDirty = savedConfig
+    ? (savedConfig.start_hour !== startHour || savedConfig.start_min !== startMin ||
+       savedConfig.end_hour   !== endHour   || savedConfig.end_min   !== endMin   ||
+       savedConfig.interval_min !== interval)
+    : false;
+
+  const saveTeeSheetConfig = async () => {
+    setSavingConfig(true);
+    setConfigSaveMsg('');
+    try {
+      await api('/api/settings/tee_sheet_config', {
+        method: 'PUT',
+        body: JSON.stringify({
+          value: currentConfig,
+          description: 'Local tee-sheet grid display: start, end, interval. Read-only with respect to Tee-On.'
+        })
+      });
+      setSavedConfig({ ...currentConfig });
+      setConfigSaveMsg('Saved');
+      setTimeout(() => setConfigSaveMsg(''), 1500);
+    } catch (err) {
+      setConfigSaveMsg('Failed: ' + (err.message || 'unknown'));
+    } finally {
+      setSavingConfig(false);
+    }
+  };
+
   const loadBookings = () => {
     setLoading(true);
     api('/api/bookings?limit=200')
@@ -2530,7 +2594,24 @@ function TeeSheetPage() {
         React.createElement('button', {
           onClick: () => setSelectedDate(toLocalDateStr(today)),
           className: 'text-sm px-3 py-2 bg-golf-600 hover:bg-golf-700 text-white rounded-xl transition-colors shadow-sm'
-        }, 'Today')
+        }, 'Today'),
+        // Save grid — persists Start / End / Interval to settings.tee_sheet_config
+        // so the same layout reappears every time anyone opens the Tee Sheet.
+        // Disabled until the operator changes something (avoids redundant saves)
+        // or while a save is in flight. NEVER touches Tee-On data — only the
+        // local grid display config.
+        React.createElement('button', {
+          onClick: saveTeeSheetConfig,
+          disabled: !configDirty || savingConfig,
+          title: configDirty
+            ? 'Save Start / End / Interval so this grid layout shows every day'
+            : 'No changes to save — already matches the saved grid',
+          className: `text-sm px-3 py-2 rounded-xl transition-colors shadow-sm font-medium ${
+            configDirty
+              ? 'bg-emerald-600 hover:bg-emerald-700 text-white'
+              : 'bg-gray-100 text-gray-400 cursor-not-allowed'
+          }`
+        }, savingConfig ? 'Saving…' : configSaveMsg || (configDirty ? '💾 Save grid' : '✓ Saved'))
       )
     ),
 

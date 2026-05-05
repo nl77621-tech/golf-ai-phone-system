@@ -857,7 +857,12 @@ router.patch('/businesses/:id', async (req, res) => {
     // Plain array of short strings the operator can click to populate
     // today's message. Storage-only — the AI doesn't read these
     // directly; they're a convenience for the human in the dashboard.
-    'daily_instruction_quickfills'
+    'daily_instruction_quickfills',
+    // Local Tee Sheet grid display config — { start_hour, start_min,
+    // end_hour, end_min, interval_min }. Persists the operator's
+    // chosen Start / End / Interval so the same grid layout shows
+    // every day. Read-only with respect to Tee-On's actual slot data.
+    'tee_sheet_config'
   ]);
   const settingsMap =
     body.settings && typeof body.settings === 'object' && !Array.isArray(body.settings)

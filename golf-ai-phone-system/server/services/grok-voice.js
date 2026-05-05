@@ -1096,6 +1096,30 @@ async function executeToolCall(toolName, args, ctx) {
             }
           }
 
+          // ---------- HOLES AVAILABILITY SUMMARY ----------
+          // Real customer feedback: AI was asking "18 or 9 holes?" in the
+          // morning when Tee-On only has 18-hole slots up there. Tee-On
+          // 9-hole back-nine starts only run in the afternoon/twilight
+          // window, never AM at most courses. Surface explicit
+          // morning_18 / morning_9 / afternoon_18 / afternoon_9 counts so
+          // the AI can SEE which products are actually available before
+          // asking the caller a multiple-choice question that has only
+          // one real answer.
+          const has_morning_18  = morning18Fits.length > 0 || morning18Partial.length > 0;
+          const has_morning_9   = morningBack9Fits.length > 0 || morningBack9Partial.length > 0;
+          const has_afternoon_18 = afternoon18Fits.length > 0 || afternoon18Partial.length > 0;
+          const has_afternoon_9 = back9Fits.filter(s => s.time.includes('PM')).length > 0
+                              || back9Partial.filter(s => s.time.includes('PM')).length > 0;
+          const holes_available = {
+            morning:    { eighteen: has_morning_18,    nine: has_morning_9 },
+            afternoon:  { eighteen: has_afternoon_18,  nine: has_afternoon_9 }
+          };
+
+          message += `\n\nHOLES AVAILABILITY (use this to decide whether to ask "18 or 9 holes?"):`;
+          message += `\n• Morning: ${has_morning_18 ? '18-hole YES' : '18-hole NO'} | ${has_morning_9 ? '9-hole YES' : '9-hole NO'}`;
+          message += `\n• Afternoon: ${has_afternoon_18 ? '18-hole YES' : '18-hole NO'} | ${has_afternoon_9 ? '9-hole YES' : '9-hole NO'}`;
+          message += `\n→ If only ONE of the two products has slots in the time window the caller asked about, DO NOT ASK the holes question — just say "for 18 holes" or "for 9 holes back nine" and continue. Asking "18 or 9?" when 9 isn't available is misleading.`;
+
           // ---------- KEY FACTS — flat facts the AI can quote directly ----------
           message += `\n\nKEY FACTS:`;
           if (earliestFits18) {
@@ -1143,8 +1167,8 @@ If you are about to say a time and it does NOT appear above, STOP. Either re-cal
 - 🚫 NEVER INVENT TIMES. Tee-On uses an irregular 8-minute grid (e.g. 4:06, 4:22, 4:46, 4:54 — NOT 4:02, 4:10, 4:18). If you don't see a specific time in the AUTHORITATIVE TIME LIST above, that time DOES NOT EXIST. A real customer was nearly told to show up for "4:02 PM" — a slot that never existed. NEVER do that. Read times from the list verbatim.
 - ⚠️ CRITICAL — When you say a time aloud, say the EXACT minute as it appears in the list. When you eventually call book_tee_time, pass the EXACT slot time character-for-character. If the caller asked for "2 PM" and the closest valid time is 1:58 PM, you MUST say "1:58 PM" — never paraphrase as "2 PM" or "around 2".`;
 
-          console.log(`[tenant:${businessId}][${callLogId}] Tee times for ${args.date}: ${openSlots.length} open (${fitsParty} fit ${partySize}); ${full18.length} 18-hole / ${back9.length} 9-hole; whitelist=${valid_times.length} times`);
-          return { available: true, date: args.date, partySize, total: openSlots.length, fits_party: fitsParty, valid_times, message };
+          console.log(`[tenant:${businessId}][${callLogId}] Tee times for ${args.date}: ${openSlots.length} open (${fitsParty} fit ${partySize}); ${full18.length} 18-hole / ${back9.length} 9-hole; whitelist=${valid_times.length} times; AM18=${has_morning_18} AM9=${has_morning_9} PM18=${has_afternoon_18} PM9=${has_afternoon_9}`);
+          return { available: true, date: args.date, partySize, total: openSlots.length, fits_party: fitsParty, valid_times, holes_available, message };
         } catch (err) {
           console.error(`[tenant:${businessId}][TeeOn] checkAvailability error:`, err.message);
           return { available: null, message: 'Unable to check live availability right now. I can take a booking request.' };

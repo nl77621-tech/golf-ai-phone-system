@@ -852,7 +852,12 @@ router.patch('/businesses/:id', async (req, res) => {
     // matching calls to a take_topic_message flow. Used for ad-hoc
     // scenarios the wizard templates don't cover (e.g. lost & found,
     // catering inquiries, league sign-ups).
-    'custom_topics'
+    'custom_topics',
+    // Tenant-saved quick-fill chips for the Daily Instructions panel.
+    // Plain array of short strings the operator can click to populate
+    // today's message. Storage-only — the AI doesn't read these
+    // directly; they're a convenience for the human in the dashboard.
+    'daily_instruction_quickfills'
   ]);
   const settingsMap =
     body.settings && typeof body.settings === 'object' && !Array.isArray(body.settings)

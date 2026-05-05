@@ -1514,6 +1514,9 @@ function DailyInstructionsTab({ settings, saveSetting, saving }) {
     setLocal(prev => ({ ...prev, [dateKey]: { active: false, message: '' } }));
   };
 
+  // Built-in starter chips — common scenarios most courses hit. Always
+  // visible; cannot be removed. Tenants who want their own phrasings add
+  // them via the "Add your own" input below — those chips ARE removable.
   const EXAMPLES = [
     'Cart path only today due to wet conditions.',
     'Back 9 closed for aeration — front 9 only.',
@@ -1525,6 +1528,48 @@ function DailyInstructionsTab({ settings, saveSetting, saving }) {
     'Driving range closed for maintenance.',
   ];
 
+  // Custom chips — saved per-tenant in settings.daily_instruction_quickfills
+  // as an array of strings. Loaded once from the same `settings` blob the
+  // rest of this component already reads, so no extra API call needed.
+  const customChipsRaw = settings['daily_instruction_quickfills']?.value;
+  const initialCustom = Array.isArray(customChipsRaw) ? customChipsRaw : [];
+  const [customChips, setCustomChips] = useState(initialCustom);
+  const [newChip, setNewChip] = useState('');
+  const [chipSaving, setChipSaving] = useState(false);
+
+  // Re-sync from settings when the parent reloads (e.g. after another save).
+  useEffect(() => {
+    const v = settings['daily_instruction_quickfills']?.value;
+    setCustomChips(Array.isArray(v) ? v : []);
+  }, [settings]);
+
+  const persistCustomChips = async (next) => {
+    setChipSaving(true);
+    try {
+      await saveSetting('daily_instruction_quickfills', next);
+      setCustomChips(next);
+    } catch (_) {
+      // saveSetting handles its own error UI
+    } finally {
+      setChipSaving(false);
+    }
+  };
+
+  const addCustomChip = async () => {
+    const t = newChip.trim();
+    if (!t) return;
+    if (customChips.includes(t) || EXAMPLES.includes(t)) {
+      setNewChip(''); // already there, just clear
+      return;
+    }
+    await persistCustomChips([...customChips, t]);
+    setNewChip('');
+  };
+
+  const removeCustomChip = async (chip) => {
+    await persistCustomChips(customChips.filter(c => c !== chip));
+  };
+
   return React.createElement('div', null,
     // Header
     React.createElement('div', { className: 'mb-6' },
@@ -1534,18 +1579,60 @@ function DailyInstructionsTab({ settings, saveSetting, saving }) {
       )
     ),
 
-    // Quick examples strip
+    // Quick examples strip — built-ins + custom user-saved chips.
     React.createElement('div', { className: 'mb-6 p-4 bg-gray-50 rounded-xl border' },
-      React.createElement('p', { className: 'text-xs font-medium text-gray-500 mb-2' }, '⚡ Quick fill — click to copy to any day below:'),
-      React.createElement('div', { className: 'flex flex-wrap gap-2' },
+      React.createElement('p', { className: 'text-xs font-medium text-gray-500 mb-2' }, '⚡ Quick fill — click to copy to today below:'),
+      React.createElement('div', { className: 'flex flex-wrap gap-2 mb-3' },
+        // Built-in chips
         EXAMPLES.map(ex => React.createElement('button', {
-          key: ex,
+          key: 'builtin:' + ex,
           onClick: () => {
             const todayKey = toDateKey(0);
             updateLocal(todayKey, 'message', ex);
           },
           className: 'text-xs px-2.5 py-1 bg-white hover:bg-golf-50 hover:text-golf-700 border border-gray-200 rounded-lg transition-colors text-gray-600'
-        }, ex))
+        }, ex)),
+        // Custom user chips — same look, but with a small × on hover so the
+        // operator can remove the ones they don't want anymore. Click on the
+        // text still copies; click on the × removes.
+        customChips.map(chip => React.createElement('span', {
+          key: 'custom:' + chip,
+          className: 'inline-flex items-center text-xs bg-white border border-amber-200 rounded-lg overflow-hidden'
+        },
+          React.createElement('button', {
+            onClick: () => {
+              const todayKey = toDateKey(0);
+              updateLocal(todayKey, 'message', chip);
+            },
+            className: 'px-2.5 py-1 hover:bg-amber-50 hover:text-amber-800 transition-colors text-gray-700'
+          }, chip),
+          React.createElement('button', {
+            onClick: () => removeCustomChip(chip),
+            disabled: chipSaving,
+            title: 'Remove this custom chip',
+            className: 'px-1.5 py-1 text-gray-400 hover:text-red-600 hover:bg-red-50 border-l border-amber-100 disabled:opacity-50'
+          }, '×')
+        ))
+      ),
+      // Add-your-own input. Save on Enter or button click. Pressing the
+      // input while focused doesn't submit the parent day card — the input
+      // is its own scope.
+      React.createElement('div', { className: 'flex gap-2 items-center pt-2 border-t border-gray-200' },
+        React.createElement('span', { className: 'text-xs font-medium text-gray-500 shrink-0' }, '+ Your own:'),
+        React.createElement('input', {
+          type: 'text',
+          placeholder: 'e.g. Greens just aerated — putting may be slow',
+          value: newChip,
+          onChange: e => setNewChip(e.target.value),
+          onKeyDown: e => { if (e.key === 'Enter') { e.preventDefault(); addCustomChip(); } },
+          maxLength: 200,
+          className: 'flex-1 text-xs px-2.5 py-1 bg-white border border-gray-200 rounded-lg focus:ring-2 focus:ring-golf-500 focus:border-transparent outline-none'
+        }),
+        React.createElement('button', {
+          onClick: addCustomChip,
+          disabled: chipSaving || !newChip.trim(),
+          className: 'text-xs px-3 py-1 rounded-lg font-medium transition-colors bg-golf-600 hover:bg-golf-700 text-white disabled:bg-gray-200 disabled:text-gray-400 disabled:cursor-not-allowed'
+        }, chipSaving ? 'Saving…' : 'Add chip')
       )
     ),
 

@@ -196,6 +196,19 @@ async function getPendingModifications(businessId) {
 }
 
 // Update booking status (from Command Center)
+//
+// Tee-On sync hook (Phase 13):
+//   When a booking transitions to 'confirmed' we optionally push it to
+//   the live Tee-On admin tee sheet. The push is gated by per-tenant
+//   feature flags (`teeon_admin_writes_enabled` + `teeon_admin_dry_run`)
+//   in the settings table — both default to off / dry-run, so EXISTING
+//   tenants see ZERO behaviour change until ops opts them in.
+//   - Push happens BEFORE the local UPDATE on confirm. If Tee-On rejects
+//     the booking, we throw and the row stays 'pending' so staff can
+//     retry — no half-confirmed state, no premature SMS.
+//   - On 'cancelled' transitions from 'confirmed', we mirror the cancel
+//     to Tee-On AFTER the local UPDATE, best-effort. A Tee-On hiccup
+//     must never trap a customer in a confirmed booking they cancelled.
 async function updateBookingStatus(businessId, id, status, staffNotes) {
   requireBusinessId(businessId, 'updateBookingStatus');
 
@@ -208,6 +221,21 @@ async function updateBookingStatus(businessId, id, status, staffNotes) {
   if (prev.rows.length === 0) return null; // belongs to a different tenant (or doesn't exist)
   const prevStatus = prev.rows[0].status;
 
+  // Pre-update Tee-On push for confirm transitions. createBooking is a
+  // no-op when the feature flag is off, so this branch is dormant by
+  // default and incurs only a single getSetting() round-trip.
+  if (status === 'confirmed' && prevStatus !== 'confirmed') {
+    const teeonAdmin = require('./teeon-admin');
+    const result = await teeonAdmin.createBooking(businessId, id);
+    if (result && !result.ok && !result.skipped) {
+      // Real failure (not flag-off, not dry-run) — refuse to confirm so
+      // staff sees the error and the booking stays pending for retry.
+      const err = new Error(`Tee-On push failed: ${result.error || 'unknown'}`);
+      err.code = 'TEEON_WRITE_FAILED';
+      throw err;
+    }
+  }
+
   const res = await query(
     `UPDATE booking_requests
         SET status = $1, staff_notes = $2, updated_at = NOW()
@@ -218,6 +246,16 @@ async function updateBookingStatus(businessId, id, status, staffNotes) {
   const booking = res.rows[0];
 
   if (booking && prevStatus !== status) {
+    // Mirror cancellations to Tee-On (best-effort — local cancel wins).
+    if (status === 'cancelled' && prevStatus === 'confirmed') {
+      try {
+        const teeonAdmin = require('./teeon-admin');
+        await teeonAdmin.cancelBooking(businessId, id);
+      } catch (err) {
+        console.error(`[tenant:${businessId}] Tee-On cancel mirror failed:`, err.message);
+      }
+    }
+
     try {
       if (status === 'confirmed') {
         await sendBookingConfirmedToCustomer(businessId, booking);

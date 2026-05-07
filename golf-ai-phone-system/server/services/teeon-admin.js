@@ -511,10 +511,31 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
     if (formPage.status >= 400) {
       throw new Error(`Tee-On rejected ProshopPlayerEntry GET (${formPage.status})`);
     }
-    // Detect a redirect-to-login leak (session expired between login and now).
-    if (/SignInGolferSection|sign\s*in/i.test(formPage.body || '') && !/profileForm/i.test(formPage.body || '')) {
+    // Session-expired detection: ONLY fire when we're clearly on a login
+    // page. The previous regex (`/SignInGolferSection|sign\s*in/i`) was
+    // a false-positive magnet because the proshop form page contains
+    // "Sign Out" links and other "sign"-prefixed text. Now we look for
+    // the actual login form fields — `name="Username"` + `name="Password"`
+    // — which only co-occur on Tee-On's SignIn page itself.
+    const looksLikeLoginPage =
+      /name=['"]?Username['"]?/i.test(formPage.body || '') &&
+      /name=['"]?Password['"]?/i.test(formPage.body || '');
+    if (looksLikeLoginPage) {
       sessions.delete(businessId);
       throw new Error('Session expired before POST — re-auth required');
+    }
+    // Sanity check: confirm we landed on the booking form. The POST
+    // form has id="form" and submits to BookTimeProshop. If both are
+    // missing, something else has happened (maintenance page, session
+    // hiccup) and we should bail loudly rather than send a doomed POST.
+    const looksLikeBookingForm =
+      /id=['"]?form['"]?/i.test(formPage.body || '') ||
+      /BookTimeProshop/i.test(formPage.body || '');
+    if (!looksLikeBookingForm) {
+      throw new Error(
+        `ProshopPlayerEntry GET returned an unrecognised page ` +
+        `(${formPage.body?.length || 0} bytes; status ${formPage.status})`
+      );
     }
     // Carry any cookies the form page set into the POST.
     if (formPage.cookies && formPage.cookies.length) {

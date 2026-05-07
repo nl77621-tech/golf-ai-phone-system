@@ -801,16 +801,33 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
     });
     const bookerId = extractBookerIdForSlot(sheet.body, time, nine || 'F');
     if (!bookerId) {
-      // Two distinct failure modes:
-      //   (a) Tee-On rejected the POST silently (form re-rendered with
-      //       error class) — errorHint is true; tell ops the form was
-      //       rejected.
-      //   (b) Booking succeeded but our regex didn't catch it (HTML
-      //       format quirk) — we'd actually want to surface this too,
-      //       and ops can verify on Tee-On.
-      const reason = errorHint
-        ? 'Tee-On rejected the POST (form re-rendered with error)'
-        : 'Could not locate BookerID after POST — verify on Tee-On';
+      // Diagnostic: log the actual response body so ops can see WHY
+      // Tee-On rejected. Strip scripts/styles, collapse whitespace,
+      // grab a snippet large enough to include any visible error
+      // <h3>/<div class="error">/<p class="error">/etc.
+      const snippet = (res.body || '')
+        .replace(/<script[\s\S]*?<\/script>/gi, '<script…/>')
+        .replace(/<style[\s\S]*?<\/style>/gi, '<style…/>')
+        .replace(/<link\b[^>]*>/gi, '')
+        .replace(/<meta\b[^>]*>/gi, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      // Try to extract user-visible error text first — that's the most
+      // useful piece. Look for common error containers.
+      const visibleError = (snippet.match(/<(?:h\d|p|div|span)[^>]*class="[^"]*\berror\b[^"]*"[^>]*>([^<]{3,300})<\/(?:h\d|p|div|span)>/i)
+        || snippet.match(/<(?:h\d|p|div|span)[^>]*>\s*((?:Error|Invalid|Cannot|Sorry|Please)[^<]{5,250})<\/(?:h\d|p|div|span)>/i))?.[1]?.trim();
+      console.warn(
+        `[tenant:${businessId}] [TeeOn-Admin] POST rejected body snippet:\n` +
+        `  errorHint:    ${errorHint}\n` +
+        `  visibleError: ${visibleError || '(none extracted)'}\n` +
+        `  bytes:        ${res.body?.length || 0}\n` +
+        `  snippet[0..900]: ${snippet.slice(0, 900)}`
+      );
+      const reason = visibleError
+        ? `Tee-On rejected POST: ${visibleError.slice(0, 120)}`
+        : (errorHint
+          ? 'Tee-On rejected the POST (form re-rendered with error)'
+          : 'Could not locate BookerID after POST — verify on Tee-On');
       throw new Error(reason);
     }
 

@@ -484,17 +484,71 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
 
   // Real write path. Caller has explicitly opted in by setting
   // teeon_admin_dry_run=false in settings.
+  //
+  // Tee-On's BookTimeProshop expects the proshop session to already
+  // know which slot is being edited — that state is established by
+  // GETting ProshopPlayerEntry first (the same flow a real user
+  // follows when they click an empty slot). Skipping the GET means
+  // the POST is silently treated as a no-op: HTTP 200 comes back, but
+  // no booking row appears on the tee sheet. We saw this in practice.
+  // So: GET the form page, THEN POST.
   try {
-    const { cookies } = await getSession(businessId);
+    let { cookies } = await getSession(businessId);
+    const proshopFormUrl =
+      `${PROSHOP_ENTRY_PATH}?Date=${encodeURIComponent(date)}` +
+      `&Time=${encodeURIComponent(time)}` +
+      `&Course=${cfg.courseCode}` +
+      `&Nine=${nine || 'F'}` +
+      `&ClickedGolfer=-1` +
+      `&CacheTime=true`;
+
+    await throttle(businessId);
+    const formPage = await httpsRequest({
+      method: 'GET',
+      path: proshopFormUrl,
+      headers: { Cookie: cookies, Referer: `https://${TEEON_HOST}${TEE_SHEET_PATH}?Default=true` }
+    });
+    if (formPage.status >= 400) {
+      throw new Error(`Tee-On rejected ProshopPlayerEntry GET (${formPage.status})`);
+    }
+    // Detect a redirect-to-login leak (session expired between login and now).
+    if (/SignInGolferSection|sign\s*in/i.test(formPage.body || '') && !/profileForm/i.test(formPage.body || '')) {
+      sessions.delete(businessId);
+      throw new Error('Session expired before POST — re-auth required');
+    }
+    // Carry any cookies the form page set into the POST.
+    if (formPage.cookies && formPage.cookies.length) {
+      cookies = mergeCookieHeaders(cookies, formPage.cookies);
+      const cached = sessions.get(businessId);
+      if (cached) sessions.set(businessId, { ...cached, cookies });
+    }
+    console.log(
+      `[tenant:${businessId}] [TeeOn-Admin] form page loaded ` +
+      `(${formPage.body?.length || 0} bytes) — proceeding with POST`
+    );
+
     await throttle(businessId);
     const body = encodeForm(payload);
     const res = await httpsRequest({
       method: 'POST',
       path: BOOK_TIME_PATH,
-      headers: { Cookie: cookies, Referer: `https://${TEEON_HOST}${PROSHOP_ENTRY_PATH}` },
+      headers: {
+        Cookie: cookies,
+        Referer: `https://${TEEON_HOST}${proshopFormUrl}`
+      },
       body
     });
-    if (res.status >= 400) throw new Error(`Tee-On responded ${res.status}`);
+    if (res.status >= 400) throw new Error(`Tee-On responded ${res.status} on POST`);
+    console.log(
+      `[tenant:${businessId}] [TeeOn-Admin] POST status=${res.status} ` +
+      `body=${res.body?.length || 0} bytes`
+    );
+    // Tee-On sometimes returns the form re-rendered with an error message
+    // instead of redirecting on a bad submit. Surface a hint when that
+    // happens so the log is more informative than "Could not locate BookerID".
+    const errorHint =
+      /class="error/i.test(res.body || '') ||
+      /(invalid|conflict|already booked|not allowed|please correct)/i.test(res.body || '');
 
     // Re-fetch tee sheet to discover the new BookerID.
     await throttle(businessId);
@@ -505,10 +559,17 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
     });
     const bookerId = extractBookerIdForSlot(sheet.body, time, nine || 'F');
     if (!bookerId) {
-      // Booking might still have succeeded but we couldn't find it (race
-      // with the redirect, or the slot moved). Surface an error so ops
-      // can investigate. Local row stays pending.
-      throw new Error('Could not locate BookerID after POST — verify on Tee-On');
+      // Two distinct failure modes:
+      //   (a) Tee-On rejected the POST silently (form re-rendered with
+      //       error class) — errorHint is true; tell ops the form was
+      //       rejected.
+      //   (b) Booking succeeded but our regex didn't catch it (HTML
+      //       format quirk) — we'd actually want to surface this too,
+      //       and ops can verify on Tee-On.
+      const reason = errorHint
+        ? 'Tee-On rejected the POST (form re-rendered with error)'
+        : 'Could not locate BookerID after POST — verify on Tee-On';
+      throw new Error(reason);
     }
 
     await recordSyncSuccess(businessId, bookingRequestId, bookerId);
@@ -589,17 +650,49 @@ async function cancelBooking(businessId, bookingRequestId, { nine } = {}) {
     return { ok: true, dryRun: true };
   }
 
+  // Cancel uses the same GET-then-POST pattern as create. The form page
+  // for an EXISTING booking takes BookerID + AllowDel so Tee-On knows
+  // which booking is being edited; without that GET, our delete POST
+  // can hit the same silent no-op as a missing-state create.
   try {
-    const { cookies } = await getSession(businessId);
+    let { cookies } = await getSession(businessId);
+    const proshopFormUrl =
+      `${PROSHOP_ENTRY_PATH}?Date=${encodeURIComponent(date)}` +
+      `&Time=${encodeURIComponent(time)}` +
+      `&Course=${cfg.courseCode}` +
+      `&Nine=${nine || 'F'}` +
+      `&BookerID=${encodeURIComponent(booking.teeon_booking_id)}` +
+      `&AllowDel=true` +
+      `&ClickedGolfer=0` +
+      `&CacheTime=true`;
+
+    await throttle(businessId);
+    const formPage = await httpsRequest({
+      method: 'GET',
+      path: proshopFormUrl,
+      headers: { Cookie: cookies, Referer: `https://${TEEON_HOST}${TEE_SHEET_PATH}?Default=true` }
+    });
+    if (formPage.status >= 400) {
+      throw new Error(`Tee-On rejected ProshopPlayerEntry GET on cancel (${formPage.status})`);
+    }
+    if (formPage.cookies && formPage.cookies.length) {
+      cookies = mergeCookieHeaders(cookies, formPage.cookies);
+      const cached = sessions.get(businessId);
+      if (cached) sessions.set(businessId, { ...cached, cookies });
+    }
+
     await throttle(businessId);
     const body = encodeForm(payload);
     const res = await httpsRequest({
       method: 'POST',
       path: BOOK_TIME_PATH,
-      headers: { Cookie: cookies, Referer: `https://${TEEON_HOST}${PROSHOP_ENTRY_PATH}` },
+      headers: {
+        Cookie: cookies,
+        Referer: `https://${TEEON_HOST}${proshopFormUrl}`
+      },
       body
     });
-    if (res.status >= 400) throw new Error(`Tee-On responded ${res.status}`);
+    if (res.status >= 400) throw new Error(`Tee-On responded ${res.status} on cancel POST`);
     // Clear the teeon_booking_id since the row no longer exists on Tee-On.
     await query(
       `UPDATE booking_requests

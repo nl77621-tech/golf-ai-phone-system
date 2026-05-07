@@ -890,7 +890,19 @@ function BookingsPage() {
                         : React.createElement('button', {
                             onClick: () => markNoShow(b.id, false),
                             className: 'bg-gray-400 hover:bg-gray-500 text-white px-3 py-1.5 rounded-lg text-sm font-medium'
-                          }, 'Undo No-Show')
+                          }, 'Undo No-Show'),
+                      // Cancel a confirmed booking. With Tee-On admin writes
+                      // enabled this also removes the row from the live tee
+                      // sheet (best-effort — Command Center cancel always
+                      // wins locally even if the Tee-On mirror fails).
+                      React.createElement('button', {
+                        onClick: () => {
+                          if (confirm(`Cancel ${b.customer_name}'s booking on ${b.requested_date}? This will also remove it from Tee-On.`)) {
+                            updateStatus(b.id, 'cancelled');
+                          }
+                        },
+                        className: 'bg-red-500 hover:bg-red-600 text-white px-3 py-1.5 rounded-lg text-sm font-medium'
+                      }, 'Cancel')
                     )
                   ),
                   // Inline reply panel — expands when Reply is clicked

@@ -48,7 +48,12 @@ const { query, getSetting, getBusinessById } = require('../config/database');
 
 // Tee-On endpoints — kept here as constants so route changes are one-edit.
 const TEEON_HOST = 'www.tee-on.com';
+// SIGNIN_PATH is the SignIn PAGE (HTML form). It does NOT process credentials.
+// Real credential check goes through CHECKSIGN_AJAX_PATH (an AJAX servlet
+// invoked by doLogin() on the page). Hitting SIGNIN_PATH directly with a
+// credentials body just re-renders the form — silent fail for our purposes.
 const SIGNIN_PATH = '/PubGolf/servlet/com.teeon.teesheet.servlets.golfersection.SignInGolferSection';
+const CHECKSIGN_AJAX_PATH = '/PubGolf/servlet/com.teeon.teesheet.servlets.ajax.CheckSignInCloudAjax';
 const TEE_SHEET_PATH = '/PubGolf/servlet/com.teeon.teesheet.servlets.proshop.course.booking.TeeSheetFullScreen';
 const PROSHOP_ENTRY_PATH = '/PubGolf/servlet/com.teeon.teesheet.servlets.proshop.course.booking.ProshopPlayerEntry';
 const BOOK_TIME_PATH = '/PubGolf/servlet/com.teeon.teesheet.servlets.proshop.course.booking.BookTimeProshop';
@@ -232,47 +237,64 @@ async function login(cfg) {
     `cookies=[${cookieNames(cookieHeader)}]`
   );
 
+  // Credential check goes through CheckSignInCloudAjax — an AJAX servlet
+  // invoked by the page's doLogin() function via jQuery. SignInGolferSection
+  // (the page) doesn't process credentials, it only renders the form.
+  // Verified by intercepting jQuery.ajax in the live browser: doLogin POSTs
+  // exactly Username/Password/SaveSignIn/CourseCode to that AJAX endpoint.
   await throttle(cfg.businessId);
   const body = encodeForm({
     Username: cfg.creds.username,
     Password: cfg.creds.password,
-    BackTarget: '',
-    Language: 'en',
-    LockerString: '',
-    FromTeeOn: 'true',
-    GrabFocus: 'true',
-    LoginType: '-1',
-    SaveSignIn: 'false'
+    SaveSignIn: 'false',
+    CourseCode: cfg.courseCode
   });
   const res = await httpsRequest({
     method: 'POST',
-    path: SIGNIN_PATH,
+    path: CHECKSIGN_AJAX_PATH,
     headers: {
       Cookie: cookieHeader,
-      Referer: `https://${TEEON_HOST}${signInUrl}`
+      Referer: `https://${TEEON_HOST}${signInUrl}`,
+      // jQuery sets this for $.ajax — Tee-On may use it to gate the AJAX
+      // servlet from non-AJAX callers.
+      'X-Requested-With': 'XMLHttpRequest',
+      // The AJAX servlet typically returns JSON.
+      Accept: 'application/json, text/javascript, */*; q=0.01'
     },
     body,
     redirect: true
   });
-  // Merge any cookies the POST + redirect chain set ON TOP of the
-  // primer's JSESSIONID (deduped by name — last-write-wins).
   cookieHeader = mergeCookieHeaders(cookieHeader, res.cookies);
   console.log(
     `[tenant:${cfg.businessId}] [TeeOn-Admin] login post: ` +
-    `status=${res.status} title="${titleOf(res.body)}" ` +
-    `cookies=[${cookieNames(cookieHeader)}] body=${res.body?.length || 0}b`
+    `status=${res.status} cookies=[${cookieNames(cookieHeader)}] body=${res.body?.length || 0}b`
   );
 
-  // After redirect-following we should be on a logged-in page. If we
-  // ended up back at SignIn it means credentials were rejected.
-  const looksLikeLogin =
-    /name=['"]?username['"]?/i.test(res.body || '') &&
-    /name=['"]?password['"]?/i.test(res.body || '');
-  // Also detect explicit credential-rejection text.
-  const credsRejected = /(invalid|incorrect|wrong)\s+(user|pass)/i.test(res.body || '');
-  if (!cookieHeader || looksLikeLogin || credsRejected) {
+  // CheckSignInCloudAjax returns JSON on success/failure. Sniff for
+  // common shapes: { success: true } or { Result: 'OK' } or similar.
+  // If the body looks like an HTML error page, login was rejected.
+  const bodyStr = (res.body || '').trim();
+  let looksOk = false;
+  let serverMsg = '';
+  if (bodyStr.startsWith('{') || bodyStr.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(bodyStr);
+      // Tee-On's AJAX shapes vary by tenant; treat ANY truthy success-like
+      // marker as OK. If we can see an explicit error message, capture it.
+      looksOk = parsed?.Success === true
+             || parsed?.success === true
+             || /^(true|ok|success)$/i.test(String(parsed?.Result || parsed?.result || ''))
+             || (typeof parsed?.SuccessTarget === 'string' && parsed.SuccessTarget.length > 0);
+      serverMsg = String(parsed?.Message || parsed?.message || parsed?.Error || parsed?.error || '');
+    } catch (_) { /* fallthrough — treat as not OK */ }
+  } else if (res.status === 200 && bodyStr.length < 200) {
+    // Some Tee-On AJAX endpoints return a tiny "OK" plain-text response.
+    if (/^(ok|success|true|1)$/i.test(bodyStr)) looksOk = true;
+  }
+
+  if (!looksOk) {
     throw new Error(
-      credsRejected ? 'login-failed (credentials rejected by Tee-On)' : 'login-failed'
+      `login-failed${serverMsg ? ` (${serverMsg.slice(0,80)})` : ''}`
     );
   }
   return cookieHeader;

@@ -190,6 +190,29 @@ async function isDryRun(businessId) {
 
 async function login(cfg) {
   if (!cfg.creds) throw new Error('no-credentials');
+
+  // Tee-On's auth is a stateful Java-servlet session: the server only
+  // accepts a sign-in POST whose request carries a JSESSIONID it
+  // previously issued. POSTing cold (which is what we used to do) gets
+  // a 200 OK that LOOKS authenticated — Set-Cookie comes back, body
+  // doesn't contain "forgot username" — but those cookies are NOT bound
+  // to a logged-in session on the server side. Subsequent GETs to
+  // ProshopPlayerEntry get the "your session has timed out" page.
+  //
+  // Fix: prime the session with a GET to the sign-in URL first, capture
+  // its JSESSIONID, then POST the credentials with that cookie attached.
+  // This mirrors what a browser does when the user types the URL.
+
+  const signInUrl = SIGNIN_PATH + '?LoginType=-1&GrabFocus=true&FromTeeOn=true';
+
+  await throttle(cfg.businessId);
+  const primer = await httpsRequest({
+    method: 'GET',
+    path: signInUrl,
+    redirect: true
+  });
+  let cookieHeader = mergeCookieHeaders('', primer.cookies);
+
   await throttle(cfg.businessId);
   const body = encodeForm({
     Username: cfg.creds.username,
@@ -205,18 +228,27 @@ async function login(cfg) {
   const res = await httpsRequest({
     method: 'POST',
     path: SIGNIN_PATH,
+    headers: {
+      Cookie: cookieHeader,
+      Referer: `https://${TEEON_HOST}${signInUrl}`
+    },
     body,
     redirect: true
   });
+  // Merge any cookies the POST + redirect chain set ON TOP of the
+  // primer's JSESSIONID (deduped by name — last-write-wins).
+  cookieHeader = mergeCookieHeaders(cookieHeader, res.cookies);
+
   // After redirect-following we should be on a logged-in page. If we
   // ended up back at SignIn it means credentials were rejected.
   const html = (res.body || '').toLowerCase();
-  const looksLikeLogin = html.includes('forgot username') && html.includes('sign in');
-  const cookies = (res.cookies || []).join('; ');
-  if (!cookies || looksLikeLogin) {
+  const looksLikeLogin =
+    /name=['"]?username['"]?/i.test(res.body || '') &&
+    /name=['"]?password['"]?/i.test(res.body || '');
+  if (!cookieHeader || looksLikeLogin) {
     throw new Error('login-failed');
   }
-  return cookies;
+  return cookieHeader;
 }
 
 async function getSession(businessId, { force = false } = {}) {

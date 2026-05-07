@@ -437,7 +437,22 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
     ? booking.requested_date.toISOString().slice(0, 10)
     : String(booking.requested_date).slice(0, 10));
   const time = timeToHHmm(booking.requested_time);
-  if (!date || !time) return { ok: false, error: 'missing-date-or-time' };
+  // A booking row without a date or time is one we cannot push to
+  // Tee-On (Tee-On requires both to identify the slot). Rather than
+  // blocking the local confirm — which would regress the existing
+  // staff workflow for any booking the AI saved without a precise
+  // time — we treat this as a best-effort skip: log it, mark the
+  // local row's teeon_last_error so ops can see it, and let the
+  // confirm proceed unchanged. Staff who still want it on Tee-On
+  // can enter it manually on the live tee sheet.
+  if (!date || !time) {
+    console.log(
+      `[tenant:${businessId}] [TeeOn-Admin] skipping push for booking ${bookingRequestId} ` +
+      `— no ${!date ? 'date' : 'time'} on row (legacy/loose booking)`
+    );
+    await recordSyncError(businessId, bookingRequestId, new Error('missing-date-or-time (skipped)'));
+    return { ok: true, skipped: true, reason: 'missing-date-or-time' };
+  }
 
   let cfg;
   try {
@@ -528,7 +543,16 @@ async function cancelBooking(businessId, bookingRequestId, { nine } = {}) {
     ? booking.requested_date.toISOString().slice(0, 10)
     : String(booking.requested_date).slice(0, 10);
   const time = timeToHHmm(booking.requested_time);
-  if (!date || !time) return { ok: false, error: 'missing-date-or-time' };
+  if (!date || !time) {
+    // Same fail-open posture as createBooking: a row without a usable
+    // date/time can't be cancelled on Tee-On either, but blocking the
+    // local cancel would be a worse outcome than a quiet skip.
+    console.log(
+      `[tenant:${businessId}] [TeeOn-Admin] skipping cancel for booking ${bookingRequestId} ` +
+      `— no ${!date ? 'date' : 'time'} on row`
+    );
+    return { ok: true, skipped: true, reason: 'missing-date-or-time' };
+  }
 
   let cfg;
   try {

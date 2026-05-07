@@ -450,6 +450,71 @@ function buildBookingPayload({
   return fields;
 }
 
+// ─── Form-HTML field parser ───────────────────────────────────────────────
+//
+// Extracts every <input>/<select>/<textarea> inside id="form" so we can
+// use the live form's values as the base payload. The submitted POST
+// then overrides ONLY the user-driven fields (player names, phones,
+// players/holes/carts choice). This preserves all the server-populated
+// hidden state (cart inventory, pricing item IDs, etc.) that Tee-On
+// expects to round-trip exactly.
+function parseFormFields(html) {
+  if (!html) return {};
+  // Narrow to the booking form. The page also has profileForm + price-form
+  // — we want only id="form".
+  const formStart = html.search(/<form[^>]*\bid=['"]form['"]/i);
+  if (formStart < 0) return {};
+  // Find the matching </form>. Forms aren't nested in this app.
+  const formEndRel = html.slice(formStart).search(/<\/form>/i);
+  const formHtml = formEndRel < 0 ? html.slice(formStart) : html.slice(formStart, formStart + formEndRel);
+
+  const out = {};
+  // <input ... name="X" ... value="Y">
+  const inputRe = /<input\b[^>]*>/gi;
+  let m;
+  while ((m = inputRe.exec(formHtml)) !== null) {
+    const tag = m[0];
+    const nm = (tag.match(/\bname=['"]([^'"]+)['"]/i) || [])[1];
+    if (!nm) continue;
+    const type = ((tag.match(/\btype=['"]([^'"]+)['"]/i) || [])[1] || 'text').toLowerCase();
+    if (type === 'submit' || type === 'button' || type === 'image') continue;
+    let v = (tag.match(/\bvalue=['"]([^'"]*)['"]/i) || [])[1] || '';
+    if (type === 'checkbox' || type === 'radio') {
+      const isChecked = /\bchecked\b/i.test(tag);
+      if (!isChecked) continue; // unchecked → not submitted
+      // checked checkbox without explicit value → "on"
+      if (!v) v = 'on';
+    }
+    // Already-set entries (multiple radios with same name): keep the
+    // checked one; we just continue past unchecked above.
+    out[nm] = v;
+  }
+  // <select name="X">...<option value="Y" selected>...</select>
+  const selectRe = /<select\b[^>]*\bname=['"]([^'"]+)['"][^>]*>([\s\S]*?)<\/select>/gi;
+  while ((m = selectRe.exec(formHtml)) !== null) {
+    const nm = m[1];
+    const inner = m[2];
+    const sel = inner.match(/<option\b[^>]*\bselected\b[^>]*>([\s\S]*?)<\/option>/i);
+    let val = '';
+    if (sel) {
+      const beforeSel = sel[0];
+      val = (beforeSel.match(/\bvalue=['"]([^'"]*)['"]/i) || [])[1];
+      if (val === undefined) val = (sel[1] || '').trim();
+    } else {
+      // Default to first option's value
+      const first = inner.match(/<option\b[^>]*>/i);
+      if (first) val = (first[0].match(/\bvalue=['"]([^'"]*)['"]/i) || [])[1] || '';
+    }
+    out[nm] = val || '';
+  }
+  // <textarea name="X">value</textarea>
+  const taRe = /<textarea\b[^>]*\bname=['"]([^'"]+)['"][^>]*>([\s\S]*?)<\/textarea>/gi;
+  while ((m = taRe.exec(formHtml)) !== null) {
+    out[m[1]] = m[2] || '';
+  }
+  return out;
+}
+
 // ─── BookerID extraction ──────────────────────────────────────────────────
 //
 // After a successful create POST, Tee-On redirects back to TeeSheetFullScreen.
@@ -656,8 +721,44 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
       `(${formPage.body?.length || 0} bytes) — proceeding with POST`
     );
 
+    // Parse the live form's hidden + select + radio values and use them
+    // as the base payload. Tee-On populates many fields from the slot's
+    // server-side state (cart inventory, pricing item IDs, etc.); if we
+    // submit empty strings for those it 500s. Override ONLY the user-
+    // driven fields we want to set: player names/contact, party
+    // size/holes/carts choice.
+    const liveFields = parseFormFields(formPage.body || '');
+    const overrides = {
+      Players: payload.Players,
+      Holes: payload.Holes,
+      Carts: payload.Carts,
+      // Slot identity — Tee-On sets these as hidden inputs on the form
+      // page already (matches our query params), but we re-assert them
+      // for safety.
+      Date: payload.Date,
+      Time: payload.Time,
+      CourseCode: payload.CourseCode,
+      Nine: payload.Nine,
+      // Slot 0 player (the booker)
+      GolferName0: payload.GolferName0,
+      Phone0: payload.Phone0,
+      Email0: payload.Email0,
+      Holes0: payload.Holes0
+    };
+    // For party >1, also override slot 1..n with "Guest"
+    for (let i = 1; i < 4; i++) {
+      if (payload[`GolferName${i}`]) overrides[`GolferName${i}`] = payload[`GolferName${i}`];
+      if (payload[`Holes${i}`]) overrides[`Holes${i}`] = payload[`Holes${i}`];
+    }
+    const merged = { ...liveFields, ...overrides };
+    console.log(
+      `[tenant:${businessId}] [TeeOn-Admin] payload merge: ` +
+      `live=${Object.keys(liveFields).length} overrides=${Object.keys(overrides).length} ` +
+      `merged=${Object.keys(merged).length}`
+    );
+
     await throttle(businessId);
-    const body = encodeForm(payload);
+    const body = encodeForm(merged);
     const res = await httpsRequest({
       method: 'POST',
       path: BOOK_TIME_PATH,
@@ -667,7 +768,19 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
       },
       body
     });
-    if (res.status >= 400) throw new Error(`Tee-On responded ${res.status} on POST`);
+    if (res.status >= 400) {
+      // Log a sanitised snippet so we can see WHY Tee-On rejected.
+      const snippet = (res.body || '')
+        .replace(/<script[\s\S]*?<\/script>/gi, '<script…/>')
+        .replace(/<style[\s\S]*?<\/style>/gi, '<style…/>')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 600);
+      console.warn(
+        `[tenant:${businessId}] [TeeOn-Admin] POST ${res.status} body snippet: ${snippet}`
+      );
+      throw new Error(`Tee-On responded ${res.status} on POST`);
+    }
     console.log(
       `[tenant:${businessId}] [TeeOn-Admin] POST status=${res.status} ` +
       `body=${res.body?.length || 0} bytes`

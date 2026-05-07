@@ -270,32 +270,41 @@ async function login(cfg) {
     `status=${res.status} cookies=[${cookieNames(cookieHeader)}] body=${res.body?.length || 0}b`
   );
 
-  // CheckSignInCloudAjax returns JSON on success/failure. Sniff for
-  // common shapes: { success: true } or { Result: 'OK' } or similar.
-  // If the body looks like an HTML error page, login was rejected.
-  const bodyStr = (res.body || '').trim();
-  let looksOk = false;
-  let serverMsg = '';
-  if (bodyStr.startsWith('{') || bodyStr.startsWith('[')) {
-    try {
-      const parsed = JSON.parse(bodyStr);
-      // Tee-On's AJAX shapes vary by tenant; treat ANY truthy success-like
-      // marker as OK. If we can see an explicit error message, capture it.
-      looksOk = parsed?.Success === true
-             || parsed?.success === true
-             || /^(true|ok|success)$/i.test(String(parsed?.Result || parsed?.result || ''))
-             || (typeof parsed?.SuccessTarget === 'string' && parsed.SuccessTarget.length > 0);
-      serverMsg = String(parsed?.Message || parsed?.message || parsed?.Error || parsed?.error || '');
-    } catch (_) { /* fallthrough — treat as not OK */ }
-  } else if (res.status === 200 && bodyStr.length < 200) {
-    // Some Tee-On AJAX endpoints return a tiny "OK" plain-text response.
-    if (/^(ok|success|true|1)$/i.test(bodyStr)) looksOk = true;
-  }
-
-  if (!looksOk) {
-    throw new Error(
-      `login-failed${serverMsg ? ` (${serverMsg.slice(0,80)})` : ''}`
-    );
+  // We don't try to parse CheckSignInCloudAjax's JSON shape — Tee-On's
+  // AJAX responses vary per tenant and we got bitten by guessing. The
+  // most reliable success signal is "can we now access an admin-only
+  // page with this session?" so we do a sanity GET to TeeSheetFullScreen
+  // (the proshop tee sheet) and check the response.
+  //
+  // If we see the proshop grid markup → login worked.
+  // If we see the "session has timed out" page → credentials rejected
+  //   or session not authenticated.
+  await throttle(cfg.businessId);
+  const verify = await httpsRequest({
+    method: 'GET',
+    path: `${TEE_SHEET_PATH}?Default=true`,
+    headers: { Cookie: cookieHeader },
+    redirect: true
+  });
+  // Carry any further cookies the verify GET set.
+  cookieHeader = mergeCookieHeaders(cookieHeader, verify.cookies);
+  const sessionTimedOut =
+    /session\s+has\s+tim/i.test(verify.body || '') ||
+    /you\s+must\s+be\s+signed\s+in/i.test(verify.body || '') ||
+    /not\s+signed\s+in\s+yet/i.test(verify.body || '');
+  // Positive signals — proshop tee sheet markers we know exist on the
+  // authenticated page (from the original recon).
+  const looksLikeTeeSheet =
+    /tee-sheet-body/i.test(verify.body || '') ||
+    /submitTime\(/i.test(verify.body || '') ||
+    /ChangeDate|changeDate/.test(verify.body || '');
+  console.log(
+    `[tenant:${cfg.businessId}] [TeeOn-Admin] login verify: ` +
+    `status=${verify.status} body=${verify.body?.length || 0}b ` +
+    `looksLikeTeeSheet=${looksLikeTeeSheet} sessionTimedOut=${sessionTimedOut}`
+  );
+  if (sessionTimedOut || !looksLikeTeeSheet) {
+    throw new Error('login-failed (session not authenticated post-AJAX)');
   }
   return cookieHeader;
 }

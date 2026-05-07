@@ -102,7 +102,7 @@ function httpsRequest({ method, path, headers = {}, body = null, redirect = true
           headers: { ...headers, Cookie: mergedCookies },
           redirect: true,
           redirectCount: redirectCount + 1
-        }).then(r => ({ ...r, cookies: mergeCookieArrays(r.cookies, setCookies) })));
+        }).then(r => ({ ...r, cookies: mergeCookieArrays(setCookies, r.cookies) })));
       }
       res.on('data', c => chunks.push(c));
       res.on('end', () => resolve({
@@ -133,8 +133,17 @@ function mergeCookieHeaders(existingHeader, newCookies) {
   return [...map.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
 }
 
-function mergeCookieArrays(a, b) {
-  return [...(a || []), ...(b || [])];
+// IMPORTANT: cookie arrays must be CHRONOLOGICAL (earliest first).
+// mergeCookieHeaders parses left-to-right and last-write-wins, so the
+// most recently set cookie has to be the LAST element of the array
+// for last-write-wins to actually pick the freshest value.
+//
+// Through a redirect chain we receive cookies "outside in" (the
+// recursive call returns the final response's cookies first), so we
+// have to reverse the order: setCookies (this hop, earlier) goes
+// FIRST, r.cookies (later hops) goes AFTER.
+function mergeCookieArrays(thisHopFirst, laterHopsAfter) {
+  return [...(thisHopFirst || []), ...(laterHopsAfter || [])];
 }
 
 function encodeForm(obj) {
@@ -205,6 +214,11 @@ async function login(cfg) {
 
   const signInUrl = SIGNIN_PATH + '?LoginType=-1&GrabFocus=true&FromTeeOn=true';
 
+  // Diagnostic helper: list cookie names only (never values).
+  const cookieNames = (header) => (header || '').split(';')
+    .map(s => s.split('=')[0].trim()).filter(Boolean).join(',');
+  const titleOf = (html) => (html || '').match(/<title[^>]*>([^<]*)<\/title>/i)?.[1]?.trim() || '(no title)';
+
   await throttle(cfg.businessId);
   const primer = await httpsRequest({
     method: 'GET',
@@ -212,6 +226,11 @@ async function login(cfg) {
     redirect: true
   });
   let cookieHeader = mergeCookieHeaders('', primer.cookies);
+  console.log(
+    `[tenant:${cfg.businessId}] [TeeOn-Admin] login primer: ` +
+    `status=${primer.status} title="${titleOf(primer.body)}" ` +
+    `cookies=[${cookieNames(cookieHeader)}]`
+  );
 
   await throttle(cfg.businessId);
   const body = encodeForm({
@@ -238,15 +257,23 @@ async function login(cfg) {
   // Merge any cookies the POST + redirect chain set ON TOP of the
   // primer's JSESSIONID (deduped by name — last-write-wins).
   cookieHeader = mergeCookieHeaders(cookieHeader, res.cookies);
+  console.log(
+    `[tenant:${cfg.businessId}] [TeeOn-Admin] login post: ` +
+    `status=${res.status} title="${titleOf(res.body)}" ` +
+    `cookies=[${cookieNames(cookieHeader)}] body=${res.body?.length || 0}b`
+  );
 
   // After redirect-following we should be on a logged-in page. If we
   // ended up back at SignIn it means credentials were rejected.
-  const html = (res.body || '').toLowerCase();
   const looksLikeLogin =
     /name=['"]?username['"]?/i.test(res.body || '') &&
     /name=['"]?password['"]?/i.test(res.body || '');
-  if (!cookieHeader || looksLikeLogin) {
-    throw new Error('login-failed');
+  // Also detect explicit credential-rejection text.
+  const credsRejected = /(invalid|incorrect|wrong)\s+(user|pass)/i.test(res.body || '');
+  if (!cookieHeader || looksLikeLogin || credsRejected) {
+    throw new Error(
+      credsRejected ? 'login-failed (credentials rejected by Tee-On)' : 'login-failed'
+    );
   }
   return cookieHeader;
 }

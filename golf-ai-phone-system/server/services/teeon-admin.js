@@ -532,9 +532,27 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
       /id=['"]?form['"]?/i.test(formPage.body || '') ||
       /BookTimeProshop/i.test(formPage.body || '');
     if (!looksLikeBookingForm) {
+      // Diagnostic: log the page title + first chunk of body so ops can
+      // see WHAT Tee-On is actually returning. Never include cookies or
+      // form values (could leak session tokens). Trim to 800 chars and
+      // collapse whitespace.
+      const title = (formPage.body || '').match(/<title[^>]*>([^<]*)<\/title>/i)?.[1]?.trim() || '(no title)';
+      const bodySnippet = (formPage.body || '')
+        .replace(/<script[\s\S]*?<\/script>/gi, '<script…/>')
+        .replace(/<style[\s\S]*?<\/style>/gi, '<style…/>')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 800);
+      console.warn(
+        `[tenant:${businessId}] [TeeOn-Admin] unrecognised page diagnostic:\n` +
+        `  title:    ${title}\n` +
+        `  bytes:    ${formPage.body?.length || 0}\n` +
+        `  status:   ${formPage.status}\n` +
+        `  snippet:  ${bodySnippet}`
+      );
       throw new Error(
         `ProshopPlayerEntry GET returned an unrecognised page ` +
-        `(${formPage.body?.length || 0} bytes; status ${formPage.status})`
+        `(title="${title.slice(0, 80)}"; ${formPage.body?.length || 0} bytes; status ${formPage.status})`
       );
     }
     // Carry any cookies the form page set into the POST.

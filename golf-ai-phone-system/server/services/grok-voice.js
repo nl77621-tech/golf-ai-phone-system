@@ -923,7 +923,62 @@ async function executeToolCall(toolName, args, ctx) {
           const partySize = args.party_size || 1;
           const teeOnCfg = await getTeeOnConfigForBusiness(businessId);
           console.log(`[tenant:${businessId}][${callLogId}] check_tee_times | date: ${args.date} | party_size: ${partySize} | raw args:`, JSON.stringify(args));
-          const allSlots = await teeon.checkAvailability(args.date, partySize, teeOnCfg);
+          let allSlots = await teeon.checkAvailability(args.date, partySize, teeOnCfg);
+
+          // Per-tenant 9-hole policy filter.
+          //
+          // Tee-On's tee sheet may legitimately list 9-hole back-nine slots
+          // at times when course management does NOT want them offered to
+          // callers (e.g. Valleymede only offers 9-hole back-nine before
+          // ~7:26 AM and after 4 PM "twilight"). Without this filter, those
+          // mid-day 9-hole entries flow through to the per-time holes
+          // annotation, get tagged "18+9", and the AI asks "18 or 9?" at
+          // a time when 9-hole shouldn't be on the table.
+          //
+          // Setting shape: nine_hole_windows = JSON array of {from, to}
+          // HH:mm strings (24-hour). Slots with holes === 9 whose time
+          // falls outside ALL configured windows are dropped here, before
+          // any downstream code sees them. Tenants with the setting unset
+          // or empty get the legacy unfiltered behaviour, so this is
+          // strictly opt-in.
+          try {
+            const nineHoleWindows = await getSetting(businessId, 'nine_hole_windows');
+            if (Array.isArray(nineHoleWindows) && nineHoleWindows.length > 0) {
+              const to24 = (timeStr) => {
+                const m = String(timeStr || '').trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+                if (!m) return null;
+                let h = parseInt(m[1], 10);
+                const ampm = m[3].toUpperCase();
+                if (ampm === 'PM' && h !== 12) h += 12;
+                if (ampm === 'AM' && h === 12) h = 0;
+                return `${String(h).padStart(2, '0')}:${m[2]}`;
+              };
+              const inWindow = (time24, windows) => {
+                if (!time24) return false;
+                for (const w of windows) {
+                  if (typeof w?.from === 'string' && typeof w?.to === 'string'
+                      && time24 >= w.from && time24 <= w.to) return true;
+                }
+                return false;
+              };
+              const before = allSlots.length;
+              allSlots = allSlots.filter(s => {
+                if (s.holes !== 9) return true;
+                return inWindow(to24(s.time), nineHoleWindows);
+              });
+              if (allSlots.length !== before) {
+                console.log(
+                  `[tenant:${businessId}][${callLogId}] nine_hole_windows: ` +
+                  `dropped ${before - allSlots.length} 9-hole slot(s) outside policy windows`
+                );
+              }
+            }
+          } catch (filterErr) {
+            console.warn(
+              `[tenant:${businessId}][${callLogId}] nine_hole_windows filter failed (continuing unfiltered):`,
+              filterErr.message
+            );
+          }
 
           // Subtract any pending holds — bookings the AI has taken on this
           // call (or earlier today) that staff hasn't yet pushed to Tee-On.

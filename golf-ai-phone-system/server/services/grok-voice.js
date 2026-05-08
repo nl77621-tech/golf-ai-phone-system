@@ -745,7 +745,7 @@ function buildToolDefinitions() {
       parameters: {
         type: 'object',
         properties: {
-          customer_name: { type: 'string', description: 'Full name of the customer' },
+          customer_name: { type: 'string', description: 'FULL name of the customer — MUST include both first AND last name (e.g. "Nelson Lopes", not just "Nelson"). If the caller gave only one name, ASK for their surname before calling this tool. The Tee-On tee sheet shows this name to staff and other golfers; a single first name looks unprofessional and creates ambiguity when there are multiple bookings under the same first name. NEVER pass a single-word name to this tool.' },
           customer_phone: { type: 'string', description: 'Customer phone number' },
           customer_email: { type: 'string', description: 'Customer email address' },
           date: { type: 'string', description: 'Requested date in YYYY-MM-DD format' },
@@ -1277,6 +1277,19 @@ If you are about to say a time and it does NOT appear above, STOP. Either re-cal
         if (!args.customer_name || typeof args.customer_name !== 'string' || !args.customer_name.trim()) {
           console.warn(`[tenant:${businessId}][${callLogId}] ⚠️ book_tee_time called with invalid customer_name:`, args.customer_name);
           return { success: false, message: 'I need your name to complete the booking. Can you tell me your name?' };
+        }
+        // First-AND-last-name guard. Tee-On displays the booker's name to
+        // staff and other golfers, and a single first name creates ambiguity
+        // when multiple bookings share the same first name. The AI prompt
+        // tells the model to collect both, but we enforce server-side too.
+        const trimmedName = args.customer_name.trim();
+        const nameWords = trimmedName.split(/\s+/).filter(w => w.length > 0);
+        if (nameWords.length < 2) {
+          console.warn(`[tenant:${businessId}][${callLogId}] ⚠️ book_tee_time called with single-word name: "${trimmedName}"`);
+          return {
+            success: false,
+            message: `The name you passed ("${trimmedName}") only has one word. Tee-On bookings need both first AND last name. ASK the caller now: "And your last name?" Then re-call book_tee_time with the full name (e.g. "Nelson Lopes"). Do NOT proceed with just a first name.`
+          };
         }
         if (!args.date || typeof args.date !== 'string') {
           console.warn(`[tenant:${businessId}][${callLogId}] ⚠️ book_tee_time called with invalid date:`, args.date);

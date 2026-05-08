@@ -535,6 +535,63 @@ function extractBookerIdForSlot(html, time, nine) {
   return m ? m[1] : null;
 }
 
+/**
+ * Multi-strategy BookerID extraction. The single-pattern extractor above
+ * is brittle: Tee-On's tee sheet uses different markup for booked-vs-empty
+ * slots, time strings can vary in format, and the nine indicator (F/B)
+ * isn't always what we passed. This walks 3 strategies, returning the
+ * first hit + which strategy succeeded so the log shows what worked.
+ *
+ *   1. exact          — submitExistingTime('HH:MM','<nine>','<id>'...)
+ *   2. time-any-nine  — submitExistingTime('HH:MM','<*>','<id>'...)
+ *   3. name-proximity — find customer name in HTML, then the nearest
+ *                       submitExistingTime within ±1500 chars
+ *
+ * Returns { bookerId, strategy }. bookerId is null if all strategies
+ * fail; strategy is then 'none' (or 'no-html' if input was empty).
+ */
+function extractBookerIdMultiStrategy(html, { time, nine, customerName }) {
+  if (!html) return { bookerId: null, strategy: 'no-html' };
+
+  // 1. Exact match for the slot we just booked.
+  const exactRe = new RegExp(
+    `submitExistingTime\\('${time}','${nine}','([A-Z0-9]+)'`,
+    'i'
+  );
+  const exact = html.match(exactRe);
+  if (exact) return { bookerId: exact[1], strategy: 'exact-time-nine' };
+
+  // 2. Time matches but nine indicator differs (we may have booked F
+  //    but Tee-On now reports B for it, or vice versa).
+  const timeOnlyRe = new RegExp(
+    `submitExistingTime\\('${time}','[A-Z]','([A-Z0-9]+)'`,
+    'i'
+  );
+  const timeOnly = html.match(timeOnlyRe);
+  if (timeOnly) return { bookerId: timeOnly[1], strategy: 'time-any-nine' };
+
+  // 3. Customer name proximity: find name, find nearest submitExistingTime.
+  if (customerName && customerName.length >= 3) {
+    const nameIdx = html.indexOf(customerName);
+    if (nameIdx >= 0) {
+      // ±1500 chars window around the name. The booker call usually
+      // sits in the same row, well within that range.
+      const start = Math.max(0, nameIdx - 1500);
+      const end = Math.min(html.length, nameIdx + 1500);
+      const window = html.slice(start, end);
+      const nearby = window.match(/submitExistingTime\('([^']+)','([A-Z])','([A-Z0-9]+)'/i);
+      if (nearby) {
+        return {
+          bookerId: nearby[3],
+          strategy: `name-proximity(slot=${nearby[1]}/${nearby[2]})`
+        };
+      }
+    }
+  }
+
+  return { bookerId: null, strategy: 'none' };
+}
+
 // ─── Public ops: createBooking + cancelBooking ────────────────────────────
 
 async function loadBookingRow(businessId, bookingRequestId) {
@@ -785,87 +842,136 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
       `[tenant:${businessId}] [TeeOn-Admin] POST status=${res.status} ` +
       `body=${res.body?.length || 0} bytes`
     );
-    // Tee-On sometimes returns the form re-rendered with an error message
-    // instead of redirecting on a bad submit. Surface a hint when that
-    // happens so the log is more informative than "Could not locate BookerID".
+    // ─── POST response interpretation ─────────────────────────────────
+    //
+    // Tee-On returns one of two shapes:
+    //   (a) the booking FORM re-rendered with error markup       → FAILURE
+    //   (b) the FULL TEE SHEET (with our new booking visible)    → SUCCESS
+    //
+    // Distinguishing them is the single most reliable signal we have.
+    // Past iterations relied on a regex that matched keywords like
+    // "not allowed" anywhere in the raw body — that fired on bundled
+    // analytics JS ("Session Replay is not allowed and will not be
+    // started") and sent us down the failure path on real successes.
+    // Strip scripts/styles BEFORE running any error-hint regex.
     const rawBody = res.body || '';
-    const errorHintRe = /(class="error|invalid|conflict|already booked|not allowed|please correct)/i;
-    const errorHintMatch = rawBody.match(errorHintRe);
-    const errorHint = !!errorHintMatch;
-    // Capture context around the first errorHint match — this is usually
-    // where the actual user-visible message lives. The snippet[0..900]
-    // dump only sees the very top of the page; on a re-rendered tee
-    // sheet that's the navigation chrome / first popup, not the error.
-    const errorContextRaw = errorHintMatch
-      ? rawBody.slice(Math.max(0, errorHintMatch.index - 250), errorHintMatch.index + 350)
-      : '';
-    const errorContext = errorContextRaw
+    const cleanBody = rawBody
       .replace(/<script[\s\S]*?<\/script>/gi, '')
-      .replace(/<style[\s\S]*?<\/style>/gi, '')
-      .replace(/\s+/g, ' ')
-      .trim();
-    // List every GenericMessage popup so we see whether Tee-On stacked an
-    // error popup behind the "Tee Sheet Settings" overlay.
+      .replace(/<style[\s\S]*?<\/style>/gi, '');
+
+    const looksLikeReRenderedForm =
+      /<form[^>]*\bid=['"]?form['"]?[^>]*>/i.test(cleanBody) &&
+      /BookTimeProshop/i.test(cleanBody);
+    const looksLikeTeeSheet =
+      /<title[^>]*>[^<]*Tee\s*Sheet[^<]*<\/title>/i.test(cleanBody) &&
+      !looksLikeReRenderedForm;
+
+    // Customer name reflected in the POST response = we definitely
+    // hit Tee-On with our payload and it accepted enough of it to
+    // render the name back. Strongest "did the booking land" signal.
+    const customerName = booking.customer_name || '';
+    const customerNameInPostBody = customerName.length >= 3 && cleanBody.includes(customerName);
+
+    // errorHint only meaningful inside a re-rendered form — keywords
+    // inside a tee-sheet body are almost always tooltip / help text.
+    const errorHintRe = /(class="[^"]*\berror\b|please correct|already booked|not allowed|conflict)/i;
+    const errorHintMatchInForm = looksLikeReRenderedForm ? cleanBody.match(errorHintRe) : null;
+    const errorHint = !!errorHintMatchInForm;
+    const errorContext = errorHintMatchInForm
+      ? cleanBody.slice(Math.max(0, errorHintMatchInForm.index - 250), errorHintMatchInForm.index + 350)
+          .replace(/\s+/g, ' ')
+          .trim()
+      : '';
+
+    // GenericMessage popups — kept for diagnostics. Most are routine UI
+    // overlays (Settings, Messages, Directions). On a re-rendered form
+    // an error popup may surface here — that's the high-value signal.
     const popupRe = /<div[^>]*class="[^"]*GenericPopup[^"]*"[^>]*id="(GenericMessage\d+)"[^>]*>([\s\S]{0,800}?)<\/div>\s*<\/div>/gi;
     const popups = [];
     let popupMatch;
-    while ((popupMatch = popupRe.exec(rawBody)) !== null) {
-      const id = popupMatch[1];
-      const inner = popupMatch[2]
-        .replace(/<script[\s\S]*?<\/script>/gi, '')
-        .replace(/<style[\s\S]*?<\/style>/gi, '')
-        .replace(/\s+/g, ' ')
-        .trim()
-        .slice(0, 220);
-      popups.push(`${id}: ${inner}`);
+    while ((popupMatch = popupRe.exec(cleanBody)) !== null) {
+      popups.push(`${popupMatch[1]}: ${popupMatch[2].replace(/\s+/g, ' ').trim().slice(0, 220)}`);
       if (popups.length >= 6) break;
     }
 
-    // Re-fetch tee sheet to discover the new BookerID.
+    // Re-fetch tee sheet to discover the new BookerID. We try multiple
+    // strategies so one HTML quirk doesn't sink the whole sync.
     await throttle(businessId);
     const sheet = await httpsRequest({
       method: 'GET',
       path: `${TEE_SHEET_PATH}?Course=${cfg.courseCode}&Date=${encodeURIComponent(date)}&Default=true`,
       headers: { Cookie: cookies }
     });
-    const bookerId = extractBookerIdForSlot(sheet.body, time, nine || 'F');
-    if (!bookerId) {
-      // Diagnostic: log the actual response body so ops can see WHY
-      // Tee-On rejected. Strip scripts/styles, collapse whitespace,
-      // grab a snippet large enough to include any visible error
-      // <h3>/<div class="error">/<p class="error">/etc.
-      const snippet = (res.body || '')
-        .replace(/<script[\s\S]*?<\/script>/gi, '<script…/>')
-        .replace(/<style[\s\S]*?<\/style>/gi, '<style…/>')
-        .replace(/<link\b[^>]*>/gi, '')
-        .replace(/<meta\b[^>]*>/gi, '')
-        .replace(/\s+/g, ' ')
-        .trim();
-      // Try to extract user-visible error text first — that's the most
-      // useful piece. Look for common error containers.
-      const visibleError = (snippet.match(/<(?:h\d|p|div|span)[^>]*class="[^"]*\berror\b[^"]*"[^>]*>([^<]{3,300})<\/(?:h\d|p|div|span)>/i)
-        || snippet.match(/<(?:h\d|p|div|span)[^>]*>\s*((?:Error|Invalid|Cannot|Sorry|Please)[^<]{5,250})<\/(?:h\d|p|div|span)>/i))?.[1]?.trim();
-      console.warn(
-        `[tenant:${businessId}] [TeeOn-Admin] POST rejected body snippet:\n` +
-        `  errorHint:    ${errorHint}${errorHintMatch ? ` (matched "${errorHintMatch[0]}" @${errorHintMatch.index})` : ''}\n` +
-        `  visibleError: ${visibleError || '(none extracted)'}\n` +
-        `  bytes:        ${res.body?.length || 0}\n` +
-        `  popups (${popups.length}):\n` +
-        (popups.length ? popups.map(p => `    - ${p}`).join('\n') + '\n' : '    (none found)\n') +
-        `  errorContext: ${errorContext || '(no errorHint match)'}\n` +
-        `  snippet[0..1500]: ${snippet.slice(0, 1500)}`
+    const sheetBody = sheet.body || '';
+    const extracted = extractBookerIdMultiStrategy(sheetBody, {
+      time, nine: nine || 'F', customerName
+    });
+
+    // ─── Decision matrix ─────────────────────────────────────────────
+    //   bookerId  | post-body shape       | outcome
+    //   --------- | --------------------- | -------------------------
+    //   FOUND     | (any)                 | SUCCESS, full sync
+    //   not found | tee sheet + name      | SUCCESS (lenient — log warn)
+    //   not found | tee sheet, no name    | UNCERTAIN — fail loudly
+    //   not found | re-rendered form      | FAILURE (real)
+    //
+    // The "lenient" path was missing before. We were throwing on every
+    // BookerID extraction miss, which masquerades as "form re-rendered
+    // with error" even when Tee-On clearly accepted the booking.
+    if (extracted.bookerId) {
+      await recordSyncSuccess(businessId, bookingRequestId, extracted.bookerId);
+      console.log(
+        `[tenant:${businessId}] [TeeOn-Admin] createBooking OK ` +
+        `booker=${extracted.bookerId} via=${extracted.strategy} date=${date} time=${time}`
       );
-      const reason = visibleError
-        ? `Tee-On rejected POST: ${visibleError.slice(0, 120)}`
-        : (errorHint
-          ? 'Tee-On rejected the POST (form re-rendered with error)'
-          : 'Could not locate BookerID after POST — verify on Tee-On');
-      throw new Error(reason);
+      return { ok: true, bookerId: extracted.bookerId, strategy: extracted.strategy };
+    }
+    if (looksLikeTeeSheet && customerNameInPostBody) {
+      // Booking landed; we just couldn't pin the BookerID. Mark synced
+      // so the local row reads "confirmed". Cancel-from-our-UI for
+      // this booking will need ops to manually reconcile the BookerID
+      // (rare path — log loudly).
+      await recordSyncSuccess(businessId, bookingRequestId, null);
+      console.warn(
+        `[tenant:${businessId}] [TeeOn-Admin] createBooking PROBABLY OK ` +
+        `(tee-sheet body + customer name "${customerName}" reflected) ` +
+        `but BookerID extraction failed for date=${date} time=${time}/${nine || 'F'}. ` +
+        `Booking is on Tee-On; cancel from our UI may need manual reconcile. ` +
+        `Strategies tried: exact, time-any-nine, name-proximity (all missed).`
+      );
+      return { ok: true, bookerId: null, warning: 'no-booker-id', strategy: 'lenient-name-match' };
     }
 
-    await recordSyncSuccess(businessId, bookingRequestId, bookerId);
-    console.log(`[tenant:${businessId}] [TeeOn-Admin] createBooking OK booker=${bookerId} date=${date} time=${time}`);
-    return { ok: true, bookerId };
+    // Real failure path — dump full forensic diagnostic.
+    const allSubmitTimes = [];
+    const submitRe = /submitExistingTime\('([^']+)','([A-Z])','([A-Z0-9]+)'/g;
+    let st;
+    while ((st = submitRe.exec(sheetBody)) !== null) {
+      allSubmitTimes.push(`${st[1]}/${st[2]}/${st[3]}`);
+      if (allSubmitTimes.length >= 30) break;
+    }
+    const nameInSheet = customerName && sheetBody.includes(customerName);
+    const nameSheetIdx = customerName ? sheetBody.indexOf(customerName) : -1;
+    console.warn(
+      `[tenant:${businessId}] [TeeOn-Admin] POST rejected body snippet:\n` +
+      `  bodyShape:    looksLikeReRenderedForm=${looksLikeReRenderedForm} looksLikeTeeSheet=${looksLikeTeeSheet}\n` +
+      `  customerName: "${customerName}" inPostBody=${customerNameInPostBody} inSheet=${nameInSheet}${nameSheetIdx >= 0 ? ` @${nameSheetIdx}` : ''}\n` +
+      `  errorHint:    ${errorHint}${errorHintMatchInForm ? ` (matched "${errorHintMatchInForm[0]}" @${errorHintMatchInForm.index})` : ''}\n` +
+      `  errorContext: ${errorContext || '(none — errorHint only fires on re-rendered form)'}\n` +
+      `  popups (${popups.length}):\n` +
+      (popups.length ? popups.map(p => `    - ${p}`).join('\n') + '\n' : '    (none found)\n') +
+      `  bookingTime:  ${time}/${nine || 'F'}\n` +
+      `  sheetSlots (${allSubmitTimes.length}): ${allSubmitTimes.slice(0, 12).join(', ')}${allSubmitTimes.length > 12 ? ', …' : ''}\n` +
+      `  postBytes:    ${rawBody.length}\n` +
+      `  sheetBytes:   ${sheetBody.length}\n` +
+      `  postSnippet[0..1500]: ${cleanBody.replace(/\s+/g, ' ').trim().slice(0, 1500)}`
+    );
+    const reason = errorHint
+      ? 'Tee-On rejected the POST (form re-rendered with error)'
+      : (looksLikeTeeSheet
+        ? 'POST returned tee sheet but customer name not reflected — booking may not have landed'
+        : 'POST returned an unrecognised page — verify on Tee-On');
+    throw new Error(reason);
   } catch (err) {
     await recordSyncError(businessId, bookingRequestId, err);
     console.error(`[tenant:${businessId}] [TeeOn-Admin] createBooking failed:`, err.message);

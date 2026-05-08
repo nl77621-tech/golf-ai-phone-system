@@ -741,7 +741,7 @@ function buildToolDefinitions() {
     {
       type: 'function',
       name: 'book_tee_time',
-      description: 'REQUIRED to create a booking — you MUST call this tool to submit the booking request. The booking does NOT exist until this tool is called. Never tell the caller the booking was submitted without calling this first. Collect name, date, time, and party size verbally. ⚠️ HOLES: do NOT ask "18 or 9?" again at confirmation time — you already determined the answer when you offered the time. If the slot the caller picked was tagged "18-only" in your check_tee_times response, pass holes=18 without asking. If it was "9-only", pass holes=9 without asking. ONLY ask "18 or 9?" if the picked slot was tagged "18+9" (i.e. both options exist at that exact minute). Asking redundantly when there is no choice frustrates callers and slows the booking. Then call this tool immediately. CRITICAL: the `time` you pass MUST be the EXACT minute of the slot from your most recent check_tee_times response. Tee-On uses 8-minute intervals — slots end in 1:58, 2:06, 2:14, etc. NEVER round to the nearest 5 or 10 minutes. A customer was burned showing up for "2 PM" when the actual slot was 1:58 PM.',
+      description: 'REQUIRED to create a booking — you MUST call this tool to submit the booking request. The booking does NOT exist until this tool is called. Never tell the caller the booking was submitted without calling this first. Collect name, date, time, party size, AND number of power carts verbally — always ask "Would you like a power cart?" before calling this tool. ⚠️ HOLES: do NOT ask "18 or 9?" again at confirmation time — you already determined the answer when you offered the time. If the slot the caller picked was tagged "18-only" in your check_tee_times response, pass holes=18 without asking. If it was "9-only", pass holes=9 without asking. ONLY ask "18 or 9?" if the picked slot was tagged "18+9" (i.e. both options exist at that exact minute). Asking redundantly when there is no choice frustrates callers and slows the booking. Then call this tool immediately. CRITICAL: the `time` you pass MUST be the EXACT minute of the slot from your most recent check_tee_times response. Tee-On uses 8-minute intervals — slots end in 1:58, 2:06, 2:14, etc. NEVER round to the nearest 5 or 10 minutes. A customer was burned showing up for "2 PM" when the actual slot was 1:58 PM.',
       parameters: {
         type: 'object',
         properties: {
@@ -751,12 +751,12 @@ function buildToolDefinitions() {
           date: { type: 'string', description: 'Requested date in YYYY-MM-DD format' },
           time: { type: 'string', description: 'EXACT slot time in HH:MM 24h format — must be character-for-character one of the times from your most recent check_tee_times response. If check_tee_times offered "1:58 PM", pass "13:58" (NOT "14:00"). NEVER round to a friendlier minute. If you don\'t have an exact slot from check_tee_times, do not call this tool — call check_tee_times first.' },
           party_size: { type: 'integer', description: 'Number of players (1-8)' },
-          num_carts: { type: 'integer', description: 'Number of golf carts requested' },
+          num_carts: { type: 'integer', description: 'Number of power carts the caller wants (0 if walking / no cart). REQUIRED — you must explicitly ask the caller "Would you like a power cart?" during booking. Do NOT assume or default. If they say no, pass 0. If yes, ask how many (one cart fits two players: 4 players → 2 carts, 2 players → 1 cart). Carts are booked on the tee sheet at the same time as the tee time, so this value must be collected before calling this tool.' },
           holes: { type: 'integer', enum: [9, 18], description: '18 for full course (start hole 1) or 9 for back-nine only (start hole 10). REQUIRED — must match what the slot in check_tee_times offered. If the picked slot was tagged "18-only", pass 18 without asking. If "9-only", pass 9 without asking. Only ask the caller "18 or 9?" if the slot was tagged "18+9" (both available at that minute). Do NOT ask redundantly when only one option exists — the caller already made their pick.' },
           special_requests: { type: 'string', description: 'Any special requests or notes' },
           card_last_four: { type: 'string', description: 'Last 4 digits of the credit card provided by the caller (only when credit card is required)' }
         },
-        required: ['customer_name', 'date', 'time', 'party_size', 'holes']
+        required: ['customer_name', 'date', 'time', 'party_size', 'holes', 'num_carts']
       }
     },
     {

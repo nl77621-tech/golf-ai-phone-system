@@ -710,6 +710,12 @@ function BookingsPage() {
   const [replyOpenId, setReplyOpenId] = useState(null);
   const [replyText, setReplyText] = useState('');
   const [replySending, setReplySending] = useState(false);
+  // Set of booking IDs whose status update is currently in flight. While
+  // a booking is pending an action (Confirm/Reject/Cancel), we disable
+  // its action buttons so staff can't double-click and trigger duplicate
+  // Tee-On pushes. Using a Set so two staff members hitting different
+  // bookings don't block each other.
+  const [pendingActions, setPendingActions] = useState(new Set());
 
   const loadData = useCallback(async () => {
     try {
@@ -733,11 +739,29 @@ function BookingsPage() {
   }, [loadData]);
 
   const updateStatus = async (id, status) => {
+    // Guard against double-click. The Tee-On push that runs server-side
+    // on confirm can take ~5-10s (login + GET + POST + extract); without
+    // this, an impatient staff member can fire 2-3 confirms and create
+    // duplicate bookings on Tee-On.
+    if (pendingActions.has(id)) return;
     const notes = status === 'rejected' ? prompt('Reason for rejection:') : '';
+    setPendingActions(prev => {
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
     try {
       await api(`/api/bookings/${id}/status`, { method: 'PUT', body: JSON.stringify({ status, staff_notes: notes || '' }) });
       loadData();
-    } catch (err) { alert('Failed to update: ' + err.message); }
+    } catch (err) {
+      alert('Failed to update: ' + err.message);
+    } finally {
+      setPendingActions(prev => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+    }
   };
 
   const openReply = (booking) => {
@@ -870,15 +894,23 @@ function BookingsPage() {
                     b.status === 'pending' && React.createElement('div', { className: 'flex gap-2 ml-4' },
                       React.createElement('button', {
                         onClick: () => updateStatus(b.id, 'confirmed'),
-                        className: 'bg-green-500 hover:bg-green-600 text-white px-4 py-2 rounded-lg text-sm font-medium'
-                      }, 'Confirm'),
+                        disabled: pendingActions.has(b.id),
+                        className: 'bg-green-500 hover:bg-green-600 disabled:bg-green-300 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg text-sm font-medium min-w-[88px]'
+                      }, pendingActions.has(b.id)
+                        ? React.createElement('span', { className: 'inline-flex items-center gap-2' },
+                            React.createElement('span', { className: 'w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin' }),
+                            'Booking\u2026'
+                          )
+                        : 'Confirm'),
                       React.createElement('button', {
                         onClick: () => updateStatus(b.id, 'rejected'),
-                        className: 'bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-lg text-sm font-medium'
+                        disabled: pendingActions.has(b.id),
+                        className: 'bg-red-500 hover:bg-red-600 disabled:bg-red-300 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg text-sm font-medium'
                       }, 'Reject'),
                       b.customer_phone && React.createElement('button', {
                         onClick: () => replyOpenId === b.id ? setReplyOpenId(null) : openReply(b),
-                        className: 'bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-medium'
+                        disabled: pendingActions.has(b.id),
+                        className: 'bg-blue-500 hover:bg-blue-600 disabled:bg-blue-300 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg text-sm font-medium'
                       }, '\uD83D\uDCAC Reply')
                     ),
                     b.status === 'confirmed' && React.createElement('div', { className: 'flex gap-2 ml-4' },
@@ -891,18 +923,23 @@ function BookingsPage() {
                             onClick: () => markNoShow(b.id, false),
                             className: 'bg-gray-400 hover:bg-gray-500 text-white px-3 py-1.5 rounded-lg text-sm font-medium'
                           }, 'Undo No-Show'),
-                      // Cancel a confirmed booking. With Tee-On admin writes
-                      // enabled this also removes the row from the live tee
-                      // sheet (best-effort — Command Center cancel always
-                      // wins locally even if the Tee-On mirror fails).
+                      // Cancel a confirmed booking. Local-only — staff
+                      // handles Tee-On cancellation directly in Tee-On
+                      // admin (per current operations policy).
                       React.createElement('button', {
                         onClick: () => {
-                          if (confirm(`Cancel ${b.customer_name}'s booking on ${b.requested_date}? This will also remove it from Tee-On.`)) {
+                          if (confirm(`Cancel ${b.customer_name}'s booking on ${b.requested_date}? You will need to also remove it from Tee-On manually.`)) {
                             updateStatus(b.id, 'cancelled');
                           }
                         },
-                        className: 'bg-red-500 hover:bg-red-600 text-white px-3 py-1.5 rounded-lg text-sm font-medium'
-                      }, 'Cancel')
+                        disabled: pendingActions.has(b.id),
+                        className: 'bg-red-500 hover:bg-red-600 disabled:bg-red-300 disabled:cursor-not-allowed text-white px-3 py-1.5 rounded-lg text-sm font-medium min-w-[72px]'
+                      }, pendingActions.has(b.id)
+                        ? React.createElement('span', { className: 'inline-flex items-center gap-1.5' },
+                            React.createElement('span', { className: 'w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin' }),
+                            'Cancelling…'
+                          )
+                        : 'Cancel')
                     )
                   ),
                   // Inline reply panel — expands when Reply is clicked

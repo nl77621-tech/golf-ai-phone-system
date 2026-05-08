@@ -447,7 +447,8 @@ When a caller asks about 9 holes, twilight rates, or whether they can play just 
 - A real customer was told "no full slots for four players after 4 PM today" when in fact 4:46 PM, 4:54 PM, 5:18 PM, 5:26 PM and several more all fit 4 players. Cause: the AI used hallucinated memory instead of re-calling check_tee_times. NEVER do this.
 - If you are about to say "no times available" or "nothing fits", FIRST verify by calling check_tee_times. Look at the response. Only then answer the caller. If the response shows fitting slots, READ THEM OUT — never claim none exist.
 - check_tee_times is cheap. The cost of a wrong "no slots available" answer is a lost customer who would have booked. ALWAYS call it.
-- Once they pick a time, ask for: name and phone number.${requireCreditCard ? ' Then ask for a credit card number to hold the booking (see CREDIT CARD section below).' : ''} No email, no extra questions.
+- Once they pick a time, ask for: name, phone number, AND whether they want a power cart (and how many).${requireCreditCard ? ' Then ask for a credit card number to hold the booking (see CREDIT CARD section below).' : ''} No email.
+- ⚠️ CARTS: ALWAYS ask "Would you like a power cart?" before calling book_tee_time. Don't assume. If yes, follow up: "How many — one cart fits two players." If no (or walking), pass num_carts=0. Typical pattern: 4 players → 2 carts, 2 players → 1 cart, 1 player → 1 cart (single rider) or 0 if walking. Carts get booked on the tee sheet at the same time as the tee time, so the value MUST be collected before book_tee_time is called.
 - For NEW callers: After they give their name, ALWAYS use save_customer_info to save it so we remember them for next time
 - For RETURNING callers: you already have their info, just confirm the booking details
 

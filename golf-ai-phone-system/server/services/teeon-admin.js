@@ -674,9 +674,17 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
     return { ok: false, error: err.message };
   }
 
+  // Route 9-hole bookings to the Back nine, 18-hole to the Front. Tee-On
+  // models the two nines as separate columns (NineCode=F vs B) and the
+  // booking POST must target the right one. Without this, every 9-hole
+  // call hit Front 9 (which at peak times is full of 18-hole groups),
+  // Tee-On rejected silently, and our extractor matched an existing
+  // group's BookerID — false-positive success.
+  const resolvedNine = nine || (Number(booking.holes) === 9 ? 'B' : 'F');
+
   const payload = buildBookingPayload({
     cfg,
-    date, time, nine: nine || 'F',
+    date, time, nine: resolvedNine,
     partySize: booking.party_size,
     holes: booking.holes,
     numCarts: booking.num_carts,
@@ -687,7 +695,7 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
 
   if (dry) {
     console.log(`[tenant:${businessId}] [TeeOn-Admin] DRY-RUN createBooking`, {
-      bookingRequestId, date, time, nine: nine || 'F',
+      bookingRequestId, date, time, nine: resolvedNine,
       partySize: booking.party_size, holes: booking.holes,
       payloadKeys: Object.keys(payload).length
     });
@@ -710,7 +718,7 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
       `${PROSHOP_ENTRY_PATH}?Date=${encodeURIComponent(date)}` +
       `&Time=${encodeURIComponent(time)}` +
       `&Course=${cfg.courseCode}` +
-      `&Nine=${nine || 'F'}` +
+      `&Nine=${resolvedNine}` +
       `&ClickedGolfer=-1` +
       `&CacheTime=true`;
 
@@ -904,7 +912,7 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
     });
     const sheetBody = sheet.body || '';
     const extracted = extractBookerIdMultiStrategy(sheetBody, {
-      time, nine: nine || 'F', customerName
+      time, nine: resolvedNine, customerName
     });
 
     // ─── Decision matrix ─────────────────────────────────────────────
@@ -935,7 +943,7 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
       console.warn(
         `[tenant:${businessId}] [TeeOn-Admin] createBooking PROBABLY OK ` +
         `(tee-sheet body + customer name "${customerName}" reflected) ` +
-        `but BookerID extraction failed for date=${date} time=${time}/${nine || 'F'}. ` +
+        `but BookerID extraction failed for date=${date} time=${time}/${resolvedNine}. ` +
         `Booking is on Tee-On; cancel from our UI may need manual reconcile. ` +
         `Strategies tried: exact, time-any-nine, name-proximity (all missed).`
       );
@@ -960,7 +968,7 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
       `  errorContext: ${errorContext || '(none — errorHint only fires on re-rendered form)'}\n` +
       `  popups (${popups.length}):\n` +
       (popups.length ? popups.map(p => `    - ${p}`).join('\n') + '\n' : '    (none found)\n') +
-      `  bookingTime:  ${time}/${nine || 'F'}\n` +
+      `  bookingTime:  ${time}/${resolvedNine}\n` +
       `  sheetSlots (${allSubmitTimes.length}): ${allSubmitTimes.slice(0, 12).join(', ')}${allSubmitTimes.length > 12 ? ', …' : ''}\n` +
       `  postBytes:    ${rawBody.length}\n` +
       `  sheetBytes:   ${sheetBody.length}\n` +
@@ -1027,9 +1035,13 @@ async function cancelBooking(businessId, bookingRequestId, { nine } = {}) {
   const deleteSlots = [];
   for (let i = 0; i < partySize; i++) deleteSlots.push(i);
 
+  // Same nine routing as createBooking so a 9-hole booking on the Back
+  // nine gets cancelled on the Back nine, not the Front.
+  const resolvedNine = nine || (Number(booking.holes) === 9 ? 'B' : 'F');
+
   const payload = buildBookingPayload({
     cfg,
-    date, time, nine: nine || 'F',
+    date, time, nine: resolvedNine,
     partySize: booking.party_size,
     holes: booking.holes,
     numCarts: booking.num_carts,
@@ -1057,7 +1069,7 @@ async function cancelBooking(businessId, bookingRequestId, { nine } = {}) {
       `${PROSHOP_ENTRY_PATH}?Date=${encodeURIComponent(date)}` +
       `&Time=${encodeURIComponent(time)}` +
       `&Course=${cfg.courseCode}` +
-      `&Nine=${nine || 'F'}` +
+      `&Nine=${resolvedNine}` +
       `&BookerID=${encodeURIComponent(booking.teeon_booking_id)}` +
       `&AllowDel=true` +
       `&ClickedGolfer=0` +

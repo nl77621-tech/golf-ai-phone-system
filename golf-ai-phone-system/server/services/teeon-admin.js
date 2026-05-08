@@ -788,9 +788,38 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
     // Tee-On sometimes returns the form re-rendered with an error message
     // instead of redirecting on a bad submit. Surface a hint when that
     // happens so the log is more informative than "Could not locate BookerID".
-    const errorHint =
-      /class="error/i.test(res.body || '') ||
-      /(invalid|conflict|already booked|not allowed|please correct)/i.test(res.body || '');
+    const rawBody = res.body || '';
+    const errorHintRe = /(class="error|invalid|conflict|already booked|not allowed|please correct)/i;
+    const errorHintMatch = rawBody.match(errorHintRe);
+    const errorHint = !!errorHintMatch;
+    // Capture context around the first errorHint match — this is usually
+    // where the actual user-visible message lives. The snippet[0..900]
+    // dump only sees the very top of the page; on a re-rendered tee
+    // sheet that's the navigation chrome / first popup, not the error.
+    const errorContextRaw = errorHintMatch
+      ? rawBody.slice(Math.max(0, errorHintMatch.index - 250), errorHintMatch.index + 350)
+      : '';
+    const errorContext = errorContextRaw
+      .replace(/<script[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[\s\S]*?<\/style>/gi, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    // List every GenericMessage popup so we see whether Tee-On stacked an
+    // error popup behind the "Tee Sheet Settings" overlay.
+    const popupRe = /<div[^>]*class="[^"]*GenericPopup[^"]*"[^>]*id="(GenericMessage\d+)"[^>]*>([\s\S]{0,800}?)<\/div>\s*<\/div>/gi;
+    const popups = [];
+    let popupMatch;
+    while ((popupMatch = popupRe.exec(rawBody)) !== null) {
+      const id = popupMatch[1];
+      const inner = popupMatch[2]
+        .replace(/<script[\s\S]*?<\/script>/gi, '')
+        .replace(/<style[\s\S]*?<\/style>/gi, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 220);
+      popups.push(`${id}: ${inner}`);
+      if (popups.length >= 6) break;
+    }
 
     // Re-fetch tee sheet to discover the new BookerID.
     await throttle(businessId);
@@ -818,10 +847,13 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
         || snippet.match(/<(?:h\d|p|div|span)[^>]*>\s*((?:Error|Invalid|Cannot|Sorry|Please)[^<]{5,250})<\/(?:h\d|p|div|span)>/i))?.[1]?.trim();
       console.warn(
         `[tenant:${businessId}] [TeeOn-Admin] POST rejected body snippet:\n` +
-        `  errorHint:    ${errorHint}\n` +
+        `  errorHint:    ${errorHint}${errorHintMatch ? ` (matched "${errorHintMatch[0]}" @${errorHintMatch.index})` : ''}\n` +
         `  visibleError: ${visibleError || '(none extracted)'}\n` +
         `  bytes:        ${res.body?.length || 0}\n` +
-        `  snippet[0..900]: ${snippet.slice(0, 900)}`
+        `  popups (${popups.length}):\n` +
+        (popups.length ? popups.map(p => `    - ${p}`).join('\n') + '\n' : '    (none found)\n') +
+        `  errorContext: ${errorContext || '(no errorHint match)'}\n` +
+        `  snippet[0..1500]: ${snippet.slice(0, 1500)}`
       );
       const reason = visibleError
         ? `Tee-On rejected POST: ${visibleError.slice(0, 120)}`

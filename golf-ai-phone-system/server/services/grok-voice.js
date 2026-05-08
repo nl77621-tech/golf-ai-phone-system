@@ -756,7 +756,7 @@ function buildToolDefinitions() {
           special_requests: { type: 'string', description: 'Any special requests or notes' },
           card_last_four: { type: 'string', description: 'Last 4 digits of the credit card provided by the caller (only when credit card is required)' }
         },
-        required: ['customer_name', 'date', 'party_size', 'holes']
+        required: ['customer_name', 'date', 'time', 'party_size', 'holes']
       }
     },
     {

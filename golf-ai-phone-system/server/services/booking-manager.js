@@ -246,15 +246,12 @@ async function updateBookingStatus(businessId, id, status, staffNotes) {
   const booking = res.rows[0];
 
   if (booking && prevStatus !== status) {
-    // Mirror cancellations to Tee-On (best-effort — local cancel wins).
-    if (status === 'cancelled' && prevStatus === 'confirmed') {
-      try {
-        const teeonAdmin = require('./teeon-admin');
-        await teeonAdmin.cancelBooking(businessId, id);
-      } catch (err) {
-        console.error(`[tenant:${businessId}] Tee-On cancel mirror failed:`, err.message);
-      }
-    }
+    // NOTE: Cancellations are NOT mirrored to Tee-On. Per current
+    // operations policy, staff manages cancellations directly in
+    // Tee-On admin; Command Center cancel only updates the local
+    // row + sends the customer SMS. Re-enable Tee-On cancel mirror
+    // only after BookerID extraction is reliable enough that we
+    // can identify the right row to delete safely.
 
     try {
       if (status === 'confirmed') {

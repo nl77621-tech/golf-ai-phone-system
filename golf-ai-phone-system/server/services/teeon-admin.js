@@ -940,8 +940,34 @@ async function cancelBooking(businessId, bookingRequestId, { nine } = {}) {
       if (cached) sessions.set(businessId, { ...cached, cookies });
     }
 
+    // Same form-hiddens merge as createBooking. The booking edit form
+    // populates server-side state (cart inventory, pricing item IDs,
+    // SlotBookerIDs, etc.) that BookTimeProshop validates on submit.
+    // POSTing without those values 500s — same root cause we hit on
+    // create. Parse the live form, use it as the base, override only
+    // the Delete# flags + BookerID + slot identity.
+    const liveFields = parseFormFields(formPage.body || '');
+    const cancelOverrides = {
+      Date: payload.Date,
+      Time: payload.Time,
+      CourseCode: payload.CourseCode,
+      Nine: payload.Nine,
+      BookerID: payload.BookerID || booking.teeon_booking_id || '',
+    };
+    // Stamp Delete# = 'on' for every slot in the party so the whole
+    // booking disappears.
+    for (let i = 0; i < 4; i++) {
+      cancelOverrides[`Delete${i}`] = deleteSlots.includes(i) ? 'on' : '';
+    }
+    const merged = { ...liveFields, ...cancelOverrides };
+    console.log(
+      `[tenant:${businessId}] [TeeOn-Admin] cancel payload merge: ` +
+      `live=${Object.keys(liveFields).length} overrides=${Object.keys(cancelOverrides).length} ` +
+      `merged=${Object.keys(merged).length}`
+    );
+
     await throttle(businessId);
-    const body = encodeForm(payload);
+    const body = encodeForm(merged);
     const res = await httpsRequest({
       method: 'POST',
       path: BOOK_TIME_PATH,
@@ -951,7 +977,22 @@ async function cancelBooking(businessId, bookingRequestId, { nine } = {}) {
       },
       body
     });
-    if (res.status >= 400) throw new Error(`Tee-On responded ${res.status} on cancel POST`);
+    if (res.status >= 400) {
+      const snippet = (res.body || '')
+        .replace(/<script[\s\S]*?<\/script>/gi, '<script…/>')
+        .replace(/<style[\s\S]*?<\/style>/gi, '<style…/>')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 600);
+      console.warn(
+        `[tenant:${businessId}] [TeeOn-Admin] cancel POST ${res.status} body snippet: ${snippet}`
+      );
+      throw new Error(`Tee-On responded ${res.status} on cancel POST`);
+    }
+    console.log(
+      `[tenant:${businessId}] [TeeOn-Admin] cancel POST status=${res.status} ` +
+      `body=${res.body?.length || 0}b`
+    );
     // Clear the teeon_booking_id since the row no longer exists on Tee-On.
     await query(
       `UPDATE booking_requests

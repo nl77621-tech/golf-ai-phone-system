@@ -728,12 +728,12 @@ function buildToolDefinitions() {
     {
       type: 'function',
       name: 'check_tee_times',
-      description: 'Check live available tee times on the Tee-On tee sheet for a specific date. You MUST provide the party_size so the system can filter out times that are already partially booked and cannot fit the group. Results show 18-hole slots (start hole 1, full course) and 9-hole slots (start hole 10, back nine only) separately. If no 18-hole morning times, suggest 9-hole back nine as alternative. ALWAYS call this tool — NEVER guess or assume availability.',
+      description: 'Check live available tee times on the Tee-On tee sheet for a specific date. ⚠️ DO NOT CALL THIS TOOL UNTIL YOU HAVE THE CALLER\'S EXPLICIT PARTY SIZE. If the caller said "I want a tee time Monday morning" but did NOT say how many players, you MUST first ASK "How many players?" and WAIT for their answer — do not call this tool with a guessed or default party_size. Defaulting party_size to 1 returns slots that fit a single player but may NOT fit the actual group, leading to false "available" claims that staff has to clean up. Once you have the date AND the actual party size, call this tool. Results show 18-hole slots (start hole 1, full course) and 9-hole slots (start hole 10, back nine only) separately. If no 18-hole times fit, suggest 9-hole back nine as alternative. NEVER guess or assume availability.',
       parameters: {
         type: 'object',
         properties: {
           date: { type: 'string', description: 'Date to check in YYYY-MM-DD format' },
-          party_size: { type: 'integer', description: 'Number of players in the group — REQUIRED so we only show times with enough open spots' }
+          party_size: { type: 'integer', description: 'Number of players in the group — MUST come from the caller\'s explicit verbal answer ("just me", "two of us", "a foursome", etc.). NEVER default to 1 or any other value. If the caller has not told you how many players, ASK FIRST and wait for their reply BEFORE calling this tool. A guessed party_size returns inflated availability and produces times that don\'t actually fit the group.' }
         },
         required: ['date', 'party_size']
       }
@@ -1096,7 +1096,22 @@ async function executeToolCall(toolName, args, ctx) {
           // AI can never accidentally treat them as full-fit times.
           const fmtPartial = (s) => `${s.time} (only ${s.maxPlayers} seat${s.maxPlayers === 1 ? '' : 's'})`;
 
-          let message = `LIVE tee sheet for ${args.date}, party of ${partySize}: ${openSlots.length} open slot${openSlots.length === 1 ? '' : 's'} total — ${fitsParty} of those fit your full party of ${partySize}.\n`;
+          let message = '';
+          // Self-correcting safeguard: if the AI called us with partySize=1
+          // it may have defaulted/guessed. A real "I just want to play
+          // alone" caller is rarer than an AI calling speculatively before
+          // asking the caller. Prepend a loud reminder so the AI re-checks
+          // before offering any times. False positives (genuine singles)
+          // cost the AI one extra question; false negatives (offering
+          // foursome-incompatible slots) cost a real customer the booking.
+          if (partySize === 1) {
+            message += `⚠️⚠️⚠️ PARTY SIZE = 1 — VERIFY BEFORE OFFERING ANY TIMES ⚠️⚠️⚠️\n` +
+              `You called check_tee_times with party_size=1. If the caller has NOT explicitly told you ` +
+              `they want to play alone (e.g. "just me", "for myself"), STOP and ASK "How many players?" ` +
+              `before reading any of the times below. After they answer, RE-CALL this tool with the actual ` +
+              `party size. The slots below are filtered for 1 player — many will NOT fit a group of 2-4.\n\n`;
+          }
+          message += `LIVE tee sheet for ${args.date}, party of ${partySize}: ${openSlots.length} open slot${openSlots.length === 1 ? '' : 's'} total — ${fitsParty} of those fit your full party of ${partySize}.\n`;
 
           // ---------- TIMES THAT FIT THE FULL PARTY (the headline answer) ----------
           if (full18Fits.length > 0 || back9Fits.length > 0) {

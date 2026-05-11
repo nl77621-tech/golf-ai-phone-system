@@ -274,6 +274,23 @@ async function handleMediaStream(twilioWs, businessId, callerPhone, callSid, str
     console.error(`[tenant:${businessId}][${callLogId}] Failed to get greeting (using default):`, err.message);
   }
 
+  // Admin-call greeting override. When the caller is a recognised admin
+  // (PR #25), the regular "Hi {name}, how can I help" greeting wins the
+  // first turn and the system prompt's "ask for PIN first" rule loses,
+  // because the greetingInstruction below is injected as a user message
+  // BEFORE the AI gets a chance to weigh the admin block. Override the
+  // greeting here so the very first thing the AI says is the PIN ask.
+  // The admin's preferred display name comes from the customers row
+  // (their normal contact name) — falls back to the admins.name field
+  // and then a generic "there".
+  if (adminRow) {
+    const friendlyName = (callerContext.name && callerContext.name.split(' ')[0])
+      || (adminRow.name && !adminRow.name.includes('@') ? adminRow.name.split(' ')[0] : null)
+      || 'there';
+    greeting = `Hi ${friendlyName} — what's your PIN?`;
+    console.log(`[tenant:${businessId}][${callLogId}] Admin greeting override — leading with PIN ask for ${friendlyName}`);
+  }
+
   // System prompt — tenant-scoped
   let systemPrompt = null;
   try {
@@ -452,9 +469,14 @@ ${callerLine}
       }
     }));
 
-    const greetingInstruction = callerContext.known && callerContext.name
-      ? `[System: A returning caller named ${callerContext.name} just called. Greet them IMMEDIATELY by name — start with their name right away, warm and personal like you recognize them. Use this greeting but make it sound natural and unscripted: "${greeting}". Do NOT sound like you are reading from a script. Do NOT ask for their name.]`
-      : `[System: Someone just called. Answer the phone naturally like a real person would — warm, casual, friendly. Use this greeting but make it sound natural and unscripted: "${greeting}". Do NOT sound like you are reading from a script.]`;
+    const greetingInstruction = callerContext.isAdmin
+      // Admin call — short, businesslike. PIN gate is mandatory; the
+      // system prompt's 🔐 ADMIN CALL block covers what to do with the
+      // answer. We just kick off the gate here.
+      ? `[System: An admin caller just dialed in. This is NOT a normal customer call. Open IMMEDIATELY with: "${greeting}" — exact words, no embellishment, no "how can I help". Do NOT ask their name (you know them). Do NOT offer to book a tee time yet. Wait for them to say a PIN, then call verify_admin_pin. The system prompt's 🔐 ADMIN CALL section explains the full gate.]`
+      : (callerContext.known && callerContext.name
+        ? `[System: A returning caller named ${callerContext.name} just called. Greet them IMMEDIATELY by name — start with their name right away, warm and personal like you recognize them. Use this greeting but make it sound natural and unscripted: "${greeting}". Do NOT sound like you are reading from a script. Do NOT ask for their name.]`
+        : `[System: Someone just called. Answer the phone naturally like a real person would — warm, casual, friendly. Use this greeting but make it sound natural and unscripted: "${greeting}". Do NOT sound like you are reading from a script.]`);
     grokWs.send(JSON.stringify({
       type: 'conversation.item.create',
       item: {

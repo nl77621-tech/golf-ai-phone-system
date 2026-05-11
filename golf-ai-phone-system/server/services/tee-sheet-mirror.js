@@ -195,16 +195,20 @@ async function getTeeSheet(businessId, date) {
 
   // Need a warm admin session. Try to grab it without forcing a login;
   // if missing (post-deploy window), ensureWarmAdminSession does a
-  // single login.
+  // single login. Each step logs so we can see WHERE failure happens
+  // if "Admin session unavailable" fires again.
   let cookies = teeonAdmin.getWarmAdminCookies(businessId);
+  console.log(`[tenant:${businessId}] [TeeSheet-Mirror] warm cookies cached: ${cookies ? 'YES' : 'no'}`);
   if (!cookies) {
     cookies = await teeonAdmin.ensureWarmAdminSession(businessId);
+    console.log(`[tenant:${businessId}] [TeeSheet-Mirror] ensureWarmAdminSession returned: ${cookies ? 'cookies present' : 'NULL'}`);
   }
   if (!cookies) {
     throw new Error('Admin session unavailable. Configure Tee-On admin credentials in Settings.');
   }
 
   const courseCode = await getTenantTeeOnCourseCode(businessId);
+  console.log(`[tenant:${businessId}] [TeeSheet-Mirror] resolved courseCode: ${courseCode || 'NULL'}`);
   if (!courseCode) {
     throw new Error('Tee-On course code not configured for this business.');
   }

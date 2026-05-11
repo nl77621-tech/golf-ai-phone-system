@@ -72,14 +72,18 @@ function httpsRequest(opts) {
 }
 
 async function getTenantTeeOnCourseCode(businessId) {
+  // teeon-admin.js uses this exact key (a flat string, not nested under
+  // a "teeon" object). Match that convention so existing tenants — for
+  // whom this is already populated — work without re-configuration.
   try {
-    const fromSetting = await getSetting(businessId, 'teeon').catch(() => null);
-    if (fromSetting?.course_code) return fromSetting.course_code;
+    const courseCode = await getSetting(businessId, 'teeon_course_code').catch(() => null);
+    if (courseCode) return String(courseCode);
     const business = await getBusinessById(businessId).catch(() => null);
-    return business?.teeon_course_code || null;
+    if (business?.teeon_course_code) return String(business.teeon_course_code);
   } catch {
-    return null;
+    /* fall through */
   }
+  return null;
 }
 
 // ─── HTML parser ────────────────────────────────────────────────────

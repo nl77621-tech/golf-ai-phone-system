@@ -2003,6 +2003,8 @@ function SettingsPage() {
 
   const tabs = [
     { id: 'daily', label: '📋 Daily' },
+    { id: 'ops_notes', label: '📢 Ops Notes' },
+    { id: 'admins', label: '🔐 Admin Line' },
     { id: 'general', label: 'General' },
     { id: 'phones', label: '📞 Phones' },
     { id: 'team', label: '👥 Team' },
@@ -2037,6 +2039,16 @@ function SettingsPage() {
 
       // DAILY INSTRUCTIONS TAB
       activeTab === 'daily' && React.createElement(DailyInstructionsTab, { settings, saveSetting, saving }),
+
+      // OPS NOTES TAB — admin-set rules applied to every customer call.
+      // Mirrors the in-call phone admin tools; staff can also add and
+      // remove rules from here.
+      activeTab === 'ops_notes' && React.createElement(OpsNotesTab),
+
+      // ADMIN LINE TAB — manage admin phone numbers + PINs. Listed
+      // numbers, when they call in, get the PIN gate + announcement
+      // management tools (see ADMIN CALL section in the system prompt).
+      activeTab === 'admins' && React.createElement(AdminsTab),
 
       // GENERAL TAB
       activeTab === 'general' && React.createElement('div', null,
@@ -7473,6 +7485,355 @@ function tenantPagesFor(templateKey, plan) {
 }
 
 // ============================================
+// ADMIN LINE — phone-number + PIN management (Settings tab)
+// ============================================
+// Lists admin phone numbers for the current business. Each row is a
+// human (owner, GM, head pro) who can call the public phone number and
+// run admin-mode tools after entering their PIN. PINs are bcrypt-hashed
+// server-side; we never display or transmit them in plaintext after
+// creation. Business admins can add/edit/remove; regular staff get 403
+// from the backend.
+function AdminsTab() {
+  const [admins, setAdmins] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [adding, setAdding] = useState(false);
+  const [newPhone, setNewPhone] = useState('');
+  const [newName, setNewName] = useState('');
+  const [newPin, setNewPin] = useState('');
+  const [editingId, setEditingId] = useState(null);
+  const [editPin, setEditPin] = useState('');
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const r = await api('/api/admins');
+      setAdmins(r.admins || []);
+    } catch (err) {
+      alert('Failed to load admins: ' + err.message);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const addAdmin = async () => {
+    const phone = newPhone.trim();
+    const name = newName.trim();
+    const pin = newPin.trim();
+    if (!phone || !name || !pin) { alert('Phone, name, and PIN are all required.'); return; }
+    if (pin.length < 4 || pin.length > 12) { alert('PIN must be 4-12 characters.'); return; }
+    setAdding(true);
+    try {
+      await api('/api/admins', {
+        method: 'POST',
+        body: JSON.stringify({ phone_number: phone, name, pin })
+      });
+      setNewPhone(''); setNewName(''); setNewPin('');
+      await load();
+    } catch (err) {
+      alert('Failed to add admin: ' + err.message);
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  const updatePin = async (id) => {
+    const pin = editPin.trim();
+    if (!pin || pin.length < 4 || pin.length > 12) { alert('PIN must be 4-12 characters.'); return; }
+    try {
+      await api(`/api/admins/${id}`, { method: 'PATCH', body: JSON.stringify({ pin }) });
+      setEditingId(null); setEditPin('');
+      await load();
+      alert('PIN updated.');
+    } catch (err) {
+      alert('Failed to update PIN: ' + err.message);
+    }
+  };
+
+  const removeAdmin = async (id, name) => {
+    if (!confirm(`Remove admin "${name}"? They will no longer be able to call the admin line.`)) return;
+    try {
+      await api(`/api/admins/${id}`, { method: 'DELETE' });
+      await load();
+    } catch (err) {
+      alert('Failed to remove admin: ' + err.message);
+    }
+  };
+
+  if (loading) return React.createElement('div', { className: 'text-gray-500' }, 'Loading admins...');
+
+  return React.createElement('div', null,
+    React.createElement('p', { className: 'text-sm text-gray-500 mb-6' },
+      'Phone numbers listed here can call the regular business phone number, enter their PIN, and update what the AI tells callers (e.g. "no carts today — wet conditions"). They can also make a normal booking from the same line. PINs are bcrypt-hashed; you can only reset, never read them back.'
+    ),
+    // Add new admin
+    React.createElement('div', { className: 'bg-gray-50 border border-gray-200 rounded-lg p-4 mb-6' },
+      React.createElement('h3', { className: 'font-semibold text-gray-800 mb-3' }, 'Add an admin'),
+      React.createElement('div', { className: 'grid grid-cols-1 md:grid-cols-3 gap-3 mb-3' },
+        React.createElement('input', {
+          type: 'tel',
+          placeholder: 'Phone (e.g. +14168276921)',
+          value: newPhone,
+          onChange: (e) => setNewPhone(e.target.value),
+          className: 'border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-golf-300'
+        }),
+        React.createElement('input', {
+          type: 'text',
+          placeholder: 'Name (e.g. Nelson Lopes)',
+          value: newName,
+          onChange: (e) => setNewName(e.target.value),
+          className: 'border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-golf-300'
+        }),
+        React.createElement('input', {
+          type: 'password',
+          placeholder: 'PIN (4-12 chars)',
+          value: newPin,
+          onChange: (e) => setNewPin(e.target.value),
+          maxLength: 12,
+          className: 'border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-golf-300'
+        })
+      ),
+      React.createElement('button', {
+        onClick: addAdmin,
+        disabled: adding,
+        className: 'bg-golf-600 hover:bg-golf-700 disabled:bg-golf-300 text-white px-4 py-2 rounded-md text-sm font-medium'
+      }, adding ? 'Adding...' : 'Add admin')
+    ),
+    // Existing admins
+    admins.length === 0
+      ? React.createElement('div', { className: 'text-sm text-gray-500 italic' }, 'No admin numbers configured yet. Add one above.')
+      : React.createElement('div', { className: 'space-y-2' },
+          admins.map(a =>
+            React.createElement('div', {
+              key: a.id,
+              className: `flex items-center justify-between border rounded-lg p-3 ${a.is_active ? 'bg-white border-gray-200' : 'bg-gray-50 border-gray-200 opacity-60'}`
+            },
+              React.createElement('div', { className: 'flex-1' },
+                React.createElement('div', { className: 'font-medium text-gray-800' }, a.name, !a.is_active && React.createElement('span', { className: 'ml-2 text-xs text-gray-400' }, '(inactive)')),
+                React.createElement('div', { className: 'text-sm text-gray-500' }, a.phone_number),
+                a.last_used_at && React.createElement('div', { className: 'text-xs text-gray-400' }, `Last used: ${new Date(a.last_used_at).toLocaleString()}`)
+              ),
+              React.createElement('div', { className: 'flex items-center gap-2' },
+                editingId === a.id
+                  ? React.createElement(React.Fragment, null,
+                      React.createElement('input', {
+                        type: 'password',
+                        placeholder: 'New PIN',
+                        value: editPin,
+                        onChange: (e) => setEditPin(e.target.value),
+                        maxLength: 12,
+                        className: 'border border-gray-300 rounded-md px-2 py-1 text-sm w-24'
+                      }),
+                      React.createElement('button', {
+                        onClick: () => updatePin(a.id),
+                        className: 'bg-blue-500 hover:bg-blue-600 text-white px-3 py-1 rounded-md text-sm font-medium'
+                      }, 'Save'),
+                      React.createElement('button', {
+                        onClick: () => { setEditingId(null); setEditPin(''); },
+                        className: 'text-gray-500 px-2 py-1 text-sm'
+                      }, 'Cancel')
+                    )
+                  : React.createElement(React.Fragment, null,
+                      a.is_active && React.createElement('button', {
+                        onClick: () => { setEditingId(a.id); setEditPin(''); },
+                        className: 'text-blue-600 hover:text-blue-700 px-2 py-1 text-sm font-medium'
+                      }, 'Reset PIN'),
+                      a.is_active && React.createElement('button', {
+                        onClick: () => removeAdmin(a.id, a.name),
+                        className: 'text-red-600 hover:text-red-700 px-2 py-1 text-sm font-medium'
+                      }, 'Remove')
+                    )
+              )
+            )
+          )
+        )
+  );
+}
+
+// ============================================
+// OPS NOTES — staff-managed announcements (Settings tab)
+// ============================================
+// Mirrors the in-call phone admin tools. Lists active rows, lets a
+// business admin add a new note (scope today/persistent) and remove
+// existing ones. Same /api/announcements endpoints as the banner.
+function OpsNotesTab() {
+  const [notes, setNotes] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [text, setText] = useState('');
+  const [scope, setScope] = useState('today');
+  const [saving, setSaving] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const r = await api('/api/announcements');
+      setNotes(r.announcements || []);
+    } catch (err) {
+      alert('Failed to load notes: ' + err.message);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const add = async () => {
+    const t = text.trim();
+    if (!t) { alert('Enter the instruction text.'); return; }
+    setSaving(true);
+    try {
+      await api('/api/announcements', {
+        method: 'POST',
+        body: JSON.stringify({ instruction_text: t, scope })
+      });
+      setText(''); setScope('today');
+      await load();
+    } catch (err) {
+      alert('Failed to add: ' + err.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const remove = async (id) => {
+    if (!confirm('Remove this operations note? The AI will stop applying it immediately.')) return;
+    try {
+      await api(`/api/announcements/${id}`, { method: 'DELETE' });
+      await load();
+    } catch (err) {
+      alert('Failed to remove: ' + err.message);
+    }
+  };
+
+  if (loading) return React.createElement('div', { className: 'text-gray-500' }, 'Loading notes...');
+
+  return React.createElement('div', null,
+    React.createElement('p', { className: 'text-sm text-gray-500 mb-6' },
+      'Operations notes are applied to every customer call. Use them for short-term changes ("no carts today — wet conditions", "closed for tournament Tuesday"). Admins can also add notes by calling the business phone number directly and going through PIN entry.'
+    ),
+    // Add new note
+    React.createElement('div', { className: 'bg-gray-50 border border-gray-200 rounded-lg p-4 mb-6' },
+      React.createElement('h3', { className: 'font-semibold text-gray-800 mb-3' }, 'Add a new note'),
+      React.createElement('textarea', {
+        value: text,
+        onChange: (e) => setText(e.target.value),
+        placeholder: 'e.g. No power carts today due to wet course conditions',
+        rows: 3,
+        className: 'w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-golf-300 resize-none mb-3'
+      }),
+      React.createElement('div', { className: 'flex items-center gap-4 mb-3' },
+        React.createElement('label', { className: 'text-sm font-medium text-gray-700' }, 'Scope:'),
+        React.createElement('label', { className: 'flex items-center gap-1 text-sm' },
+          React.createElement('input', { type: 'radio', name: 'scope', value: 'today', checked: scope === 'today', onChange: () => setScope('today') }),
+          'Today only (auto-expires at end of day)'
+        ),
+        React.createElement('label', { className: 'flex items-center gap-1 text-sm' },
+          React.createElement('input', { type: 'radio', name: 'scope', value: 'persistent', checked: scope === 'persistent', onChange: () => setScope('persistent') }),
+          'Persistent (until I remove it)'
+        )
+      ),
+      React.createElement('button', {
+        onClick: add,
+        disabled: saving,
+        className: 'bg-golf-600 hover:bg-golf-700 disabled:bg-golf-300 text-white px-4 py-2 rounded-md text-sm font-medium'
+      }, saving ? 'Saving...' : 'Add note')
+    ),
+    // Active notes
+    React.createElement('h3', { className: 'font-semibold text-gray-800 mb-3' }, `Active notes (${notes.length})`),
+    notes.length === 0
+      ? React.createElement('div', { className: 'text-sm text-gray-500 italic' }, 'No active operations notes.')
+      : React.createElement('div', { className: 'space-y-2' },
+          notes.map(n =>
+            React.createElement('div', {
+              key: n.id,
+              className: 'flex items-start justify-between bg-yellow-50 border border-yellow-200 rounded-lg p-3'
+            },
+              React.createElement('div', { className: 'flex-1' },
+                React.createElement('div', { className: 'flex items-center gap-2 mb-1' },
+                  React.createElement('span', {
+                    className: `text-xs font-semibold uppercase px-2 py-0.5 rounded ${n.scope === 'persistent' ? 'bg-purple-100 text-purple-700' : 'bg-blue-100 text-blue-700'}`
+                  }, n.scope === 'persistent' ? 'Ongoing' : 'Today only'),
+                  n.expires_at && React.createElement('span', { className: 'text-xs text-gray-500' }, `Expires: ${new Date(n.expires_at).toLocaleString()}`)
+                ),
+                React.createElement('div', { className: 'text-sm text-gray-800' }, n.instruction_text)
+              ),
+              React.createElement('button', {
+                onClick: () => remove(n.id),
+                className: 'text-red-600 hover:text-red-700 px-2 py-1 text-sm font-medium'
+              }, 'Remove')
+            )
+          )
+        )
+  );
+}
+
+// ============================================
+// ANNOUNCEMENTS BANNER — read-only header banner
+// ============================================
+// Mounted in the main app layout. Visible on every page so staff can
+// see at a glance what the AI is telling callers right now. Auto-
+// refreshes every 60s in case an admin called in and added a rule.
+function AnnouncementsBanner({ canManage = false }) {
+  const [notes, setNotes] = useState([]);
+
+  const load = useCallback(async () => {
+    try {
+      const r = await api('/api/announcements');
+      setNotes(r.announcements || []);
+    } catch {
+      // Silent — banner is best-effort, not blocking. If the API errors
+      // the banner just doesn't render this cycle.
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+    const t = setInterval(load, 60000);
+    return () => clearInterval(t);
+  }, [load]);
+
+  const remove = async (id) => {
+    if (!confirm('Remove this operations note? The AI will stop applying it immediately.')) return;
+    try {
+      await api(`/api/announcements/${id}`, { method: 'DELETE' });
+      await load();
+    } catch (err) {
+      alert('Failed to remove: ' + err.message);
+    }
+  };
+
+  if (notes.length === 0) return null;
+
+  return React.createElement('div', { className: 'mb-6 rounded-lg border-l-4 border-yellow-400 bg-yellow-50 p-4' },
+    React.createElement('div', { className: 'flex items-start gap-3' },
+      React.createElement('div', { className: 'text-2xl' }, '📢'),
+      React.createElement('div', { className: 'flex-1' },
+        React.createElement('div', { className: 'font-semibold text-yellow-900 mb-2' },
+          `Live operations notes — AI is telling callers ${notes.length === 1 ? 'this' : 'these'} right now`
+        ),
+        React.createElement('ul', { className: 'space-y-1.5' },
+          notes.map(n =>
+            React.createElement('li', { key: n.id, className: 'flex items-center justify-between gap-3 text-sm text-yellow-900' },
+              React.createElement('span', null,
+                React.createElement('span', {
+                  className: `inline-block text-xs font-semibold uppercase mr-2 px-1.5 py-0.5 rounded ${n.scope === 'persistent' ? 'bg-purple-200 text-purple-800' : 'bg-blue-200 text-blue-800'}`
+                }, n.scope === 'persistent' ? 'Ongoing' : 'Today'),
+                n.instruction_text
+              ),
+              canManage && React.createElement('button', {
+                onClick: () => remove(n.id),
+                className: 'text-yellow-800 hover:text-red-700 text-xs font-medium whitespace-nowrap'
+              }, '× remove')
+            )
+          )
+        )
+      )
+    )
+  );
+}
+
+// ============================================
 // MAIN APP
 // ============================================
 function App() {
@@ -7747,6 +8108,11 @@ function App() {
         plan: effectivePlan
       }),
       React.createElement('main', { className: 'flex-1 p-8 overflow-auto bg-gray-50' },
+        // Active operations-notes banner. Visible on every page so staff
+        // always know what the AI is telling callers (e.g. "no carts —
+        // wet conditions"). Empty array → no banner rendered. Business
+        // admins get a remove button per row; regular staff get read-only.
+        React.createElement(AnnouncementsBanner, { canManage: session?.role === 'business_admin' || session?.role === 'super_admin' }),
         React.createElement(PageComponent)
       )
     ),

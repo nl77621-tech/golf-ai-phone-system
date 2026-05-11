@@ -28,7 +28,11 @@ function getTwilioClient() {
 }
 const { buildSystemPrompt } = require('./system-prompt');
 const { sendPostCallSummary, sendSMS, sendEmail } = require('./notification');
-const { lookupByPhone, lookupByName, registerCall, updateCustomer } = require('./caller-lookup');
+const {
+  lookupByPhone, lookupByName, registerCall, updateCustomer,
+  lookupAdminByPhone, verifyAdminPin, markAdminPinSuccess,
+  getActiveAnnouncements, createAnnouncement, deactivateAnnouncement,
+} = require('./caller-lookup');
 const {
   createBookingRequest,
   createModificationRequest,
@@ -198,6 +202,21 @@ async function handleMediaStream(twilioWs, businessId, callerPhone, callSid, str
     }
   }
 
+  // Admin-line detection. If the caller's phone number matches a row in
+  // business_admins for this tenant, we mark the call as an admin call.
+  // The system prompt then leads with a PIN gate before allowing any
+  // state-change operations. Customer-mode tools (book_tee_time, etc.)
+  // stay available so admins can still place normal bookings from the
+  // same line — they just need to clear the PIN first.
+  let adminRow = null;
+  if (!isAnonymous && callerPhone) {
+    try {
+      adminRow = await lookupAdminByPhone(businessId, callerPhone);
+    } catch (err) {
+      console.warn(`[tenant:${businessId}][${callSid}] Admin lookup failed (treating as normal caller):`, err.message);
+    }
+  }
+
   const callerContext = {
     phone: isAnonymous ? null : callerPhone,
     isAnonymous,
@@ -210,8 +229,17 @@ async function handleMediaStream(twilioWs, businessId, callerPhone, callSid, str
     lineType,
     isLandline: lineType === 'landline',
     alternatePhone: customer?.alternate_phone || null,
-    noShowCount: customer?.no_show_count || 0
+    noShowCount: customer?.no_show_count || 0,
+    // Admin call context. isAdmin gates the system-prompt's admin
+    // section + tool availability; pinVerified flips to true after a
+    // successful verify_admin_pin call within this call's lifetime.
+    isAdmin: !!adminRow,
+    adminId: adminRow?.id || null,
+    adminName: adminRow?.name || null,
   };
+  if (adminRow) {
+    console.log(`[tenant:${businessId}][${callSid}] Admin caller detected: ${adminRow.name} (id=${adminRow.id}, phone=${adminRow.phone_number})`);
+  }
 
   // Update call log with customer ID (business-scoped)
   if (callLogId && customer?.id) {
@@ -366,7 +394,14 @@ ${callerLine}
   const callState = {
     startTime: Date.now(),
     transcriptParts: [],
-    actions: []
+    actions: [],
+    // Admin-line gate state. pinVerified flips true only after a
+    // successful verify_admin_pin tool call within this call. The admin
+    // tools (add/list/remove_announcement) check this flag and reject
+    // before-PIN attempts. failedPinAttempts is a soft rate-limit — at
+    // 3 misses we lock out further attempts for the rest of the call.
+    pinVerified: false,
+    failedPinAttempts: 0,
   };
 
   let keepAlive = null;
@@ -900,6 +935,54 @@ function buildToolDefinitions() {
           message: { type: 'string', description: 'A short transcript of what the caller wants to convey. Keep it under ~200 words. Do not paraphrase loosely — capture key facts (what, when, why).' }
         },
         required: ['team_member_name', 'message']
+      }
+    },
+    // ─── Admin-line tools ─────────────────────────────────────────────
+    // These four tools are exposed on EVERY call but only function for
+    // calls whose caller is recognised as an admin (server-side check).
+    // verify_admin_pin must be called and succeed before any of the
+    // mutation tools (add/remove_announcement) will run.
+    {
+      type: 'function',
+      name: 'verify_admin_pin',
+      description: 'Verify the admin caller\'s PIN. ONLY call this when the system prompt indicates this is an admin call (the 🔐 ADMIN CALL section appears at the top). Pass the digits the caller said as a string. The tool returns { success: true } when the PIN matches, { success: false, locked: true } after 3 failed attempts (no further attempts allowed this call), or { success: false, attempts_remaining } otherwise. NEVER fabricate a success result — the tool result is the source of truth.',
+      parameters: {
+        type: 'object',
+        properties: {
+          pin: { type: 'string', description: 'The PIN the caller said, as digits (e.g. "1234"). Strip any "the PIN is" prefix the caller may have included.' }
+        },
+        required: ['pin']
+      }
+    },
+    {
+      type: 'function',
+      name: 'add_announcement',
+      description: 'Record a new operations note that will be applied to every customer call until it expires or is removed. ONLY call this for an admin caller whose PIN has been verified in this call. ALWAYS confirm the wording and scope with the admin by speaking it back before calling this tool. The scope parameter is REQUIRED: "today" means the note auto-expires at end of local day; "persistent" means it stays until manually removed. If the admin says "for today" / "just today" use "today". If they say "from now on" / "every day" / "until I change it" use "persistent". When unsure, ASK them: "Is this just for today, or moving forward?"',
+      parameters: {
+        type: 'object',
+        properties: {
+          instruction_text: { type: 'string', description: 'The full instruction in plain English, e.g. "No power carts today due to wet course conditions" or "Course closed Tuesday May 12 for tournament". Write it clearly — the AI will use this text verbatim as context for future calls.' },
+          scope: { type: 'string', enum: ['today', 'persistent'], description: 'How long this note stays active. "today" auto-expires at end of local day. "persistent" stays until removed. ALWAYS ask the admin which they want — never guess.' }
+        },
+        required: ['instruction_text', 'scope']
+      }
+    },
+    {
+      type: 'function',
+      name: 'list_announcements',
+      description: 'List all currently-active operations notes for this business. Use this when the admin asks "what\'s set right now?", BEFORE adding a contradictory rule (to read back the conflict), or before removing a specific note (to find its id). Returns each note with its id, text, scope, and expires_at. Read them out naturally to the admin — don\'t list ids verbatim unless they ask.',
+      parameters: { type: 'object', properties: {} }
+    },
+    {
+      type: 'function',
+      name: 'remove_announcement',
+      description: 'Deactivate an existing operations note by id. ONLY call this for an admin caller whose PIN has been verified. If the admin says "remove the cart rule" without giving a number, call list_announcements first to find the matching id, then call this. Soft-delete only — the row is retained for audit.',
+      parameters: {
+        type: 'object',
+        properties: {
+          id: { type: 'integer', description: 'The numeric id of the announcement to deactivate, obtained from list_announcements.' }
+        },
+        required: ['id']
       }
     }
   ];
@@ -1897,6 +1980,172 @@ If you are about to say a time and it does NOT appear above, STOP. Either re-cal
             message: `I’ll make sure ${resolvedMember.name} gets your message — there was a hiccup just now, but I’ve noted it.`
           };
         }
+      }
+
+      // ─── Admin-line handlers ────────────────────────────────────────
+      // All four admin tools defend in depth: they refuse if the caller
+      // isn't a registered admin (server-side check, independent of the
+      // system prompt). Mutation tools additionally require pinVerified.
+      // The bcrypt PIN comparison happens inside caller-lookup so the
+      // hash never reaches this file.
+      case 'verify_admin_pin': {
+        if (!callerContext?.isAdmin || !callerContext?.adminId) {
+          console.warn(`[tenant:${businessId}][${callLogId}] verify_admin_pin called by non-admin caller (phone=${callerContext?.phone || 'n/a'})`);
+          return { success: false, error: 'not_admin', message: 'This line is not configured for admin access. If you meant to make a booking, just let me know.' };
+        }
+        if (callState?.failedPinAttempts >= 3) {
+          return {
+            success: false, locked: true,
+            message: 'PIN entry is locked for this call after too many failed attempts. Please call back, or contact support if you need help.'
+          };
+        }
+        let ok = false;
+        try {
+          ok = await verifyAdminPin(callerContext.adminId, args.pin);
+        } catch (err) {
+          console.error(`[tenant:${businessId}][${callLogId}] verify_admin_pin error:`, err.message);
+          return { success: false, error: 'verify_failed', message: 'I had trouble checking the PIN. Try again in a moment.' };
+        }
+        if (ok) {
+          callState.pinVerified = true;
+          markAdminPinSuccess(callerContext.adminId).catch(() => {});
+          console.log(`[tenant:${businessId}][${callLogId}] Admin PIN verified for ${callerContext.adminName} (id=${callerContext.adminId})`);
+          return {
+            success: true,
+            admin_name: callerContext.adminName || 'Admin',
+            message: `PIN accepted for ${callerContext.adminName || 'Admin'}. Ask if they're making changes or doing something else like booking a tee time.`
+          };
+        }
+        callState.failedPinAttempts = (callState.failedPinAttempts || 0) + 1;
+        const remaining = Math.max(0, 3 - callState.failedPinAttempts);
+        console.warn(`[tenant:${businessId}][${callLogId}] Admin PIN failed for ${callerContext.adminName} (attempt ${callState.failedPinAttempts}/3)`);
+        return {
+          success: false,
+          attempts_remaining: remaining,
+          locked: remaining === 0,
+          message: remaining > 0
+            ? `That PIN didn't match. ${remaining} ${remaining === 1 ? 'attempt' : 'attempts'} left.`
+            : 'That PIN didn\'t match. PIN entry is now locked for the rest of this call.'
+        };
+      }
+
+      case 'add_announcement': {
+        if (!callerContext?.isAdmin || !callerContext?.adminId) {
+          return { success: false, error: 'not_admin', message: 'Only admin callers can set operations notes.' };
+        }
+        if (!callState?.pinVerified) {
+          return { success: false, error: 'pin_required', message: 'Verify the admin PIN first before adding an announcement.' };
+        }
+        const text = typeof args.instruction_text === 'string' ? args.instruction_text.trim() : '';
+        if (!text) {
+          return { success: false, error: 'missing_text', message: 'I need the instruction text — what should I tell callers?' };
+        }
+        const scope = args.scope === 'persistent' ? 'persistent' : 'today';
+        // Compute expires_at for scope='today' as end-of-local-day in
+        // the business's timezone. Tomorrow 00:00 in that zone, converted
+        // to UTC for the timestamp. Falls back to UTC midnight + 1 day
+        // if timezone lookup fails — the announcement still expires, just
+        // off by hours.
+        let expiresAt = null;
+        if (scope === 'today') {
+          try {
+            const tz = (await getBusinessById(businessId).catch(() => null))?.timezone || 'America/Toronto';
+            const now = new Date();
+            // Compute the local date string, then re-parse as that date 00:00 + 1 day in UTC,
+            // then offset by the timezone's UTC offset for that wall-clock moment.
+            const localDateStr = now.toLocaleDateString('en-CA', { timeZone: tz }); // YYYY-MM-DD
+            // Use a stable trick: midnight UTC of (next day) minus the tz offset of midnight in that tz.
+            const tomorrowLocal = new Date(localDateStr + 'T23:59:59');
+            // tomorrowLocal is approximately end-of-local-day in *server local* time. Convert via tz offset:
+            const offsetMins = (() => {
+              const probe = new Date(localDateStr + 'T12:00:00Z');
+              const localProbe = new Date(probe.toLocaleString('en-US', { timeZone: tz }));
+              return (probe - localProbe) / 60000;
+            })();
+            expiresAt = new Date(tomorrowLocal.getTime() + offsetMins * 60000);
+          } catch (err) {
+            // Conservative fallback — 18 hours from now. Worst case the
+            // announcement lingers a few extra hours, never less than 0.
+            expiresAt = new Date(Date.now() + 18 * 60 * 60 * 1000);
+          }
+        }
+        let row;
+        try {
+          row = await createAnnouncement({
+            businessId,
+            instructionText: text,
+            scope,
+            expiresAt,
+            adminId: callerContext.adminId,
+            adminPhone: callerContext.phone || null,
+          });
+        } catch (err) {
+          console.error(`[tenant:${businessId}][${callLogId}] add_announcement failed:`, err.message);
+          return { success: false, error: 'save_failed', message: 'I couldn\'t save that just now. Try again in a sec.' };
+        }
+        console.log(`[tenant:${businessId}][${callLogId}] Announcement added id=${row.id} scope=${scope} by admin=${callerContext.adminId}`);
+        return {
+          success: true,
+          id: row.id,
+          scope,
+          instruction_text: row.instruction_text,
+          expires_at: row.expires_at,
+          message: scope === 'today'
+            ? 'Saved for today only. It\'ll automatically expire at end of day. Anything else?'
+            : 'Saved as ongoing. It\'ll stay active until you remove it. Anything else?'
+        };
+      }
+
+      case 'list_announcements': {
+        if (!callerContext?.isAdmin || !callerContext?.adminId) {
+          return { success: false, error: 'not_admin' };
+        }
+        let rows = [];
+        try {
+          rows = await getActiveAnnouncements(businessId);
+        } catch (err) {
+          console.error(`[tenant:${businessId}][${callLogId}] list_announcements failed:`, err.message);
+          return { success: false, error: 'load_failed', message: 'I couldn\'t pull the list just now.' };
+        }
+        if (rows.length === 0) {
+          return { success: true, count: 0, announcements: [], message: 'No active notes right now.' };
+        }
+        return {
+          success: true,
+          count: rows.length,
+          announcements: rows.map(r => ({
+            id: r.id,
+            scope: r.scope,
+            instruction_text: r.instruction_text,
+            expires_at: r.expires_at,
+          })),
+          message: `${rows.length} active note${rows.length === 1 ? '' : 's'}. Read them to the admin and ask if they want to add, change, or remove anything.`
+        };
+      }
+
+      case 'remove_announcement': {
+        if (!callerContext?.isAdmin || !callerContext?.adminId) {
+          return { success: false, error: 'not_admin' };
+        }
+        if (!callState?.pinVerified) {
+          return { success: false, error: 'pin_required', message: 'Verify the admin PIN first.' };
+        }
+        const id = Number(args.id);
+        if (!Number.isInteger(id) || id <= 0) {
+          return { success: false, error: 'bad_id', message: 'I need the numeric id of the note to remove.' };
+        }
+        let removed;
+        try {
+          removed = await deactivateAnnouncement(businessId, id, `admin:${callerContext.adminId}`);
+        } catch (err) {
+          console.error(`[tenant:${businessId}][${callLogId}] remove_announcement failed:`, err.message);
+          return { success: false, error: 'remove_failed', message: 'I couldn\'t remove that just now.' };
+        }
+        if (!removed) {
+          return { success: false, error: 'not_found', message: `I don\'t see an active note with id ${id} — it may already be removed.` };
+        }
+        console.log(`[tenant:${businessId}][${callLogId}] Announcement removed id=${id} by admin=${callerContext.adminId}`);
+        return { success: true, id, message: 'Removed. Anything else?' };
       }
 
       default:

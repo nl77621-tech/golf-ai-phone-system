@@ -29,7 +29,10 @@ const DEFAULT_COURSE_GROUP_ID = '12';
 function resolveConfig(cfg) {
   const courseCode = (cfg?.courseCode || DEFAULT_COURSE_CODE).toString();
   const courseGroupId = (cfg?.courseGroupId || DEFAULT_COURSE_GROUP_ID).toString();
-  return { courseCode, courseGroupId, key: `${courseCode}:${courseGroupId}` };
+  // Preserve businessId when supplied so the downstream HTTP path can
+  // ask teeon-admin.js for a warm authenticated session to piggyback on.
+  // Anonymous public-sheet fallback still works when businessId is unset.
+  return { courseCode, courseGroupId, key: `${courseCode}:${courseGroupId}`, businessId: cfg?.businessId || null };
 }
 
 // ─── HTTPS helpers ────────────────────────────────────────────────────────────
@@ -300,14 +303,39 @@ const httpSessions = new Map(); // cfgKey → { cookies, time }
 const HTTP_SESSION_TTL = 10 * 60 * 1000;
 
 async function checkAvailabilityHTTP(date, partySize, cfg, retryCount = 0) {
-  const { courseCode, courseGroupId, key: cfgKey } = cfg;
+  const { courseCode, courseGroupId, key: cfgKey, businessId } = cfg;
   console.log(`[TeeOn-HTTP:${cfgKey}] Checking availability for ${date} (party of ${partySize})${retryCount > 0 ? ' [RETRY ' + retryCount + ']' : ''}`);
 
   try {
     let session = httpSessions.get(cfgKey);
     const sessionExpired = !session || (Date.now() - session.time > HTTP_SESSION_TTL);
 
-    if (sessionExpired || retryCount > 0) {
+    // Prefer the authenticated admin session if one is warm for this
+    // tenant. Tee-On rate-limits anonymous IPs that hit the public sheet
+    // repeatedly; authenticated cookies bypass that limiter. The admin
+    // session is kept warm by teeon-admin.js's 15-minute keep-alive,
+    // so on a Valleymede-style tenant (admin enabled) this branch is
+    // taken on essentially every call. Falls through to the original
+    // anonymous flow when admin isn't configured / warm.
+    if ((sessionExpired || retryCount > 0) && businessId) {
+      try {
+        const teeonAdmin = require('./teeon-admin');
+        const adminCookies = teeonAdmin.getWarmAdminCookies(businessId);
+        if (adminCookies) {
+          session = { cookies: adminCookies, time: Date.now(), auth: 'admin' };
+          httpSessions.set(cfgKey, session);
+          console.log(`[TeeOn-HTTP:${cfgKey}] Using warm admin session (skipping anonymous landing fetch)`);
+        }
+      } catch (e) {
+        // Module not available or warm-cookies threw — silent fallthrough.
+      }
+    }
+
+    // Re-read session in case the admin branch populated it.
+    session = httpSessions.get(cfgKey);
+    const stillExpired = !session || (Date.now() - session.time > HTTP_SESSION_TTL);
+
+    if (stillExpired || retryCount > 0) {
       await throttledWait(cfgKey);
       console.log(`[TeeOn-HTTP:${cfgKey}] Getting fresh session...`);
       const landing = await httpsGet(

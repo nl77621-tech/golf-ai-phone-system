@@ -71,6 +71,16 @@ const sessions = new Map();
 const SESSION_TTL_MS = 25 * 60 * 1000; // refresh after 25min of inactivity
 const lastRequestTime = new Map();
 
+// Keep-alive interval — every 15 min we ping the authenticated tee sheet
+// for each cached session. This:
+//   1. Prevents the session from going cold and expiring
+//   2. Keeps Tee-On's session-side timer fresh (their app likely has its
+//      own session timeout we don't see)
+//   3. Lets check_tee_times reuse these warm cookies instead of doing
+//      a cold anonymous public-sheet fetch (which Tee-On rate-limits)
+// Started on module load. Never stops (Node lifecycle handles cleanup).
+const KEEPALIVE_INTERVAL_MS = 15 * 60 * 1000; // 15 min
+
 // ─── Generic HTTPS helpers ────────────────────────────────────────────────
 
 function httpsRequest({ method, path, headers = {}, body = null, redirect = true, redirectCount = 0 }) {
@@ -1163,9 +1173,94 @@ async function cancelBooking(businessId, bookingRequestId, { nine } = {}) {
   }
 }
 
+/**
+ * Returns the cached authenticated cookies for a tenant, or null if no
+ * session is cached (i.e. nobody has booked for this tenant yet this
+ * process lifetime, or the session was deleted after a failure).
+ *
+ * Does NOT trigger a login. Read-only access for callers (like
+ * teeon-automation.js's check_tee_times) that want to piggyback on the
+ * authenticated session for non-write reads without risking a cold-start
+ * login on a customer call.
+ */
+function getWarmAdminCookies(businessId) {
+  const cached = sessions.get(businessId);
+  if (!cached) return null;
+  if (Date.now() - cached.time > SESSION_TTL_MS) return null;
+  return cached.cookies;
+}
+
+/**
+ * Ensure a fresh authenticated session exists for the tenant. Triggers a
+ * login if needed. Used at app boot (by callers who want to pre-warm)
+ * and by the keep-alive ping. Quiet — swallows errors and returns null
+ * rather than throwing, so a misconfigured tenant doesn't crash boot.
+ */
+async function ensureWarmAdminSession(businessId) {
+  try {
+    if (!(await isEnabledForBusiness(businessId).catch(() => false))) return null;
+    const { cookies } = await getSession(businessId);
+    return cookies;
+  } catch (err) {
+    console.warn(`[tenant:${businessId}] [TeeOn-Admin] ensureWarmAdminSession failed:`, err.message);
+    return null;
+  }
+}
+
+// ─── Keep-alive runner ────────────────────────────────────────────────────
+//
+// Pings the authenticated tee sheet every KEEPALIVE_INTERVAL_MS for every
+// tenant we have a cached session for. A successful GET keeps both
+// Tee-On's server-side session timer AND our local TTL fresh, so calls
+// to check_tee_times can use the warm cookies indefinitely without
+// triggering a cold-start session fetch (which got us rate-limited).
+async function runKeepalive() {
+  for (const [businessId, cached] of sessions.entries()) {
+    if (!cached || !cached.cookies) continue;
+    try {
+      const cfg = await getTenantTeeOnConfig(businessId);
+      if (!cfg) continue;
+      const res = await httpsRequest({
+        method: 'GET',
+        path: `${TEE_SHEET_PATH}?Course=${cfg.courseCode}&Default=true`,
+        headers: { Cookie: cached.cookies, Referer: `https://${TEEON_HOST}/` }
+      });
+      const looksAuthenticated =
+        res.status === 200 &&
+        /tee-sheet-body|submitTime\(|ChangeDate|changeDate/.test(res.body || '');
+      if (looksAuthenticated) {
+        // Refresh our local TTL so the next check_tee_times sees a warm
+        // session. We deliberately don't merge new cookies here — login
+        // post-redirect cookies were set originally; this GET is a refresh,
+        // not a re-auth.
+        cached.time = Date.now();
+        console.log(`[tenant:${businessId}] [TeeOn-Admin] keep-alive OK (session refreshed)`);
+      } else {
+        // Session has gone bad — drop it so the next caller does a fresh
+        // login rather than reusing dead cookies.
+        console.warn(`[tenant:${businessId}] [TeeOn-Admin] keep-alive failed (status=${res.status}, body=${res.body?.length || 0}b) — dropping session`);
+        sessions.delete(businessId);
+      }
+    } catch (err) {
+      console.warn(`[tenant:${businessId}] [TeeOn-Admin] keep-alive ping error:`, err.message);
+    }
+  }
+}
+
+// Fire-and-forget. Node's event loop keeps the interval alive for the
+// lifetime of the process; no cleanup needed.
+setInterval(() => {
+  runKeepalive().catch(err => {
+    console.error('[TeeOn-Admin] keep-alive runner crashed:', err.message);
+  });
+}, KEEPALIVE_INTERVAL_MS);
+
 module.exports = {
   createBooking,
   cancelBooking,
   isEnabledForBusiness,
-  isDryRun
+  isDryRun,
+  // For teeon-automation.js — auth'd reads piggyback on this session.
+  getWarmAdminCookies,
+  ensureWarmAdminSession,
 };

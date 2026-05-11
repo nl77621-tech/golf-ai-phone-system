@@ -131,6 +131,7 @@ async function getTeeOnConfigForBusiness(businessId) {
     const fromSetting = await getSetting(businessId, 'teeon').catch(() => null);
     if (fromSetting?.course_code) {
       return {
+        businessId,
         courseCode: fromSetting.course_code,
         courseGroupId: fromSetting.course_group_id
       };
@@ -138,6 +139,7 @@ async function getTeeOnConfigForBusiness(businessId) {
     const business = await getBusinessById(businessId).catch(() => null);
     if (business?.teeon_course_code) {
       return {
+        businessId,
         courseCode: business.teeon_course_code,
         courseGroupId: business.teeon_course_group_id
       };
@@ -1022,7 +1024,11 @@ async function executeToolCall(toolName, args, ctx) {
     switch (toolName) {
       case 'check_tee_times': {
         if (!teeon.isAvailable()) {
-          return { available: null, message: 'Live tee sheet not connected. I can take your preferred date and time and staff will confirm availability.' };
+          return {
+            available: null,
+            error: 'tee_sheet_not_connected',
+            message: '⚠️ TEE SHEET NOT CONNECTED — DO NOT say "no slots available" or "fully booked". The live tee sheet integration is offline. Tell the caller: "I\'m not able to see the live tee sheet right now — let me take your preferred date and time as a request, and staff will confirm by text once they verify."'
+          };
         }
         try {
           const partySize = args.party_size || 1;
@@ -1374,7 +1380,15 @@ If you are about to say a time and it does NOT appear above, STOP. Either re-cal
           return { available: true, date: args.date, partySize, total: openSlots.length, fits_party: fitsParty, valid_times, holes_available, message };
         } catch (err) {
           console.error(`[tenant:${businessId}][TeeOn] checkAvailability error:`, err.message);
-          return { available: null, message: 'Unable to check live availability right now. I can take a booking request.' };
+          // Explicit, AI-readable contract: this is a "could not reach
+          // Tee-On" state, NOT a "no slots" state. Real-call observed
+          // 2026-05-11: AI translated this into "No open slots for three
+          // players Friday" because the prior wording was ambiguous.
+          return {
+            available: null,
+            error: 'tee_sheet_unreachable',
+            message: '⚠️ TEE SHEET UNREACHABLE — DO NOT say "no slots available" or "fully booked". The live tee sheet is temporarily unreachable (rate limit, network, or Tee-On maintenance). Tell the caller: "I\'m having trouble reaching the live tee sheet right now — let me take your request and have staff confirm by text once they verify the time." Then collect name, phone, date, party size, holes, carts and call book_tee_time normally; staff will confirm manually.'
+          };
         }
       }
 

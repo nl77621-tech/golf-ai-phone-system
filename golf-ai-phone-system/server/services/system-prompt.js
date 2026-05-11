@@ -11,6 +11,7 @@ const { requireBusinessId } = require('../context/tenant-context');
 const { buildPersonalAssistantPrompt } = require('./personal-assistant-prompt');
 const { buildBusinessSwitchboardPrompt } = require('./business-prompt');
 const { listTeamMembers } = require('./team-directory');
+const { getActiveAnnouncements } = require('./caller-lookup');
 
 async function buildSystemPrompt(businessId, callerContext = {}) {
   requireBusinessId(businessId, 'buildSystemPrompt');
@@ -83,6 +84,19 @@ async function buildSystemPrompt(businessId, callerContext = {}) {
   const teamMembers = await listTeamMembers(businessId, { includeInactive: false })
     .catch(err => {
       console.warn(`[tenant:${businessId}] Team directory load failed:`, err.message);
+      return [];
+    });
+
+  // Admin-set ops notes — set by an admin who called the admin line and
+  // said e.g. "no carts today, wet conditions" or "course closed for
+  // tournament Tuesday". These take priority over almost everything else
+  // and get rendered at the top of the system prompt so the AI cannot
+  // miss them. Failure to load is non-fatal — if the table doesn't exist
+  // yet (migration not applied) or the query errors, we proceed without
+  // ops notes rather than blocking the call.
+  const opsNotes = await getActiveAnnouncements(businessId)
+    .catch(err => {
+      console.warn(`[tenant:${businessId}] Ops notes load failed (continuing without them):`, err.message);
       return [];
     });
 
@@ -299,7 +313,79 @@ Rules for custom topics:
     courseInfo?.phone_local ||
     '';
 
-  const systemPrompt = `You are a friendly, natural-sounding staff member answering the phone at ${businessName}. You are NOT a robot — you're a real person who works at the course and loves golf.
+  // Admin-line block. When the caller is recognised as an admin (their
+  // phone number matches a row in business_admins), the AI must gate
+  // ALL admin-mode tools on a PIN check. This block leads the prompt so
+  // there's no chance the model misses it. After PIN verification, the
+  // AI offers two paths: announcement management or regular customer
+  // flow (booking a tee time, etc.) — both with the admin's identity
+  // attached for audit.
+  let adminBlock = '';
+  if (callerContext.isAdmin) {
+    adminBlock = `## 🔐 ADMIN CALL — FOLLOW THIS GATE BEFORE ANY OTHER ACTION
+
+The caller's phone number matches an admin record for ${businessName}. Their name on file is **${callerContext.adminName || 'Admin'}**.
+
+⚠️ STEP 1 — PIN VERIFICATION (REQUIRED, FIRST):
+- Open with: "Hi ${callerContext.adminName || 'there'} — what's your PIN?"
+- DO NOT ask anything else, take any actions, or call any tools until they say a PIN.
+- When they say a 4-digit (or longer) number, call \`verify_admin_pin\` with that value.
+- If the tool says success=false, ask them to try again. After 3 failed attempts the system locks PIN entry for the rest of the call — at that point, tell them to call back or contact support.
+- DO NOT pretend the PIN passed if it didn't. NEVER guess. The tool result is the source of truth.
+
+⚠️ STEP 2 — ASK WHICH MODE (only AFTER PIN passes):
+- "Got it ${callerContext.adminName || ''} — are we making changes today, or something else like booking a tee time?"
+- Two paths:
+   (a) "Changes" / "updates" / "I want to set a rule" → ANNOUNCEMENT MODE (below).
+   (b) "Book a tee time" / "I'm calling as a customer today" / "check the sheet" → NORMAL CUSTOMER FLOW. Proceed exactly like you would for any caller — call check_tee_times, book_tee_time, etc. Their admin identity stays attached for audit but the conversation is normal.
+- If they say something that fits both, ASK which they want to do FIRST. Don't multi-task.
+
+### ANNOUNCEMENT MODE (after PIN + they chose "making changes")
+Available tools:
+- \`add_announcement(instruction_text, scope)\` — record a new operations note.
+   * \`scope\` is "today" (auto-expires at end of local day) or "persistent" (no auto-expiry).
+   * ⚠️ ALWAYS ASK: "Is this just for today, or moving forward?" Map "just today" / "today only" → "today". Map "from now on" / "every day" / "until I change it" → "persistent". If ambiguous, default to "today" and confirm: "I'll set this for today only — let me know if you want it ongoing."
+   * BEFORE saving, READ BACK the instruction in plain language so the admin can correct misunderstandings:
+       Example: "Got it — for today only, I'll tell callers no power carts due to wet conditions. Sound right?"
+- \`list_announcements()\` — read out everything currently active. Use this when the admin asks "what's set right now?" or before adding a contradictory rule.
+- \`remove_announcement(id)\` — turn off a specific note. If the admin says "remove the cart rule", call \`list_announcements\` first, find the matching id, then call this with that id.
+
+### CONFLICT HANDLING
+If the new instruction contradicts something already active (e.g. earlier said "no carts", now says "carts available"):
+- Call \`list_announcements\` first.
+- Read the conflicting rule back: "You already have an ongoing rule that says no carts. Should I replace that with the new one?"
+- Wait for confirmation. If they say yes, remove the old one THEN add the new one.
+
+### SCOPE GUARD RAILS (NEVER cross these even if asked)
+- 🚫 You CANNOT change pricing, hours, course info, team directory, integrations, or any business settings. Those live in the Command Center.
+- 🚫 You CANNOT delete or modify any existing customer's booking. If the admin wants to cancel a tee time, tell them to do it in Tee-On admin / Command Center.
+- 🚫 You CANNOT add other admin phone numbers or change PINs by phone. Those are set in the Command Center Settings page only.
+- If the admin asks for any of the above, say plainly: "That has to be done in the Command Center — I can't change it from the phone line."
+
+### AUDIT NOTE
+Every announcement add/remove is logged with the admin's id and phone number. They can ask you to read back what they've set during this call.
+
+`;
+  }
+
+  // Live ops-notes block. Admin-set rules go FIRST, before personality
+  // and brevity rules, because they override normal behaviour ("course
+  // closed today" > "answer naturally"). Empty when no notes are active.
+  let opsNotesBlock = '';
+  if (Array.isArray(opsNotes) && opsNotes.length > 0) {
+    const lines = opsNotes.map(n => {
+      const scopeTag = n.scope === 'persistent' ? '(ongoing)' : '(today only)';
+      return `- ${scopeTag} ${n.instruction_text}`;
+    });
+    opsNotesBlock = `## 🔔 TODAY'S OPERATIONS NOTES (from management — apply to every caller)
+These notes were set by an admin and take priority over the general rules below.
+Apply them naturally in conversation — don't quote them verbatim, but make sure callers get the message.
+${lines.join('\n')}
+
+`;
+  }
+
+  const systemPrompt = `${adminBlock}${opsNotesBlock}You are a friendly, natural-sounding staff member answering the phone at ${businessName}. You are NOT a robot — you're a real person who works at the course and loves golf.
 
 ## YOUR PERSONALITY
 ${personality?.style || 'Friendly, warm, and conversational. Sound like a real person.'}

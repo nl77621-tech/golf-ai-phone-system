@@ -43,7 +43,13 @@ const {
   getPendingModifications,
   updateModificationStatus
 } = require('../services/booking-manager');
-const { normalizePhone } = require('../services/caller-lookup');
+const {
+  normalizePhone,
+  hashAdminPin,
+  getActiveAnnouncements,
+  createAnnouncement,
+  deactivateAnnouncement,
+} = require('../services/caller-lookup');
 const { logEventFromReq } = require('../services/audit-log');
 const {
   listTeamMembers,
@@ -1510,6 +1516,228 @@ router.post('/users/:userId/send-credentials-sms', requireBusinessAdmin, async (
     res.json({ ok: true, message_sid, to, from });
   } catch (err) {
     mapUserMgmtError(err, res);
+  }
+});
+
+// ============================================
+// ADMIN-LINE PHONE NUMBERS + PINS  (business_admins table)
+// ============================================
+// These routes let staff manage which phone numbers can call the admin
+// line and what PIN unlocks it. The PIN is bcrypt-hashed; we never read
+// it back to the client. Only business admins (and super admins) can
+// touch this table — same gate as phone-numbers / team management.
+
+router.get('/admins', requireBusinessAdmin, async (req, res) => {
+  const businessId = tenantId(req);
+  try {
+    const result = await query(
+      `SELECT id, phone_number, name, is_active, created_at, last_used_at
+         FROM business_admins
+        WHERE business_id = $1
+        ORDER BY created_at DESC`,
+      [businessId]
+    );
+    res.json({ admins: result.rows });
+  } catch (err) {
+    console.error('[api] GET /admins failed:', err.message);
+    res.status(500).json({ error: 'Failed to load admins' });
+  }
+});
+
+router.post('/admins', requireBusinessAdmin, async (req, res) => {
+  const businessId = tenantId(req);
+  const { phone_number, name, pin } = req.body || {};
+  if (!phone_number || !name || !pin) {
+    return res.status(400).json({ error: 'phone_number, name, and pin are required' });
+  }
+  const normalized = normalizePhone(phone_number);
+  if (!normalized || !isValidPhoneE164(normalized)) {
+    return res.status(400).json({ error: 'Invalid phone_number — must be E.164 (e.g. +14168276921)' });
+  }
+  if (typeof pin !== 'string' || pin.length < 4 || pin.length > 12) {
+    return res.status(400).json({ error: 'pin must be 4-12 characters' });
+  }
+  if (typeof name !== 'string' || !name.trim() || name.length > 100) {
+    return res.status(400).json({ error: 'name must be 1-100 characters' });
+  }
+  let pinHash;
+  try {
+    pinHash = await hashAdminPin(pin);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+  try {
+    const result = await query(
+      `INSERT INTO business_admins (business_id, phone_number, name, pin_hash)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, phone_number, name, is_active, created_at, last_used_at`,
+      [businessId, normalized, name.trim(), pinHash]
+    );
+    res.status(201).json({ admin: result.rows[0] });
+  } catch (err) {
+    if (err.code === '23505') {
+      // Unique violation — phone is already an admin for this business
+      return res.status(409).json({ error: 'This phone number is already registered as an admin' });
+    }
+    console.error('[api] POST /admins failed:', err.message);
+    res.status(500).json({ error: 'Failed to create admin' });
+  }
+});
+
+router.patch('/admins/:id', requireBusinessAdmin, async (req, res) => {
+  const businessId = tenantId(req);
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ error: 'Invalid admin id' });
+  }
+  const { name, pin, is_active } = req.body || {};
+  const updates = [];
+  const values = [];
+  let n = 1;
+  if (typeof name === 'string' && name.trim()) {
+    updates.push(`name = $${n++}`);
+    values.push(name.trim().slice(0, 100));
+  }
+  if (pin !== undefined) {
+    if (typeof pin !== 'string' || pin.length < 4 || pin.length > 12) {
+      return res.status(400).json({ error: 'pin must be 4-12 characters' });
+    }
+    try {
+      const hash = await hashAdminPin(pin);
+      updates.push(`pin_hash = $${n++}`);
+      values.push(hash);
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+  }
+  if (typeof is_active === 'boolean') {
+    updates.push(`is_active = $${n++}`);
+    values.push(is_active);
+  }
+  if (updates.length === 0) {
+    return res.status(400).json({ error: 'No updatable fields supplied' });
+  }
+  values.push(id, businessId);
+  try {
+    const result = await query(
+      `UPDATE business_admins SET ${updates.join(', ')}
+        WHERE id = $${n++} AND business_id = $${n}
+        RETURNING id, phone_number, name, is_active, created_at, last_used_at`,
+      values
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Admin not found' });
+    res.json({ admin: result.rows[0] });
+  } catch (err) {
+    console.error('[api] PATCH /admins/:id failed:', err.message);
+    res.status(500).json({ error: 'Failed to update admin' });
+  }
+});
+
+router.delete('/admins/:id', requireBusinessAdmin, async (req, res) => {
+  const businessId = tenantId(req);
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ error: 'Invalid admin id' });
+  }
+  // Soft-delete: flip is_active=false so historical announcements still
+  // resolve their created_by_admin_id to a real row (FK is ON DELETE SET
+  // NULL but soft-delete keeps the name for the audit trail).
+  try {
+    const result = await query(
+      `UPDATE business_admins SET is_active = FALSE
+        WHERE id = $1 AND business_id = $2 AND is_active = TRUE
+        RETURNING id`,
+      [id, businessId]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Admin not found or already inactive' });
+    res.json({ ok: true, id: result.rows[0].id });
+  } catch (err) {
+    console.error('[api] DELETE /admins/:id failed:', err.message);
+    res.status(500).json({ error: 'Failed to deactivate admin' });
+  }
+});
+
+// ============================================
+// BUSINESS ANNOUNCEMENTS (admin-set ops notes)
+// ============================================
+// Active rows here are injected into the customer-facing AI system
+// prompt every call. Staff can list / add / remove via the Command
+// Center; admins can also add/list/remove via the phone admin line.
+// Every modifying route is guarded by requireBusinessAdmin so a
+// regular staff user doesn't accidentally publish a rule to every
+// caller. Read access is open to any authenticated tenant user so the
+// banner can render.
+
+router.get('/announcements', async (req, res) => {
+  const businessId = tenantId(req);
+  try {
+    const rows = await getActiveAnnouncements(businessId);
+    res.json({ announcements: rows });
+  } catch (err) {
+    console.error('[api] GET /announcements failed:', err.message);
+    res.status(500).json({ error: 'Failed to load announcements' });
+  }
+});
+
+router.post('/announcements', requireBusinessAdmin, async (req, res) => {
+  const businessId = tenantId(req);
+  const { instruction_text, scope } = req.body || {};
+  if (!instruction_text || !String(instruction_text).trim()) {
+    return res.status(400).json({ error: 'instruction_text is required' });
+  }
+  if (!['today', 'persistent'].includes(scope)) {
+    return res.status(400).json({ error: "scope must be 'today' or 'persistent'" });
+  }
+  // Same end-of-local-day logic as the phone admin tool. Falls back to
+  // ~18h from now if the timezone lookup fails.
+  let expiresAt = null;
+  if (scope === 'today') {
+    try {
+      const { getBusinessById } = require('../config/database');
+      const tz = (await getBusinessById(businessId).catch(() => null))?.timezone || 'America/Toronto';
+      const now = new Date();
+      const localDateStr = now.toLocaleDateString('en-CA', { timeZone: tz });
+      const tomorrowLocal = new Date(localDateStr + 'T23:59:59');
+      const offsetMins = (() => {
+        const probe = new Date(localDateStr + 'T12:00:00Z');
+        const localProbe = new Date(probe.toLocaleString('en-US', { timeZone: tz }));
+        return (probe - localProbe) / 60000;
+      })();
+      expiresAt = new Date(tomorrowLocal.getTime() + offsetMins * 60000);
+    } catch {
+      expiresAt = new Date(Date.now() + 18 * 60 * 60 * 1000);
+    }
+  }
+  try {
+    const row = await createAnnouncement({
+      businessId,
+      instructionText: instruction_text,
+      scope,
+      expiresAt,
+      adminId: null,
+      adminPhone: null,
+    });
+    res.status(201).json({ announcement: row });
+  } catch (err) {
+    console.error('[api] POST /announcements failed:', err.message);
+    res.status(500).json({ error: 'Failed to create announcement' });
+  }
+});
+
+router.delete('/announcements/:id', requireBusinessAdmin, async (req, res) => {
+  const businessId = tenantId(req);
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ error: 'Invalid announcement id' });
+  }
+  try {
+    const deactivatedBy = `user:${req.auth?.user_id || 'unknown'}`;
+    const row = await deactivateAnnouncement(businessId, id, deactivatedBy);
+    if (!row) return res.status(404).json({ error: 'Announcement not found or already inactive' });
+    res.json({ ok: true, id: row.id });
+  } catch (err) {
+    console.error('[api] DELETE /announcements/:id failed:', err.message);
+    res.status(500).json({ error: 'Failed to remove announcement' });
   }
 });
 

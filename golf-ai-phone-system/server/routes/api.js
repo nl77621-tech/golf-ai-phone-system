@@ -1741,4 +1741,33 @@ router.delete('/announcements/:id', requireBusinessAdmin, async (req, res) => {
   }
 });
 
+// ============================================
+// LIVE TEE SHEET MIRROR (read-only)
+// ============================================
+// Returns a parsed snapshot of the Tee-On admin tee sheet for a given
+// date. Backed by the warm authenticated session managed by teeon-admin
+// (PR #28's keep-alive) — no anonymous public-sheet hits, no per-request
+// login. Cached server-side for 5 minutes; staff polling every 60 s
+// from the Command Center costs at most one Tee-On fetch every 5 min
+// per visible date per tenant.
+//
+// Read-only. No phone numbers, emails, payment info, or notes — just
+// the surface view the clubhouse staff sees on Tee-On.
+
+router.get('/tee-sheet', async (req, res) => {
+  const businessId = tenantId(req);
+  const date = String(req.query.date || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return res.status(400).json({ error: 'date query param required in YYYY-MM-DD format' });
+  }
+  try {
+    const teeSheetMirror = require('../services/tee-sheet-mirror');
+    const result = await teeSheetMirror.getTeeSheet(businessId, date);
+    res.json(result);
+  } catch (err) {
+    console.error(`[api] GET /tee-sheet (${date}) failed:`, err.message);
+    res.status(503).json({ error: err.message });
+  }
+});
+
 module.exports = router;

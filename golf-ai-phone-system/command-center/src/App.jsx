@@ -350,6 +350,7 @@ const DEFAULT_SIDEBAR_ICON = '\ud83c\udfe0'; // fallback emoji
 const GOLF_SIDEBAR_ITEMS = [
   { id: 'dashboard', label: 'Dashboard', icon: '\ud83d\udcca' },
   { id: 'teesheet',  label: 'Tee Sheet', icon: '\u26f3' },
+  { id: 'livesheet', label: 'Live Tee-On', icon: '\ud83d\udfe2' },
   { id: 'bookings',  label: 'Bookings',  icon: '\ud83d\udcc5' },
   { id: 'customers', label: 'Customers', icon: '\ud83d\udc65' },
   { id: 'calls',     label: 'Call Logs', icon: '\ud83d\udcde' },
@@ -7434,9 +7435,178 @@ function RestaurantSettingsPage() {
 // Shared golf page map — used by the plan='legacy' safety lock and by
 // the regular golf_course / driving_range path so dispatch stays in
 // lockstep with the sidebar.
+// ============================================
+// LIVE TEE-ON SHEET PAGE
+// ============================================
+// Read-only mirror of the Tee-On admin tee sheet. Shows every booking
+// (AI, phone, walk-in, online) without needing to log into Tee-On
+// separately. Backed by /api/tee-sheet which scrapes the admin tee
+// sheet using the warm authenticated session (PR #28 + tee-sheet-
+// mirror.js). 5-minute server-side cache + 60-second client polling
+// so staff always see fresh data with negligible Tee-On load.
+//
+// Intentionally lightweight: no booking edits, no phone numbers, no
+// payment data — just the visible-on-Tee-On surface so staff don't
+// have to flip between Command Center and Tee-On admin.
+function LiveTeeOnSheetPage() {
+  const toLocalDateStr = (d) => {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  };
+
+  const [selectedDate, setSelectedDate] = useState(toLocalDateStr(new Date()));
+  const [data, setData] = useState(null);   // { date, rows, fetchedAt, cached }
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  const load = useCallback(async (date) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const r = await api(`/api/tee-sheet?date=${encodeURIComponent(date)}`);
+      setData(r);
+    } catch (err) {
+      setError(err.message || 'Failed to load tee sheet');
+      setData(null);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { load(selectedDate); }, [selectedDate, load]);
+
+  // Live refresh — re-fetch every 60s while the page is open. Cheap
+  // because the server caches for 5 min, so most polls are an in-
+  // memory lookup (no Tee-On request).
+  useEffect(() => {
+    const t = setInterval(() => load(selectedDate), 60_000);
+    return () => clearInterval(t);
+  }, [selectedDate, load]);
+
+  const prevDay = () => {
+    const d = new Date(selectedDate + 'T12:00:00');
+    d.setDate(d.getDate() - 1);
+    setSelectedDate(toLocalDateStr(d));
+  };
+  const nextDay = () => {
+    const d = new Date(selectedDate + 'T12:00:00');
+    d.setDate(d.getDate() + 1);
+    setSelectedDate(toLocalDateStr(d));
+  };
+  const goToday = () => setSelectedDate(toLocalDateStr(new Date()));
+
+  const displayDate = (() => {
+    const d = new Date(selectedDate + 'T12:00:00');
+    return d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+  })();
+
+  const formatTime = (hhmm) => {
+    if (!hhmm) return '';
+    const [h, m] = hhmm.split(':').map(Number);
+    const ampm = h >= 12 ? 'pm' : 'am';
+    const displayHour = h % 12 || 12;
+    return `${displayHour}:${String(m).padStart(2, '0')} ${ampm}`;
+  };
+
+  const renderSide = (slots) => {
+    // slots = [slot0, slot1, slot2, slot3] (null when empty).
+    const occupied = slots.filter(Boolean);
+    if (occupied.length === 0) {
+      return React.createElement('span', { className: 'text-gray-300 italic text-sm' }, '— empty —');
+    }
+    return React.createElement('div', { className: 'flex flex-wrap gap-1.5' },
+      occupied.map((s, i) => React.createElement('span', {
+        key: i,
+        className: `inline-flex items-center gap-1 text-xs font-medium px-2 py-1 rounded ${s.noShow ? 'bg-orange-100 text-orange-800' : s.paid ? 'bg-green-100 text-green-800' : 'bg-blue-100 text-blue-800'}`,
+        title: `${s.name} • ${s.holes}h${s.hasCart ? ' • cart' : ''}${s.paid ? ' • paid' : ''}${s.noShow ? ' • NO-SHOW' : ''}`
+      },
+        s.name,
+        React.createElement('span', { className: 'text-xs opacity-60' }, `${s.holes}h`)
+      ))
+    );
+  };
+
+  return React.createElement('div', null,
+    React.createElement('div', { className: 'flex items-center justify-between mb-4' },
+      React.createElement('div', null,
+        React.createElement('h1', { className: 'text-2xl font-bold text-gray-800' }, '🟢 Live Tee-On Sheet'),
+        React.createElement('p', { className: 'text-sm text-gray-500 mt-1' },
+          'Read-only mirror of the live Tee-On tee sheet. Auto-refreshes every minute.'
+        )
+      ),
+      React.createElement('div', { className: 'flex items-center gap-2' },
+        React.createElement('button', {
+          onClick: prevDay,
+          className: 'px-3 py-2 bg-white border border-gray-300 rounded-md hover:bg-gray-50 text-sm'
+        }, '‹ Prev'),
+        React.createElement('button', {
+          onClick: goToday,
+          className: 'px-3 py-2 bg-white border border-gray-300 rounded-md hover:bg-gray-50 text-sm font-medium'
+        }, 'Today'),
+        React.createElement('input', {
+          type: 'date',
+          value: selectedDate,
+          onChange: (e) => setSelectedDate(e.target.value),
+          className: 'px-3 py-2 bg-white border border-gray-300 rounded-md text-sm'
+        }),
+        React.createElement('button', {
+          onClick: nextDay,
+          className: 'px-3 py-2 bg-white border border-gray-300 rounded-md hover:bg-gray-50 text-sm'
+        }, 'Next ›')
+      )
+    ),
+    React.createElement('div', { className: 'flex items-center justify-between mb-4' },
+      React.createElement('div', { className: 'text-lg font-semibold text-gray-700' }, displayDate),
+      data && React.createElement('div', { className: 'text-xs text-gray-400' },
+        `Fetched ${new Date(data.fetchedAt).toLocaleTimeString()}${data.cached ? ' (cached)' : ''} • ${data.rows.length} slots`
+      )
+    ),
+    error && React.createElement('div', { className: 'bg-red-50 border border-red-200 rounded-lg p-4 mb-4' },
+      React.createElement('div', { className: 'text-red-800 font-medium mb-1' }, 'Unable to load tee sheet'),
+      React.createElement('div', { className: 'text-sm text-red-700' }, error),
+      React.createElement('div', { className: 'text-xs text-red-600 mt-2 italic' },
+        'Common causes: Tee-On admin credentials not configured, the admin session is being re-established (try again in 30s), or Tee-On is unreachable.'
+      )
+    ),
+    loading && !data && React.createElement('div', { className: 'text-gray-500 text-sm' }, 'Loading…'),
+    data && data.rows.length === 0 && React.createElement('div', { className: 'bg-yellow-50 border border-yellow-200 rounded-lg p-6 text-center text-yellow-800' },
+      'No tee-time slots found for this date. Either nothing is bookable yet or the page format changed — let us know.'
+    ),
+    data && data.rows.length > 0 && React.createElement('div', { className: 'bg-white border border-gray-200 rounded-lg overflow-hidden' },
+      React.createElement('table', { className: 'w-full' },
+        React.createElement('thead', null,
+          React.createElement('tr', { className: 'bg-gray-50 border-b border-gray-200' },
+            React.createElement('th', { className: 'px-4 py-2 text-left text-xs font-semibold uppercase text-gray-600 w-24' }, 'Time'),
+            React.createElement('th', { className: 'px-4 py-2 text-left text-xs font-semibold uppercase text-gray-600' }, 'Front 9'),
+            React.createElement('th', { className: 'px-4 py-2 text-left text-xs font-semibold uppercase text-gray-600' }, 'Back 9')
+          )
+        ),
+        React.createElement('tbody', null,
+          data.rows.map((row, i) =>
+            React.createElement('tr', {
+              key: row.time,
+              className: i % 2 === 0 ? 'bg-white border-b border-gray-100' : 'bg-gray-50/50 border-b border-gray-100'
+            },
+              React.createElement('td', { className: 'px-4 py-3 text-sm font-mono text-gray-700 align-top' }, formatTime(row.time)),
+              React.createElement('td', { className: 'px-4 py-3 align-top' }, renderSide(row.front)),
+              React.createElement('td', { className: 'px-4 py-3 align-top' }, renderSide(row.back))
+            )
+          )
+        )
+      )
+    ),
+    React.createElement('div', { className: 'mt-4 text-xs text-gray-400 italic' },
+      '⓵ Names from the live Tee-On admin tee sheet. Green badge = paid, blue = unpaid, orange = no-show. Hover for details.'
+    )
+  );
+}
+
 const GOLF_PAGES = {
   dashboard: DashboardPage,
   teesheet:  TeeSheetPage,
+  livesheet: LiveTeeOnSheetPage,
   bookings:  BookingsPage,
   customers: CustomersPage,
   calls:     CallLogsPage,

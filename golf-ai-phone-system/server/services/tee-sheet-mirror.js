@@ -26,7 +26,6 @@
 
 const https = require('https');
 const { requireBusinessId } = require('../context/tenant-context');
-const { getBusinessById, getSetting } = require('../config/database');
 const teeonAdmin = require('./teeon-admin');
 
 const TEEON_HOST = 'www.tee-on.com';
@@ -72,14 +71,14 @@ function httpsRequest(opts) {
 }
 
 async function getTenantTeeOnCourseCode(businessId) {
-  // teeon-admin.js uses this exact key (a flat string, not nested under
-  // a "teeon" object). Match that convention so existing tenants — for
-  // whom this is already populated — work without re-configuration.
+  // Reuse teeon-admin's tenant config lookup so we share its full
+  // fallback chain (settings → businesses → DEFAULT_COURSE_CODE 'COLU').
+  // Valleymede works without an explicit setting because of the default;
+  // duplicating the lookup here was causing the "not configured" error
+  // even though bookings worked fine via the same business_id.
   try {
-    const courseCode = await getSetting(businessId, 'teeon_course_code').catch(() => null);
-    if (courseCode) return String(courseCode);
-    const business = await getBusinessById(businessId).catch(() => null);
-    if (business?.teeon_course_code) return String(business.teeon_course_code);
+    const cfg = await teeonAdmin.getTenantTeeOnConfig(businessId).catch(() => null);
+    if (cfg?.courseCode) return cfg.courseCode;
   } catch {
     /* fall through */
   }

@@ -803,29 +803,77 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
     // driven fields we want to set: player names/contact, party
     // size/holes/carts choice.
     const liveFields = parseFormFields(formPage.body || '');
+
+    // ─── Slot-aware placement ───────────────────────────────────────
+    //
+    // BUG fixed here (real-call regression observed 2026-05-11): when
+    // joining a partial booking (existing players already in slots 0
+    // and/or 1), the old code unconditionally wrote the new caller's
+    // name to GolferName0. Tee-On preserves slot 0 because it has a
+    // real MemberID, then puts our addition into the next empty slot
+    // with the default "Guest" name. Result on the live tee sheet:
+    //   Slot 1: Rob Meloche   ← existing, untouched
+    //   Slot 2: Guest         ← existing partner
+    //   Slot 3: Guest         ← us (should be the caller's name!)
+    //   Slot 4: Guest         ← our partner
+    //
+    // Fix: scan the live form for occupied slots, then write the
+    // caller's data to the first EMPTY slot (and their party at the
+    // next empties). Also fix the Players field to be the TOTAL slot
+    // occupancy after our addition, not just the size of our party.
+    const occupied = [false, false, false, false];
+    for (let i = 0; i < 4; i++) {
+      const nm = String(liveFields[`GolferName${i}`] || '').trim();
+      if (nm) occupied[i] = true;
+    }
+    const existingCount = occupied.filter(Boolean).length;
+    const partySize = Math.max(1, Math.min(4, Number(payload.Players) || 1));
+    let firstEmpty = occupied.indexOf(false);
+    if (firstEmpty < 0) {
+      // No empty slots — should never happen if check_tee_times worked.
+      // Fail loudly rather than silently overwriting an existing booking.
+      throw new Error(`Slot ${time}/${resolvedNine} on ${date} is already full (4/4 players) — cannot add ${partySize} more`);
+    }
+    if (firstEmpty + partySize > 4) {
+      throw new Error(`Slot ${time}/${resolvedNine} on ${date} has ${4 - firstEmpty} seat(s) open — cannot fit a party of ${partySize}`);
+    }
+
     const overrides = {
-      Players: payload.Players,
+      // Players reflects the FULL slot occupancy after our addition so
+      // Tee-On submits all the rows correctly. Existing + new.
+      Players: String(existingCount + partySize),
       Holes: payload.Holes,
       Carts: payload.Carts,
       // Slot identity — Tee-On sets these as hidden inputs on the form
-      // page already (matches our query params), but we re-assert them
-      // for safety.
+      // page already (matches our query params), but we re-assert for safety.
       Date: payload.Date,
       Time: payload.Time,
       CourseCode: payload.CourseCode,
       Nine: payload.Nine,
-      // Slot 0 player (the booker)
-      GolferName0: payload.GolferName0,
-      Phone0: payload.Phone0,
-      Email0: payload.Email0,
-      Holes0: payload.Holes0
     };
-    // For party >1, also override slot 1..n with "Guest"
-    for (let i = 1; i < 4; i++) {
-      if (payload[`GolferName${i}`]) overrides[`GolferName${i}`] = payload[`GolferName${i}`];
-      if (payload[`Holes${i}`]) overrides[`Holes${i}`] = payload[`Holes${i}`];
+
+    // Write the caller's data into the first empty slot, then "Guest"
+    // entries for the rest of their party. We never touch already-
+    // occupied slots — those are someone else's booking and must be
+    // preserved verbatim.
+    for (let i = 0; i < partySize; i++) {
+      const slotIdx = firstEmpty + i;
+      const isBooker = i === 0;
+      overrides[`GolferName${slotIdx}`] = isBooker ? (payload.GolferName0 || 'Guest') : 'Guest';
+      overrides[`Phone${slotIdx}`]      = isBooker ? (payload.Phone0 || '')      : '';
+      overrides[`Email${slotIdx}`]      = isBooker ? (payload.Email0 || '')      : '';
+      overrides[`Holes${slotIdx}`]      = payload.Holes0 || payload.Holes;
+      // MemberID + SlotBookerID stay blank for the new slot — that's how
+      // Tee-On represents a non-member walk-in / phone booking.
+      overrides[`MemberID${slotIdx}`]   = '';
+      overrides[`SlotBookerID${slotIdx}`] = '';
     }
+
     const merged = { ...liveFields, ...overrides };
+    console.log(
+      `[tenant:${businessId}] [TeeOn-Admin] slot placement: existing=${existingCount} occupied=[${occupied.map(b => b ? '✓' : '·').join('')}] ` +
+      `→ writing ${partySize} player${partySize === 1 ? '' : 's'} starting at slot ${firstEmpty} (Players field=${overrides.Players})`
+    );
     console.log(
       `[tenant:${businessId}] [TeeOn-Admin] payload merge: ` +
       `live=${Object.keys(liveFields).length} overrides=${Object.keys(overrides).length} ` +

@@ -271,4 +271,81 @@ function invalidate(businessId, date) {
   sheetCache.delete(cacheKey(businessId, date));
 }
 
-module.exports = { getTeeSheet, parseAdminTeeSheetHTML, invalidate };
+/**
+ * Convert "06:30" (24h) → "6:30 AM" so the slot objects match the
+ * shape that teeon-automation.js's parseTimesFromHTML produces.
+ */
+function hhmm24To12(hhmm) {
+  if (!hhmm) return null;
+  const m = String(hhmm).match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  let h = parseInt(m[1], 10);
+  const mins = m[2];
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  if (h === 0) h = 12;
+  else if (h > 12) h -= 12;
+  return `${h}:${mins} ${ampm}`;
+}
+
+/**
+ * Returns flat slot objects (in the same shape teeon-automation's
+ * public-sheet parser produces) so check_tee_times can consume them
+ * as a drop-in replacement / merge source.
+ *
+ * The admin tee sheet is authoritative — it shows EVERY slot staff
+ * can book, including same-day near-term slots that Tee-On's public
+ * sheet silently filters out within ~1 hour of "now". The Live
+ * Tee-On page already proves the parser is accurate; this function
+ * is just a re-shape of the same data.
+ *
+ * Returns: Array<{ time, raw, course, holes, price?, minPlayers, maxPlayers }>
+ *
+ * Throws when the admin session is unavailable (caller should fall
+ * back to the public-sheet path).
+ */
+async function getOpenSlotsForBooking(businessId, date) {
+  const sheet = await getTeeSheet(businessId, date);
+  const out = [];
+  for (const row of sheet.rows) {
+    const time12 = hhmm24To12(row.time);
+    if (!time12) continue;
+
+    // Front 9 column — bookable as 18-hole (start hole 1). We emit
+    // even when fully empty (maxPlayers=4); the downstream filter in
+    // check_tee_times drops slots that don't fit the party size.
+    if (row.hasFront) {
+      const occupied = Array.isArray(row.front) ? row.front.filter(Boolean).length : 0;
+      const maxPlayers = Math.max(0, 4 - occupied);
+      out.push({
+        time: time12,
+        raw: time12.replace(' ', ''),
+        course: '18 holes (starts hole 1)',
+        holes: 18,
+        price: null,           // not parsed yet; existing flow surfaces price elsewhere
+        minPlayers: 1,
+        maxPlayers
+      });
+    }
+
+    // Back 9 column — bookable as 9-hole (start hole 10). Per the
+    // per-tenant nine_hole_windows policy already applied downstream
+    // in check_tee_times, slots outside the window get filtered out;
+    // we just emit what the admin sheet shows.
+    if (row.hasBack) {
+      const occupied = Array.isArray(row.back) ? row.back.filter(Boolean).length : 0;
+      const maxPlayers = Math.max(0, 4 - occupied);
+      out.push({
+        time: time12,
+        raw: time12.replace(' ', ''),
+        course: '9 holes only (starts hole 10)',
+        holes: 9,
+        price: null,
+        minPlayers: 1,
+        maxPlayers
+      });
+    }
+  }
+  return out;
+}
+
+module.exports = { getTeeSheet, parseAdminTeeSheetHTML, invalidate, getOpenSlotsForBooking };

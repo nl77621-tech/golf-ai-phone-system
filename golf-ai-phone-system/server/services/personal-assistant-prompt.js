@@ -35,6 +35,8 @@
 const { getSetting, getBusinessById } = require('../config/database');
 const { requireBusinessId } = require('../context/tenant-context');
 const { listTeamMembers } = require('./team-directory');
+const { getActiveAnnouncements } = require('./caller-lookup');
+const { renderAdminBlock, renderOpsNotesBlock } = require('./admin-prompt-blocks');
 
 async function buildPersonalAssistantPrompt(businessId, callerContext = {}) {
   requireBusinessId(businessId, 'buildPersonalAssistantPrompt');
@@ -47,7 +49,8 @@ async function buildPersonalAssistantPrompt(businessId, callerContext = {}) {
     importantContacts,
     callRules,
     hours,
-    announcements
+    announcements,
+    opsNotes
   ] = await Promise.all([
     getBusinessById(businessId),
     getSetting(businessId, 'ai_personality'),
@@ -56,7 +59,11 @@ async function buildPersonalAssistantPrompt(businessId, callerContext = {}) {
     getSetting(businessId, 'important_contacts'),
     getSetting(businessId, 'call_handling_rules'),
     getSetting(businessId, 'business_hours'),
-    getSetting(businessId, 'announcements')
+    getSetting(businessId, 'announcements'),
+    getActiveAnnouncements(businessId).catch(err => {
+      console.warn(`[tenant:${businessId}] Ops notes load failed (continuing without them):`, err.message);
+      return [];
+    })
   ]);
 
   // Team directory — same shape as the golf path. Personal-assistant tenants
@@ -229,7 +236,14 @@ How to handle "leave a message for [name]":
   }
 
   // ------- Assemble -------
-  const prompt = `You are ${assistantName}, a warm and capable personal assistant answering the phone for ${ownerName || 'the owner'}${ownerProfile?.business_name ? ` of ${ownerProfile.business_name}` : ''}. You are NOT a robot — you sound like a real person who has worked alongside them for a long time and genuinely cares about being helpful.
+  // Admin-line and ops-notes blocks render at the top so they take
+  // priority over personality / brevity rules. Empty strings when not
+  // applicable (no admin, no active notes).
+  const businessLabel = ownerProfile?.business_name || ownerName || 'the assistant';
+  const adminBlock = renderAdminBlock(callerContext, businessLabel);
+  const opsNotesBlock = renderOpsNotesBlock(opsNotes);
+
+  const prompt = `${adminBlock}${opsNotesBlock}You are ${assistantName}, a warm and capable personal assistant answering the phone for ${ownerName || 'the owner'}${ownerProfile?.business_name ? ` of ${ownerProfile.business_name}` : ''}. You are NOT a robot — you sound like a real person who has worked alongside them for a long time and genuinely cares about being helpful.
 
 ## YOUR PERSONALITY
 ${personality?.style || 'Friendly, warm, and proactive. Confident without being pushy. You pick up on what the caller actually needs and adapt.'}

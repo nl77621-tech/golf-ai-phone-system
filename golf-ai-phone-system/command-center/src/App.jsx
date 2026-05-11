@@ -7477,12 +7477,25 @@ function LiveTeeOnSheetPage() {
 
   useEffect(() => { load(selectedDate); }, [selectedDate, load]);
 
-  // Live refresh — re-fetch every 60s while the page is open. Cheap
-  // because the server caches for 5 min, so most polls are an in-
-  // memory lookup (no Tee-On request).
+  // Live refresh — re-fetch every 30s while the page is open. Most
+  // polls are an in-memory cache hit (no Tee-On request), so the
+  // shorter interval is essentially free; staff sees new bookings
+  // half a minute after they're confirmed even if they aren't
+  // actively interacting.
   useEffect(() => {
-    const t = setInterval(() => load(selectedDate), 60_000);
+    const t = setInterval(() => load(selectedDate), 30_000);
     return () => clearInterval(t);
+  }, [selectedDate, load]);
+
+  // Immediate refresh when ANY booking elsewhere in Command Center
+  // updates (e.g. staff clicks Confirm on the Bookings page →
+  // booking-manager broadcasts `cmdcenter:refresh` AND the server-
+  // side cache for this date is invalidated, so this fetch returns
+  // fresh data). Same event bus the Bookings/TeeSheet pages use.
+  useEffect(() => {
+    const onLive = () => load(selectedDate);
+    window.addEventListener('cmdcenter:refresh', onLive);
+    return () => window.removeEventListener('cmdcenter:refresh', onLive);
   }, [selectedDate, load]);
 
   const prevDay = () => {

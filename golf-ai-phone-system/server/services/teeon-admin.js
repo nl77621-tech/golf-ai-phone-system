@@ -984,8 +984,23 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
     // The "lenient" path was missing before. We were throwing on every
     // BookerID extraction miss, which masquerades as "form re-rendered
     // with error" even when Tee-On clearly accepted the booking.
+    // Helper: invalidate the Live Tee-On mirror cache for this date so
+    // Command Center reflects the new booking on its next refresh
+    // (within ~15s) instead of waiting for the 5-min TTL to expire.
+    // Lazy-require to keep the module-load order safe (tee-sheet-mirror
+    // imports teeon-admin; a top-level require here would create a
+    // cycle).
+    const invalidateMirror = () => {
+      try {
+        require('./tee-sheet-mirror').invalidate(businessId, date);
+      } catch (err) {
+        console.warn(`[tenant:${businessId}] [TeeOn-Admin] mirror invalidate failed (continuing):`, err.message);
+      }
+    };
+
     if (extracted.bookerId) {
       await recordSyncSuccess(businessId, bookingRequestId, extracted.bookerId);
+      invalidateMirror();
       console.log(
         `[tenant:${businessId}] [TeeOn-Admin] createBooking OK ` +
         `booker=${extracted.bookerId} via=${extracted.strategy} date=${date} time=${time}`
@@ -998,6 +1013,7 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
       // this booking will need ops to manually reconcile the BookerID
       // (rare path — log loudly).
       await recordSyncSuccess(businessId, bookingRequestId, null);
+      invalidateMirror();
       console.warn(
         `[tenant:${businessId}] [TeeOn-Admin] createBooking PROBABLY OK ` +
         `(tee-sheet body + customer name "${customerName}" reflected) ` +

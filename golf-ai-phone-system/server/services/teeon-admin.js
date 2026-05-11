@@ -1197,8 +1197,13 @@ function getWarmAdminCookies(businessId) {
  * rather than throwing, so a misconfigured tenant doesn't crash boot.
  */
 async function ensureWarmAdminSession(businessId) {
+  // Note: we deliberately do NOT gate this on isEnabledForBusiness
+  // (teeon_admin_writes_enabled). That flag is about WRITE permissions
+  // (create/cancel bookings on Tee-On). READS like the live tee-sheet
+  // mirror should work whenever credentials are configured, regardless
+  // of the writes flag. getSession will throw "no-credentials" naturally
+  // if no creds exist for this tenant's slug — that's the only real gate.
   try {
-    if (!(await isEnabledForBusiness(businessId).catch(() => false))) return null;
     const { cookies } = await getSession(businessId);
     return cookies;
   } catch (err) {

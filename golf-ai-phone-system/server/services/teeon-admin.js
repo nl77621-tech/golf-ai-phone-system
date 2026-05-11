@@ -1263,4 +1263,8 @@ module.exports = {
   // For teeon-automation.js — auth'd reads piggyback on this session.
   getWarmAdminCookies,
   ensureWarmAdminSession,
+  // For tee-sheet-mirror.js — same per-tenant config (course code + group)
+  // teeon-admin already uses, so all downstream consumers share the
+  // same DEFAULT_COURSE_CODE fallback chain.
+  getTenantTeeOnConfig,
 };

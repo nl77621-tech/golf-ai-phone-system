@@ -6810,6 +6810,8 @@ function PersonalSettingsPage() {
   if (loading) return React.createElement('div', { className: 'p-8 text-gray-500' }, 'Loading settings\u2026');
 
   const tabs = [
+    { id: 'ops_notes',     label: '\uD83D\uDCE2 Ops Notes' },
+    { id: 'admins',        label: '\uD83D\uDD10 Admin Line' },
     { id: 'phones',        label: '\uD83D\uDCDE Phones' },
     { id: 'team',          label: '\uD83D\uDC65 Team' },
     { id: 'users',         label: '\uD83D\uDD11 Users' },
@@ -6838,6 +6840,12 @@ function PersonalSettingsPage() {
     ),
 
     React.createElement('div', { className: 'bg-white rounded-xl shadow-sm border p-6' },
+
+      // OPS NOTES — admin-set rules applied to every customer call
+      activeTab === 'ops_notes' && React.createElement(OpsNotesTab),
+
+      // ADMIN LINE — manage admin phone numbers + PINs
+      activeTab === 'admins' && React.createElement(AdminsTab),
 
       // PHONES
       activeTab === 'phones' && React.createElement('div', null,
@@ -7078,6 +7086,8 @@ function RestaurantSettingsPage() {
 
   const tabs = [
     { id: 'info',          label: '\uD83C\uDF7D\uFE0F Restaurant Info' },
+    { id: 'ops_notes',     label: '\uD83D\uDCE2 Ops Notes' },
+    { id: 'admins',        label: '\uD83D\uDD10 Admin Line' },
     { id: 'hours',         label: '\uD83D\uDD52 Hours' },
     { id: 'menu',          label: '\uD83D\uDCCB Menu' },
     { id: 'reservations',  label: '\uD83D\uDCC5 Reservations' },
@@ -7109,6 +7119,12 @@ function RestaurantSettingsPage() {
     ),
 
     React.createElement('div', { className: 'bg-white rounded-xl shadow-sm border p-6' },
+
+      // OPS NOTES — admin-set rules applied to every customer call
+      activeTab === 'ops_notes' && React.createElement(OpsNotesTab),
+
+      // ADMIN LINE — manage admin phone numbers + PINs
+      activeTab === 'admins' && React.createElement(AdminsTab),
 
       // RESTAURANT INFO
       activeTab === 'info' && React.createElement('div', null,

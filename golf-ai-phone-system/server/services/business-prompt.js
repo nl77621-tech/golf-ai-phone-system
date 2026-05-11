@@ -32,6 +32,8 @@
 const { getSetting, getBusinessById } = require('../config/database');
 const { requireBusinessId } = require('../context/tenant-context');
 const { listTeamMembers, getDefaultRecipient } = require('./team-directory');
+const { getActiveAnnouncements } = require('./caller-lookup');
+const { renderAdminBlock, renderOpsNotesBlock } = require('./admin-prompt-blocks');
 
 function safeStr(v, fallback = '') {
   return typeof v === 'string' && v.trim() ? v.trim() : fallback;
@@ -80,7 +82,8 @@ async function buildBusinessSwitchboardPrompt(businessId, callerContext = {}) {
     policies,
     announcements,
     members,
-    defaultRecipient
+    defaultRecipient,
+    opsNotes
   ] = await Promise.all([
     getBusinessById(businessId),
     getSetting(businessId, 'ai_personality'),
@@ -88,7 +91,11 @@ async function buildBusinessSwitchboardPrompt(businessId, callerContext = {}) {
     getSetting(businessId, 'policies'),
     getSetting(businessId, 'announcements'),
     listTeamMembers(businessId, { includeInactive: false }).catch(() => []),
-    getDefaultRecipient(businessId).catch(() => null)
+    getDefaultRecipient(businessId).catch(() => null),
+    getActiveAnnouncements(businessId).catch(err => {
+      console.warn(`[tenant:${businessId}] Ops notes load failed (continuing without them):`, err.message);
+      return [];
+    })
   ]);
 
   const businessName = safeStr(business?.name, 'the business');
@@ -181,7 +188,13 @@ ${flat}\n`;
   }
 
   // ----------------- Final prompt ----------------------------------------
-  const prompt = `You are ${assistantName}, an AI receptionist answering calls for ${businessName}.
+  // Admin-line and ops-notes blocks go FIRST (before personality / brevity
+  // rules) so they override normal behaviour. Helper renders empty string
+  // when not applicable, so the template is safe either way.
+  const adminBlock = renderAdminBlock(callerContext, businessName);
+  const opsNotesBlock = renderOpsNotesBlock(opsNotes);
+
+  const prompt = `${adminBlock}${opsNotesBlock}You are ${assistantName}, an AI receptionist answering calls for ${businessName}.
 
 ## YOUR JOB
 You are a SWITCHBOARD: take messages for the right teammate, accurately and efficiently. You are NOT a salesperson, a therapist, or a generalist. Get the message, confirm the recipient, end the call.

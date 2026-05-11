@@ -537,6 +537,31 @@ async function checkAvailabilityPuppeteer(date, partySize, cfg) {
 async function checkAvailability(date, partySize = 1, teeOnConfig = null) {
   const cfg = resolveConfig(teeOnConfig);
 
+  // Tier 0 — authoritative admin tee sheet via tee-sheet-mirror.
+  // Tee-On's PUBLIC sheet silently hides same-day slots within ~1 hour
+  // of "now" (real-call observed 2026-05-11: caller asked "this
+  // afternoon", public sheet returned slots starting at 2:30 PM, but
+  // 1:02 PM through 2:22 PM Front 9 were fully open per the admin
+  // sheet). The admin sheet has no such filter. We try it first; if
+  // it succeeds we return immediately without ever hitting the public
+  // sheet. Falls through to the existing HTTP / Puppeteer chain when
+  // businessId isn't set, when the admin session can't be established
+  // (e.g. no credentials configured), or when the parse returns no
+  // rows.
+  if (cfg.businessId) {
+    try {
+      const mirror = require('./tee-sheet-mirror');
+      const adminSlots = await mirror.getOpenSlotsForBooking(cfg.businessId, date);
+      if (Array.isArray(adminSlots) && adminSlots.length > 0) {
+        console.log(`[TeeOn:${cfg.key}] Admin tee sheet used (${adminSlots.length} slot products) — no public-sheet hit needed`);
+        setCachedSlots(cfg.key, date, adminSlots);
+        return adminSlots;
+      }
+    } catch (err) {
+      console.warn(`[TeeOn:${cfg.key}] Admin tee sheet path failed (falling back to public sheet):`, err.message);
+    }
+  }
+
   // Tier 1 — fresh cache hit. Today's data is held for 3 min (real
   // bookings fill up fast); future dates ride 20 min (much steadier).
   // This single optimization absorbs ~80% of customer-traffic queries

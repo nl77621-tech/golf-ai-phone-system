@@ -7510,13 +7510,22 @@ function LiveTeeOnSheetPage() {
     return `${displayHour}:${String(m).padStart(2, '0')} ${ampm}`;
   };
 
-  const renderSide = (slots) => {
+  const renderSide = (slots, available) => {
     // slots = [slot0, slot1, slot2, slot3] (null when empty).
-    const occupied = slots.filter(Boolean);
-    if (occupied.length === 0) {
-      return React.createElement('span', { className: 'text-gray-300 italic text-sm' }, '— empty —');
+    // `available` (boolean) — true when Tee-On offers this nine at this
+    // time at all. False = the nine isn't bookable here (e.g. very
+    // early-morning or twilight when Tee-On hides one side).
+    if (!available) {
+      return React.createElement('span', { className: 'text-gray-300 italic text-xs' }, '—');
     }
-    return React.createElement('div', { className: 'flex flex-wrap gap-1.5' },
+    const occupied = slots.filter(Boolean);
+    const openSeats = 4 - occupied.length;
+    if (occupied.length === 0) {
+      return React.createElement('span', {
+        className: 'inline-flex items-center gap-1 text-xs font-medium px-2 py-1 rounded bg-emerald-50 text-emerald-700 border border-emerald-200'
+      }, '✓ open (4 seats)');
+    }
+    return React.createElement('div', { className: 'flex flex-wrap items-center gap-1.5' },
       occupied.map((s, i) => React.createElement('span', {
         key: i,
         className: `inline-flex items-center gap-1 text-xs font-medium px-2 py-1 rounded ${s.noShow ? 'bg-orange-100 text-orange-800' : s.paid ? 'bg-green-100 text-green-800' : 'bg-blue-100 text-blue-800'}`,
@@ -7524,7 +7533,10 @@ function LiveTeeOnSheetPage() {
       },
         s.name,
         React.createElement('span', { className: 'text-xs opacity-60' }, `${s.holes}h`)
-      ))
+      )),
+      openSeats > 0 && React.createElement('span', {
+        className: 'inline-flex items-center text-xs px-2 py-1 rounded bg-emerald-50 text-emerald-700 border border-emerald-200'
+      }, `+${openSeats} open`)
     );
   };
 
@@ -7590,15 +7602,23 @@ function LiveTeeOnSheetPage() {
               className: i % 2 === 0 ? 'bg-white border-b border-gray-100' : 'bg-gray-50/50 border-b border-gray-100'
             },
               React.createElement('td', { className: 'px-4 py-3 text-sm font-mono text-gray-700 align-top' }, formatTime(row.time)),
-              React.createElement('td', { className: 'px-4 py-3 align-top' }, renderSide(row.front)),
-              React.createElement('td', { className: 'px-4 py-3 align-top' }, renderSide(row.back))
+              React.createElement('td', { className: 'px-4 py-3 align-top' }, renderSide(row.front, row.hasFront !== false)),
+              React.createElement('td', { className: 'px-4 py-3 align-top' }, renderSide(row.back, row.hasBack !== false))
             )
           )
         )
       )
     ),
     React.createElement('div', { className: 'mt-4 text-xs text-gray-400 italic' },
-      '⓵ Names from the live Tee-On admin tee sheet. Green badge = paid, blue = unpaid, orange = no-show. Hover for details.'
+      '⓵ Live mirror of the Tee-On admin tee sheet. ',
+      React.createElement('span', { className: 'px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200' }, '✓ open'),
+      ' = bookable seats, ',
+      React.createElement('span', { className: 'px-1.5 py-0.5 rounded bg-blue-100 text-blue-800' }, 'blue'),
+      ' = unpaid booking, ',
+      React.createElement('span', { className: 'px-1.5 py-0.5 rounded bg-green-100 text-green-800' }, 'green'),
+      ' = paid, ',
+      React.createElement('span', { className: 'px-1.5 py-0.5 rounded bg-orange-100 text-orange-800' }, 'orange'),
+      ' = no-show. Hover any name for details.'
     )
   );
 }

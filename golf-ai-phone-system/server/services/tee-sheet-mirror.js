@@ -113,19 +113,17 @@ function stripTags(html) {
 function parseAdminTeeSheetHTML(html) {
   if (!html || typeof html !== 'string') return [];
 
-  // Match every player tile. Capture:
-  //   group 1: classes on the div (tells us "paid", "no-show", etc.)
-  //   group 2: time (HH:MM)
-  //   group 3: nine (F or B)
-  //   group 4: bookerId
-  //   group 5: party count int
-  //   group 6: slot index (0..3)
-  //   group 7: inner content up to closing </div>
-  //
-  // Tee-On wraps each tile in a <div class="...player..."
-  // onclick="submitExistingTime('06:24','F','COLU4130',true,2,0);">...</div>.
-  // The inner text is the golfer's display name. Tee-On sometimes wraps
-  // the name in additional spans for icons; stripTags() flattens those.
+  // ─── Step 1: find every BOOKED tile ───────────────────────────────
+  // Tee-On wraps each booked tile in a <div class="...player..."
+  // onclick="submitExistingTime('06:24','F','COLU4130',true,2,0);">…</div>.
+  // Captured groups:
+  //   1: classes on the div (paid / no-show / etc.)
+  //   2: time (HH:MM)
+  //   3: nine (F or B)
+  //   4: bookerId
+  //   5: party count int
+  //   6: slot index (0..3)
+  //   7: inner content (player display name)
   const tileRe = /<div\b([^>]*class="[^"]*\bplayer\b[^"]*"[^>]*onclick="submitExistingTime\('(\d{1,2}:\d{2})','([A-Z])','([A-Z0-9]+)',\s*(?:true|false)\s*,\s*(\d+)\s*,\s*(\d+)[^"]*"[^>]*)>([\s\S]*?)<\/div>/gi;
 
   // Group by time → { front: { slotIndex → {…} }, back: {…} }
@@ -150,22 +148,52 @@ function parseAdminTeeSheetHTML(html) {
     const paid = /\bpaid\b/i.test(classes);
     const noShow = /\bno-?show\b/i.test(classes);
 
-    const row = byTime.get(time) || { time, front: {}, back: {}, partyCount };
+    const row = byTime.get(time) || { time, front: {}, back: {}, partyCount: 0, hasFront: false, hasBack: false };
     const side = nine === 'B' ? row.back : row.front;
     side[slotIndex] = { slotIndex, name, bookerId, holes, hasCart, paid, noShow };
+    if (nine === 'B') row.hasBack = true; else row.hasFront = true;
     row.partyCount = Math.max(row.partyCount, partyCount);
     byTime.set(time, row);
   }
 
+  // ─── Step 2: find every EMPTY slot handler ────────────────────────
+  // Tee-On exposes empty slots via submitTime('HH:MM','F'|'B', ...) on
+  // clickable tiles or row anchors. We don't need extra metadata for
+  // these — just the (time, nine) pair so we register the row exists.
+  // Without this step the live page only shows times that have at
+  // least one booking, hiding genuinely open slots from staff.
+  //
+  // The regex is liberal — matches submitTime('HH:MM','F') or
+  // submitTime('HH:MM','F', anything). Tee-On may also use related
+  // helpers like submitNewTime / openTime; we keep the match narrow
+  // to submitTime to avoid false positives.
+  const emptyRe = /submitTime\('(\d{1,2}:\d{2})','([A-Z])'/gi;
+  let e;
+  while ((e = emptyRe.exec(html)) !== null) {
+    const time = e[1];
+    const nine = e[2];
+    const row = byTime.get(time) || { time, front: {}, back: {}, partyCount: 0, hasFront: false, hasBack: false };
+    // Just register the (time, nine) pair as "this slot is real on the
+    // sheet". Front/back arrays stay empty so the UI renders "— empty —".
+    if (nine === 'B') row.hasBack = true; else row.hasFront = true;
+    byTime.set(time, row);
+  }
+
+  // ─── Step 3: assemble dense rows ──────────────────────────────────
   // Sort times ascending and turn front/back from {idx→obj} maps into
-  // dense arrays [slot0, slot1, slot2, slot3] (null for missing slots).
+  // dense arrays [slot0, slot1, slot2, slot3] (null for empty seats).
+  // `hasFront` / `hasBack` tell the UI whether the nine is offered at
+  // this time at all (some early/late slots are F-only, etc.) so we
+  // can render "(no Back 9 at this time)" vs an empty bookable column.
   const rows = Array.from(byTime.values())
     .sort((a, b) => a.time.localeCompare(b.time))
     .map(r => ({
       time: r.time,
       partyCount: r.partyCount,
       front: [0, 1, 2, 3].map(i => r.front[i] || null),
-      back:  [0, 1, 2, 3].map(i => r.back[i]  || null)
+      back:  [0, 1, 2, 3].map(i => r.back[i]  || null),
+      hasFront: r.hasFront,
+      hasBack: r.hasBack
     }));
 
   return rows;

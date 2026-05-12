@@ -7461,11 +7461,15 @@ function LiveTeeOnSheetPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  const load = useCallback(async (date) => {
+  // `force=true` adds ?fresh=1 → server invalidates its 5-min cache before
+  // fetching from Tee-On. Used by the manual Reload button; the auto-poll
+  // path leaves it false so it stays cheap (cache hits cost nothing).
+  const load = useCallback(async (date, force = false) => {
     setLoading(true);
     setError(null);
     try {
-      const r = await api(`/api/tee-sheet?date=${encodeURIComponent(date)}`);
+      const qs = `date=${encodeURIComponent(date)}${force ? '&fresh=1' : ''}`;
+      const r = await api(`/api/tee-sheet?${qs}`);
       setData(r);
     } catch (err) {
       setError(err.message || 'Failed to load tee sheet');
@@ -7497,6 +7501,11 @@ function LiveTeeOnSheetPage() {
     window.addEventListener('cmdcenter:refresh', onLive);
     return () => window.removeEventListener('cmdcenter:refresh', onLive);
   }, [selectedDate, load]);
+
+  // Manual reload — bypasses the server-side 5-min cache. Useful when
+  // staff just made a change in Tee-On directly (not via Command Center)
+  // and wants to see it now instead of waiting for the cache TTL.
+  const reload = () => load(selectedDate, true);
 
   const prevDay = () => {
     const d = new Date(selectedDate + 'T12:00:00');
@@ -7579,7 +7588,20 @@ function LiveTeeOnSheetPage() {
         React.createElement('button', {
           onClick: nextDay,
           className: 'px-3 py-2 bg-white border border-gray-300 rounded-md hover:bg-gray-50 text-sm'
-        }, 'Next ›')
+        }, 'Next ›'),
+        // Manual reload — forces a server-side cache bypass (?fresh=1)
+        // so staff can pull the absolute current Tee-On state when
+        // they suspect the auto-poll view is stale.
+        React.createElement('button', {
+          onClick: reload,
+          disabled: loading,
+          title: 'Force-refresh from Tee-On (bypass 5-min cache)',
+          className: `px-3 py-2 rounded-md text-sm font-medium transition-colors ${
+            loading
+              ? 'bg-gray-100 border border-gray-300 text-gray-400 cursor-not-allowed'
+              : 'bg-blue-600 border border-blue-700 text-white hover:bg-blue-700'
+          }`
+        }, loading ? '↻ Reloading…' : '↻ Reload')
       )
     ),
     React.createElement('div', { className: 'flex items-center justify-between mb-4' },

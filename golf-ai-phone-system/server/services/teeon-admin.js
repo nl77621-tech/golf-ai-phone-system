@@ -546,60 +546,64 @@ function extractBookerIdForSlot(html, time, nine) {
 }
 
 /**
- * Multi-strategy BookerID extraction. The single-pattern extractor above
- * is brittle: Tee-On's tee sheet uses different markup for booked-vs-empty
- * slots, time strings can vary in format, and the nine indicator (F/B)
- * isn't always what we passed. This walks 3 strategies, returning the
- * first hit + which strategy succeeded so the log shows what worked.
+ * Multi-strategy BookerID extraction. Confirms that Tee-On rendered a
+ * tile for the slot we just booked.
  *
  *   1. exact          — submitExistingTime('HH:MM','<nine>','<id>'...)
  *   2. time-any-nine  — submitExistingTime('HH:MM','<*>','<id>'...)
- *   3. name-proximity — find customer name in HTML, then the nearest
- *                       submitExistingTime within ±1500 chars
  *
- * Returns { bookerId, strategy }. bookerId is null if all strategies
- * fail; strategy is then 'none' (or 'no-html' if input was empty).
+ * Both strategies accept an EMPTY BookerID. Tee-On only generates
+ * BookerIDs for member bookings; phone/guest bookings render as
+ * `submitExistingTime('12:06','F','',true,2,0)` — the third field is
+ * a zero-length string. An older `[A-Z0-9]+` regex missed these.
+ *
+ * Returns { bookerId, strategy, slotFound }:
+ *   - slotFound:  true iff Tee-On rendered a tile at the requested slot
+ *                 (this is the success signal — booking really landed)
+ *   - bookerId:   the BookerID if Tee-On generated one, else null
+ *                 (member = string, guest = null)
+ *   - strategy:   which strategy matched, or 'none' if both missed.
+ *
+ * We REMOVED a previous "name-proximity" strategy because it was a
+ * false-positive when the customer had any other booking on the same
+ * day's sheet: it would match the older booking's slot and report
+ * success even when the new booking didn't land. With empty-BookerID
+ * support above, name-proximity is no longer needed.
  */
-function extractBookerIdMultiStrategy(html, { time, nine, customerName }) {
-  if (!html) return { bookerId: null, strategy: 'no-html' };
+function extractBookerIdMultiStrategy(html, { time, nine }) {
+  if (!html) return { bookerId: null, strategy: 'no-html', slotFound: false };
 
   // 1. Exact match for the slot we just booked.
+  //    [A-Z0-9]* (not +) so empty-BookerID guest bookings match.
   const exactRe = new RegExp(
-    `submitExistingTime\\('${time}','${nine}','([A-Z0-9]+)'`,
+    `submitExistingTime\\('${time}','${nine}','([A-Z0-9]*)'`,
     'i'
   );
   const exact = html.match(exactRe);
-  if (exact) return { bookerId: exact[1], strategy: 'exact-time-nine' };
+  if (exact) {
+    return {
+      bookerId: exact[1] || null,
+      strategy: 'exact-time-nine',
+      slotFound: true
+    };
+  }
 
   // 2. Time matches but nine indicator differs (we may have booked F
   //    but Tee-On now reports B for it, or vice versa).
   const timeOnlyRe = new RegExp(
-    `submitExistingTime\\('${time}','[A-Z]','([A-Z0-9]+)'`,
+    `submitExistingTime\\('${time}','[A-Z]','([A-Z0-9]*)'`,
     'i'
   );
   const timeOnly = html.match(timeOnlyRe);
-  if (timeOnly) return { bookerId: timeOnly[1], strategy: 'time-any-nine' };
-
-  // 3. Customer name proximity: find name, find nearest submitExistingTime.
-  if (customerName && customerName.length >= 3) {
-    const nameIdx = html.indexOf(customerName);
-    if (nameIdx >= 0) {
-      // ±1500 chars window around the name. The booker call usually
-      // sits in the same row, well within that range.
-      const start = Math.max(0, nameIdx - 1500);
-      const end = Math.min(html.length, nameIdx + 1500);
-      const window = html.slice(start, end);
-      const nearby = window.match(/submitExistingTime\('([^']+)','([A-Z])','([A-Z0-9]+)'/i);
-      if (nearby) {
-        return {
-          bookerId: nearby[3],
-          strategy: `name-proximity(slot=${nearby[1]}/${nearby[2]})`
-        };
-      }
-    }
+  if (timeOnly) {
+    return {
+      bookerId: timeOnly[1] || null,
+      strategy: 'time-any-nine',
+      slotFound: true
+    };
   }
 
-  return { bookerId: null, strategy: 'none' };
+  return { bookerId: null, strategy: 'none', slotFound: false };
 }
 
 // ─── Public ops: createBooking + cancelBooking ────────────────────────────
@@ -970,26 +974,30 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
     });
     const sheetBody = sheet.body || '';
     const extracted = extractBookerIdMultiStrategy(sheetBody, {
-      time, nine: resolvedNine, customerName
+      time, nine: resolvedNine
     });
 
     // ─── Decision matrix ─────────────────────────────────────────────
-    //   bookerId  | outcome
-    //   --------- | -------------------------
-    //   FOUND     | SUCCESS, full sync
-    //   not found | FAILURE — booking did NOT land
+    //   slotFound | bookerId | outcome
+    //   --------- | -------- | -------------------------
+    //   true      | string   | SUCCESS — member booking, full BookerID
+    //   true      | null     | SUCCESS — guest booking (empty BookerID
+    //                          in Tee-On; expected for phone bookings)
+    //   false     | —        | FAILURE — booking did NOT land
     //
     // The fresh tee sheet (fetched right after the POST) is the single
-    // source of truth. extractBookerIdMultiStrategy already runs three
-    // strategies against it (exact time/nine, time-any-nine, name
-    // proximity anywhere in the sheet). If all three miss, the booking
-    // is not on Tee-On.
+    // source of truth. extractBookerIdMultiStrategy looks for a tile at
+    // the requested (time, nine). If it's there, the booking landed.
+    // A guest tile has the literal pattern submitExistingTime('12:06',
+    // 'F','',true,2,0) with an empty string between the bookerId quotes
+    // — perfectly legitimate, just no member id to cancel by.
     //
-    // We used to have a "lenient" fallback that accepted "POST response
-    // body contains the customer name" as success. That was a false
-    // positive — the POST response just echoes the GolferName0 form
-    // input we just submitted. It masked a real data-loss bug on
-    // 2026-05-12 (customer told they were booked, Tee-On had nothing).
+    // We previously had a "name in sheet" lenient fallback. That was
+    // a false-positive trap because customers often have OTHER bookings
+    // on the same day's sheet (an earlier booking, a friend with the
+    // same name, etc.), so "name appears somewhere" doesn't prove the
+    // new slot landed. Removed in this PR — the slot-found check above
+    // is the only authoritative signal.
     // Helper: invalidate the Live Tee-On mirror cache for this date so
     // Command Center reflects the new booking on its next refresh
     // (within ~15s) instead of waiting for the 5-min TTL to expire.
@@ -1004,61 +1012,30 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
       }
     };
 
-    // Compute "name in FRESH sheet" — the only authoritative signal of
-    // whether the booking actually landed. Used by both the success
-    // path (as a fallback when BookerID can't be pinned) and the
-    // forensic dump (so we can see why extraction missed).
+    // Diagnostic only: is the customer's name in the FRESH sheet
+    // anywhere? Used by the failure-path forensic dump so we can tell
+    // a "Tee-On rejected" failure from a "Tee-On accepted but used a
+    // marker we don't recognise yet" failure. Not used as a success
+    // signal — see the false-positive note above.
     const nameInSheet = !!(customerName && customerName.length >= 3 && sheetBody.includes(customerName));
     const nameSheetIdx = nameInSheet ? sheetBody.indexOf(customerName) : -1;
 
-    if (extracted.bookerId) {
+    if (extracted.slotFound) {
+      // bookerId is null for guest bookings (legit), string for members.
+      // Either way, mark synced — we know Tee-On rendered the tile.
       await recordSyncSuccess(businessId, bookingRequestId, extracted.bookerId);
       invalidateMirror();
       console.log(
         `[tenant:${businessId}] [TeeOn-Admin] createBooking OK ` +
-        `booker=${extracted.bookerId} via=${extracted.strategy} date=${date} time=${time}`
+        `booker=${extracted.bookerId || '(guest/empty)'} ` +
+        `via=${extracted.strategy} date=${date} time=${time}/${resolvedNine}`
       );
-      return { ok: true, bookerId: extracted.bookerId, strategy: extracted.strategy };
-    }
-
-    // ─── Lenient success: name IS on the fresh tee sheet ──────────────
-    //
-    // BookerID extraction missed all three strategies, but the customer
-    // name is in the fresh GET'd tee sheet (not the POST response —
-    // that one echoes form inputs and is a false-positive trap). That
-    // means Tee-On *did* render a tile with our name on it — the
-    // booking landed. We just can't pin the BookerID, which means
-    // cancel-from-our-UI will need ops to manually reconcile (rare).
-    //
-    // This is the corrected version of the lenient path that was
-    // removed in PR #40 because it used the wrong source (POST echo).
-    // 2026-05-12 follow-up: PR #40 swung too far — a real successful
-    // booking at 11:58/F got marked as failed because the new tile
-    // uses a marker the BookerID extractor doesn't recognize yet.
-    // We dump diagnostic info around the name position so we can
-    // teach the extractor what the new marker looks like.
-    if (looksLikeTeeSheet && nameInSheet) {
-      await recordSyncSuccess(businessId, bookingRequestId, null);
-      invalidateMirror();
-      // Show what's actually around the name in the sheet so we can
-      // see what marker the newly-booked tile uses. The 30-char floor
-      // / 600-char ceiling is enough for a tile's onclick + label.
-      const ctxStart = Math.max(0, nameSheetIdx - 600);
-      const ctxEnd   = Math.min(sheetBody.length, nameSheetIdx + 600);
-      const nameCtx  = sheetBody.slice(ctxStart, ctxEnd).replace(/\s+/g, ' ').trim();
-      // Find nearby submit* calls (any kind) so we can see what the
-      // new tile is wired to.
-      const nearbyWindow = sheetBody.slice(Math.max(0, nameSheetIdx - 3000), Math.min(sheetBody.length, nameSheetIdx + 3000));
-      const nearbySubmitCalls = (nearbyWindow.match(/submit[A-Za-z]*\([^)]*\)/g) || []).slice(0, 12);
-      console.warn(
-        `[tenant:${businessId}] [TeeOn-Admin] createBooking SOFT-OK ` +
-        `(name "${customerName}" in fresh tee sheet @${nameSheetIdx}, ` +
-        `but BookerID extraction missed for ${time}/${resolvedNine}). ` +
-        `Booking is on Tee-On; cancel-from-our-UI may need manual reconcile.\n` +
-        `  nameContext[±600]: ${nameCtx}\n` +
-        `  nearbySubmitCalls: ${nearbySubmitCalls.join(' | ') || '(none in ±3000)'}`
-      );
-      return { ok: true, bookerId: null, warning: 'no-booker-id', strategy: 'lenient-sheet-name-match' };
+      return {
+        ok: true,
+        bookerId: extracted.bookerId,
+        strategy: extracted.strategy,
+        ...(extracted.bookerId ? {} : { warning: 'no-booker-id-guest' })
+      };
     }
 
     // ─── Real failure: name is NOT on the fresh sheet ─────────────────
@@ -1068,10 +1045,10 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
     // next attempt (in the outer catch) in case it was a stale cookie.
 
     const allSubmitTimes = [];
-    const submitRe = /submitExistingTime\('([^']+)','([A-Z])','([A-Z0-9]+)'/g;
+    const submitRe = /submitExistingTime\('([^']+)','([A-Z])','([A-Z0-9]*)'/g;
     let st;
     while ((st = submitRe.exec(sheetBody)) !== null) {
-      allSubmitTimes.push(`${st[1]}/${st[2]}/${st[3]}`);
+      allSubmitTimes.push(`${st[1]}/${st[2]}/${st[3] || '(guest)'}`);
       if (allSubmitTimes.length >= 30) break;
     }
     console.warn(

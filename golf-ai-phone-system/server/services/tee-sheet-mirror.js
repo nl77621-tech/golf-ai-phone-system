@@ -116,16 +116,20 @@ function parseAdminTeeSheetHTML(html) {
 
   // ─── Step 1: find every BOOKED tile ───────────────────────────────
   // Tee-On wraps each booked tile in a <div class="...player..."
-  // onclick="submitExistingTime('06:24','F','COLU4130',true,2,0);">…</div>.
+  // onclick="submitExistingTime('06:24','F','COLU4130',true,2,0);">…</div>
+  // for MEMBER bookings, or
+  // onclick="submitExistingTime('11:34','F','',true,2,0);">…</div>
+  // for GUEST / phone bookings (empty BookerID — Tee-On only generates
+  // them for members). The [A-Z0-9]* (not +) is the difference.
   // Captured groups:
   //   1: classes on the div (paid / no-show / etc.)
   //   2: time (HH:MM)
   //   3: nine (F or B)
-  //   4: bookerId
+  //   4: bookerId (may be empty string for guest/phone bookings)
   //   5: party count int
   //   6: slot index (0..3)
   //   7: inner content (player display name)
-  const tileRe = /<div\b([^>]*class="[^"]*\bplayer\b[^"]*"[^>]*onclick="submitExistingTime\('(\d{1,2}:\d{2})','([A-Z])','([A-Z0-9]+)',\s*(?:true|false)\s*,\s*(\d+)\s*,\s*(\d+)[^"]*"[^>]*)>([\s\S]*?)<\/div>/gi;
+  const tileRe = /<div\b([^>]*class="[^"]*\bplayer\b[^"]*"[^>]*onclick="submitExistingTime\('(\d{1,2}:\d{2})','([A-Z])','([A-Z0-9]*)',\s*(?:true|false)\s*,\s*(\d+)\s*,\s*(\d+)[^"]*"[^>]*)>([\s\S]*?)<\/div>/gi;
 
   // Group by time → { front: { slotIndex → {…} }, back: {…} }
   const byTime = new Map();

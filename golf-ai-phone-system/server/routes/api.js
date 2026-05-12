@@ -1760,8 +1760,18 @@ router.get('/tee-sheet', async (req, res) => {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
     return res.status(400).json({ error: 'date query param required in YYYY-MM-DD format' });
   }
+  // ?fresh=1 forces a cache bypass — the Live Tee-On Sheet page's manual
+  // Reload button uses this so staff can pull the absolute current state
+  // from Tee-On (otherwise the 5-min server cache could hide a booking
+  // that just landed). Normal polls don't pass it, so they continue to
+  // hit the cache and stay cheap.
+  const fresh = req.query.fresh === '1' || req.query.fresh === 'true';
   try {
     const teeSheetMirror = require('../services/tee-sheet-mirror');
+    if (fresh) {
+      teeSheetMirror.invalidate(businessId, date);
+      console.log(`[tenant:${businessId}] [api] GET /tee-sheet (${date}) — fresh=1, cache invalidated`);
+    }
     const result = await teeSheetMirror.getTeeSheet(businessId, date);
     res.json(result);
   } catch (err) {

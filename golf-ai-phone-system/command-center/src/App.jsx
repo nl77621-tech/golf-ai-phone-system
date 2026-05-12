@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
 
 // ============================================
@@ -6939,6 +6939,18 @@ function LiveTeeOnSheetPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
+  // ─── Auto-scroll-to-now refs ────────────────────────────────────────
+  // `wantScrollRef.current = true` means "after the next data update,
+  // scroll the table to the row matching the current time of day."
+  // Default true (initial mount scrolls). We set it false in the scroll
+  // effect after firing, and re-set it to true on user-initiated loads
+  // (date change, Reload button, `cmdcenter:refresh` bus). The 30-second
+  // auto-poll deliberately doesn't touch it — staff who scrolled away
+  // to look at the afternoon shouldn't get yanked back to "now" twice
+  // a minute.
+  const tableRef = useRef(null);
+  const wantScrollRef = useRef(true);
+
   // `force=true` adds ?fresh=1 → server invalidates its 5-min cache before
   // fetching from Tee-On. Used by the manual Reload button; the auto-poll
   // path leaves it false so it stays cheap (cache hits cost nothing).
@@ -6957,13 +6969,21 @@ function LiveTeeOnSheetPage() {
     }
   }, []);
 
-  useEffect(() => { load(selectedDate); }, [selectedDate, load]);
+  // Initial mount + date change → re-load AND mark "scroll on next data
+  // update". wantScrollRef stays at its default `true` on mount, so the
+  // first render triggers the scroll without any extra ceremony.
+  useEffect(() => {
+    wantScrollRef.current = true;
+    load(selectedDate);
+  }, [selectedDate, load]);
 
   // Live refresh — re-fetch every 30s while the page is open. Most
   // polls are an in-memory cache hit (no Tee-On request), so the
   // shorter interval is essentially free; staff sees new bookings
   // half a minute after they're confirmed even if they aren't
-  // actively interacting.
+  // actively interacting. INTENTIONALLY DOES NOT TOUCH wantScrollRef
+  // — auto-poll must never trigger an auto-scroll, otherwise staff
+  // get pulled back to "now" every 30s while reviewing the afternoon.
   useEffect(() => {
     const t = setInterval(() => load(selectedDate), 30_000);
     return () => clearInterval(t);
@@ -6974,8 +6994,14 @@ function LiveTeeOnSheetPage() {
   // booking-manager broadcasts `cmdcenter:refresh` AND the server-
   // side cache for this date is invalidated, so this fetch returns
   // fresh data). Same event bus the Bookings/TeeSheet pages use.
+  // This IS user-initiated (someone just clicked Confirm), so we DO
+  // want to scroll to "now" — the staff member is likely watching to
+  // see their just-confirmed booking appear.
   useEffect(() => {
-    const onLive = () => load(selectedDate);
+    const onLive = () => {
+      wantScrollRef.current = true;
+      load(selectedDate);
+    };
     window.addEventListener('cmdcenter:refresh', onLive);
     return () => window.removeEventListener('cmdcenter:refresh', onLive);
   }, [selectedDate, load]);
@@ -6983,7 +7009,53 @@ function LiveTeeOnSheetPage() {
   // Manual reload — bypasses the server-side 5-min cache. Useful when
   // staff just made a change in Tee-On directly (not via Command Center)
   // and wants to see it now instead of waiting for the cache TTL.
-  const reload = () => load(selectedDate, true);
+  const reload = () => {
+    wantScrollRef.current = true;
+    load(selectedDate, true);
+  };
+
+  // After data settles, if a user-initiated load asked for it, scroll
+  // the table to bring the current-time row into view. Only fires when
+  // viewing TODAY — past/future dates stay at the top so staff can see
+  // morning slots without manual scrolling. Uses 'smooth' on subsequent
+  // scrolls so it feels intentional rather than jarring.
+  useEffect(() => {
+    if (!wantScrollRef.current) return;
+    if (!data || !Array.isArray(data.rows) || data.rows.length === 0) return;
+
+    const today = toLocalDateStr(new Date());
+    if (selectedDate !== today) {
+      // Different date selected — clear the flag without scrolling. The
+      // user will see the full day from the top, which is what they
+      // want when looking at e.g. tomorrow morning.
+      wantScrollRef.current = false;
+      return;
+    }
+
+    // Build "HH:MM" 24h for the current local time. row.time is the
+    // same format, so a lexical compare gives the right ordering.
+    const now = new Date();
+    const nowHHMM = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+
+    // First row whose time is at or after now = the "current" tee
+    // time row. If every row is in the past (rare — usually only at
+    // the very end of the day), fall back to the last row so staff
+    // see the most recent activity instead of a top-of-day view.
+    let targetIdx = data.rows.findIndex((r) => r.time >= nowHHMM);
+    if (targetIdx < 0) targetIdx = data.rows.length - 1;
+
+    // Defer one frame so the table is actually in the DOM before we
+    // try to scroll to a child of it. Without this, the ref's rows
+    // collection can be empty on the very first paint.
+    requestAnimationFrame(() => {
+      const tbodyRows = tableRef.current?.querySelectorAll('tbody tr');
+      const target = tbodyRows?.[targetIdx];
+      if (target) {
+        target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+      wantScrollRef.current = false;
+    });
+  }, [data, selectedDate]);
 
   const prevDay = () => {
     const d = new Date(selectedDate + 'T12:00:00');
@@ -7099,7 +7171,7 @@ function LiveTeeOnSheetPage() {
     data && data.rows.length === 0 && React.createElement('div', { className: 'bg-yellow-50 border border-yellow-200 rounded-lg p-6 text-center text-yellow-800' },
       'No tee-time slots found for this date. Either nothing is bookable yet or the page format changed — let us know.'
     ),
-    data && data.rows.length > 0 && React.createElement('div', { className: 'bg-white border border-gray-200 rounded-lg overflow-hidden' },
+    data && data.rows.length > 0 && React.createElement('div', { ref: tableRef, className: 'bg-white border border-gray-200 rounded-lg overflow-hidden' },
       React.createElement('table', { className: 'w-full' },
         React.createElement('thead', null,
           React.createElement('tr', { className: 'bg-gray-50 border-b border-gray-200' },

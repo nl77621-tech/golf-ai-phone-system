@@ -127,21 +127,25 @@ function mulaw8kToPcm16(inputBuf) {
  * Returns null to let teeon-automation fall back to Valleymede defaults.
  */
 async function getTeeOnConfigForBusiness(businessId) {
+  // Reuse teeon-admin's tenant config lookup (matching settings →
+  // businesses → DEFAULT_COURSE_CODE chain) so we never return null
+  // for a tenant that has Tee-On admin configured. Valleymede has no
+  // explicit teeon_course_code setting; teeon-admin falls back to
+  // DEFAULT_COURSE_CODE='COLU', but this function was returning null
+  // and check_tee_times' admin-sheet Tier-0 path was being skipped
+  // (cfg.businessId was null), routing every call to the public
+  // sheet — which today's morning hides for lead-time reasons.
+  // Real-call observed 2026-05-12 10:29 EDT: check_tee_times returned
+  // 0 slots even though the admin tee sheet had 88 rows + 110 player
+  // tiles (per a TeeSheet-Mirror log line three minutes later).
   try {
-    const fromSetting = await getSetting(businessId, 'teeon').catch(() => null);
-    if (fromSetting?.course_code) {
+    const { getTenantTeeOnConfig } = require('./teeon-admin');
+    const cfg = await getTenantTeeOnConfig(businessId).catch(() => null);
+    if (cfg?.courseCode) {
       return {
         businessId,
-        courseCode: fromSetting.course_code,
-        courseGroupId: fromSetting.course_group_id
-      };
-    }
-    const business = await getBusinessById(businessId).catch(() => null);
-    if (business?.teeon_course_code) {
-      return {
-        businessId,
-        courseCode: business.teeon_course_code,
-        courseGroupId: business.teeon_course_group_id
+        courseCode: cfg.courseCode,
+        courseGroupId: cfg.courseGroupId
       };
     }
   } catch (err) {
@@ -1165,11 +1169,15 @@ async function executeToolCall(toolName, args, ctx) {
               `pendingHoldsCount=${pendingHolds.length}.`
             );
             // Friendlier message — never tell the caller "fully booked"
-            // when we genuinely don't know; offer to submit a request and
-            // get staff to confirm directly.
+            // and never offer a "booking request" path: per current
+            // operations policy we ONLY book real, confirmed live slots.
+            // If genuinely none are open, the AI suggests a different
+            // date or asks the caller to call back later. Real-call
+            // policy correction observed 2026-05-12: we don't accept
+            // requests, only confirmed bookings.
             return {
               available: false,
-              message: `I'm not seeing any open tee times for ${args.date} in our online system right now. That could mean a busy day, a private event, an advance-booking window, or the system hasn't refreshed. DO NOT tell the caller "fully booked" — instead, offer to either (1) take a booking request and have staff confirm by text or call, or (2) try a different date. Lead with the offer to take their request.`
+              message: `I'm not seeing any open tee times for ${args.date} in our online system right now. That could mean a busy day, a private event, weather, or an advance-booking window. ⚠️ POLICY: do NOT offer to "take a booking request" or have staff "confirm later" — we only book real, currently-open slots. Instead, tell the caller: "I don't see any open slots for that date right now. Would you like to try a different day, or check back later?" Then either re-run check_tee_times for a different date, or end the call politely.`
             };
           }
 

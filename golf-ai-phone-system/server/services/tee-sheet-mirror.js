@@ -26,6 +26,7 @@
 
 const https = require('https');
 const { requireBusinessId } = require('../context/tenant-context');
+const { getBusinessById } = require('../config/database');
 const teeonAdmin = require('./teeon-admin');
 
 const TEEON_HOST = 'www.tee-on.com';
@@ -305,8 +306,51 @@ function hhmm24To12(hhmm) {
  */
 async function getOpenSlotsForBooking(businessId, date) {
   const sheet = await getTeeSheet(businessId, date);
+
+  // ─── Past-slot filter ───────────────────────────────────────────
+  //
+  // The admin tee sheet shows EVERY slot for the day — including
+  // slots in the past. The public sheet used to drop them for us; now
+  // that we're admin-only (PR #38), we have to drop them ourselves.
+  // Real-call bug observed 2026-05-12 10:50 EDT: caller asked for
+  // earliest available today, AI offered 7:02 AM. 7:02 AM was 3+
+  // hours in the past — clearly unbookable.
+  //
+  // Logic: if the requested date is TODAY in the business's local
+  // timezone, drop every slot whose HH:MM is earlier than the
+  // current wall-clock time in that same timezone. For future dates,
+  // pass through unchanged.
+  let nowLocalHHMM = null;
+  let isToday = false;
+  try {
+    const business = await getBusinessById(businessId).catch(() => null);
+    const tz = business?.timezone || 'America/Toronto';
+    const now = new Date();
+    const localDateStr = now.toLocaleDateString('en-CA', { timeZone: tz }); // YYYY-MM-DD
+    isToday = (localDateStr === date);
+    if (isToday) {
+      // "HH:MM" 24h in the tenant's local time, with leading zeros so
+      // string compare against row.time ("HH:MM") works lexically.
+      nowLocalHHMM = now.toLocaleTimeString('en-GB', { timeZone: tz, hour12: false, hour: '2-digit', minute: '2-digit' });
+    }
+  } catch {
+    // If anything goes wrong resolving the timezone, fail open — don't
+    // accidentally hide future slots. The "past slot offered" bug is
+    // worse than not filtering, but only barely; we log so ops can
+    // see it.
+    console.warn(`[tenant:${businessId}] [TeeSheet-Mirror] past-slot filter skipped (timezone resolution failed)`);
+  }
+
   const out = [];
+  let droppedPast = 0;
   for (const row of sheet.rows) {
+    // Drop past slots when the request is for today. row.time is
+    // already in "HH:MM" 24h form, same as nowLocalHHMM.
+    if (isToday && nowLocalHHMM && row.time < nowLocalHHMM) {
+      droppedPast++;
+      continue;
+    }
+
     const time12 = hhmm24To12(row.time);
     if (!time12) continue;
 
@@ -344,6 +388,10 @@ async function getOpenSlotsForBooking(businessId, date) {
         maxPlayers
       });
     }
+  }
+
+  if (droppedPast > 0) {
+    console.log(`[tenant:${businessId}] [TeeSheet-Mirror] dropped ${droppedPast} past slot(s) for ${date} (now=${nowLocalHHMM})`);
   }
   return out;
 }

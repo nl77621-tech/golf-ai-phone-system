@@ -974,16 +974,22 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
     });
 
     // ─── Decision matrix ─────────────────────────────────────────────
-    //   bookerId  | post-body shape       | outcome
-    //   --------- | --------------------- | -------------------------
-    //   FOUND     | (any)                 | SUCCESS, full sync
-    //   not found | tee sheet + name      | SUCCESS (lenient — log warn)
-    //   not found | tee sheet, no name    | UNCERTAIN — fail loudly
-    //   not found | re-rendered form      | FAILURE (real)
+    //   bookerId  | outcome
+    //   --------- | -------------------------
+    //   FOUND     | SUCCESS, full sync
+    //   not found | FAILURE — booking did NOT land
     //
-    // The "lenient" path was missing before. We were throwing on every
-    // BookerID extraction miss, which masquerades as "form re-rendered
-    // with error" even when Tee-On clearly accepted the booking.
+    // The fresh tee sheet (fetched right after the POST) is the single
+    // source of truth. extractBookerIdMultiStrategy already runs three
+    // strategies against it (exact time/nine, time-any-nine, name
+    // proximity anywhere in the sheet). If all three miss, the booking
+    // is not on Tee-On.
+    //
+    // We used to have a "lenient" fallback that accepted "POST response
+    // body contains the customer name" as success. That was a false
+    // positive — the POST response just echoes the GolferName0 form
+    // input we just submitted. It masked a real data-loss bug on
+    // 2026-05-12 (customer told they were booked, Tee-On had nothing).
     // Helper: invalidate the Live Tee-On mirror cache for this date so
     // Command Center reflects the new booking on its next refresh
     // (within ~15s) instead of waiting for the 5-min TTL to expire.
@@ -1007,24 +1013,31 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
       );
       return { ok: true, bookerId: extracted.bookerId, strategy: extracted.strategy };
     }
-    if (looksLikeTeeSheet && customerNameInPostBody) {
-      // Booking landed; we just couldn't pin the BookerID. Mark synced
-      // so the local row reads "confirmed". Cancel-from-our-UI for
-      // this booking will need ops to manually reconcile the BookerID
-      // (rare path — log loudly).
-      await recordSyncSuccess(businessId, bookingRequestId, null);
-      invalidateMirror();
-      console.warn(
-        `[tenant:${businessId}] [TeeOn-Admin] createBooking PROBABLY OK ` +
-        `(tee-sheet body + customer name "${customerName}" reflected) ` +
-        `but BookerID extraction failed for date=${date} time=${time}/${resolvedNine}. ` +
-        `Booking is on Tee-On; cancel from our UI may need manual reconcile. ` +
-        `Strategies tried: exact, time-any-nine, name-proximity (all missed).`
-      );
-      return { ok: true, bookerId: null, warning: 'no-booker-id', strategy: 'lenient-name-match' };
-    }
 
-    // Real failure path — dump full forensic diagnostic.
+    // ─── BookerID extraction failed — booking did NOT land ────────────
+    //
+    // Previously this had a "lenient" path that marked the booking as
+    // successful when the POST response body contained the customer
+    // name (even if BookerID extraction failed on the fresh tee sheet).
+    // That was wrong: the POST response just ECHOES the form inputs we
+    // submitted, so `cleanBody.includes("Nelson Lopes")` was always
+    // true after we typed "Nelson Lopes" into GolferName0 — even when
+    // Tee-On silently rejected the booking.
+    //
+    // Real-call bug observed 2026-05-12 11:05 EDT: caller's booking
+    // was confirmed in our UI and an SMS was sent, but Tee-On had no
+    // record of it. The lenient path masked this as "PROBABLY OK".
+    //
+    // The fresh tee sheet (GET'd right after POST) is the SOURCE OF
+    // TRUTH. extractBookerIdMultiStrategy already runs three strategies
+    // against it (including name-proximity, which finds the name
+    // anywhere in the sheet and looks for a nearby slot). If all three
+    // miss, the booking is not on Tee-On — full stop.
+    //
+    // Force a fresh login next attempt in case the failure was a stale
+    // cookie, and dump full forensic info so we can see what Tee-On
+    // actually returned.
+
     const allSubmitTimes = [];
     const submitRe = /submitExistingTime\('([^']+)','([A-Z])','([A-Z0-9]+)'/g;
     let st;
@@ -1035,9 +1048,10 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
     const nameInSheet = customerName && sheetBody.includes(customerName);
     const nameSheetIdx = customerName ? sheetBody.indexOf(customerName) : -1;
     console.warn(
-      `[tenant:${businessId}] [TeeOn-Admin] POST rejected body snippet:\n` +
+      `[tenant:${businessId}] [TeeOn-Admin] POST rejected — booking did NOT land:\n` +
       `  bodyShape:    looksLikeReRenderedForm=${looksLikeReRenderedForm} looksLikeTeeSheet=${looksLikeTeeSheet}\n` +
-      `  customerName: "${customerName}" inPostBody=${customerNameInPostBody} inSheet=${nameInSheet}${nameSheetIdx >= 0 ? ` @${nameSheetIdx}` : ''}\n` +
+      `  customerName: "${customerName}" inPostBody=${customerNameInPostBody} (likely just an echo of submitted form value)\n` +
+      `                inSheet=${nameInSheet}${nameSheetIdx >= 0 ? ` @${nameSheetIdx}` : ''} (this is the truth — must be true for success)\n` +
       `  errorHint:    ${errorHint}${errorHintMatchInForm ? ` (matched "${errorHintMatchInForm[0]}" @${errorHintMatchInForm.index})` : ''}\n` +
       `  errorContext: ${errorContext || '(none — errorHint only fires on re-rendered form)'}\n` +
       `  popups (${popups.length}):\n` +
@@ -1051,7 +1065,7 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
     const reason = errorHint
       ? 'Tee-On rejected the POST (form re-rendered with error)'
       : (looksLikeTeeSheet
-        ? 'POST returned tee sheet but customer name not reflected — booking may not have landed'
+        ? 'POST returned tee sheet but customer name not on it — booking did not land'
         : 'POST returned an unrecognised page — verify on Tee-On');
     throw new Error(reason);
   } catch (err) {

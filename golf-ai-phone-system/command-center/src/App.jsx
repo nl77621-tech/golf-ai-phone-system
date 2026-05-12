@@ -425,7 +425,12 @@ function Sidebar({ currentPage, onNavigate, onLogout, tenantName, templateKey, p
   // golf menu for legacy tenants (Valleymede).
   const menuItems = sidebarItemsFor(templateKey, plan);
 
-  return React.createElement('aside', { className: 'w-64 bg-golf-800 text-white min-h-screen flex flex-col' },
+  // The sidebar stretches to fill the content row (flex parent's
+  // align-items: stretch default). We dropped the old `min-h-screen`
+  // — that was a leftover from the page-level scrolling layout and
+  // now conflicts with the clipped content row. `overflow-y-auto` is
+  // belt-and-braces in case a future menu gets long enough to overflow.
+  return React.createElement('aside', { className: 'w-64 bg-golf-800 text-white flex flex-col overflow-y-auto' },
     React.createElement('div', { className: 'p-6 border-b border-golf-700' },
       React.createElement('div', { className: 'text-2xl mb-1' }, '\u26f3'),
       React.createElement('h2', { className: 'font-bold text-lg truncate' }, tenantName || 'Command Center'),
@@ -7879,14 +7884,20 @@ function App() {
   const toastNavTarget =
     effectiveTemplateKey === 'personal_assistant' ? 'calls'
     : (effectiveTemplateKey === 'restaurant' ? 'reservations' : 'bookings');
-  return React.createElement('div', { className: 'flex flex-col min-h-screen' },
+  // App shell is fixed to viewport height (`h-screen`), with the
+  // content row clipping overflow (`overflow-hidden`). That makes
+  // `<main>`'s `overflow-auto` the ONLY scrollable area — sidebar
+  // and TopBar stay pinned. Previously the shell used `min-h-screen`
+  // which let the document grow taller than the viewport, triggering
+  // window-level scrolling and dragging the sidebar off-screen.
+  return React.createElement('div', { className: 'flex flex-col h-screen' },
     React.createElement(TopBar, {
       session, businesses,
       selectedBusinessId,
       onSelectBusiness: handleSelectBusiness,
       onLogout: handleLogout
     }),
-    React.createElement('div', { className: 'flex flex-1' },
+    React.createElement('div', { className: 'flex flex-1 overflow-hidden' },
       React.createElement(Sidebar, {
         currentPage,
         onNavigate: setCurrentPage,

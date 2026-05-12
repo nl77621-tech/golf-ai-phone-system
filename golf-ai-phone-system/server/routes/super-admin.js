@@ -858,11 +858,10 @@ router.patch('/businesses/:id', async (req, res) => {
     // today's message. Storage-only — the AI doesn't read these
     // directly; they're a convenience for the human in the dashboard.
     'daily_instruction_quickfills',
-    // Local Tee Sheet grid display config — { start_hour, start_min,
-    // end_hour, end_min, interval_min }. Persists the operator's
-    // chosen Start / End / Interval so the same grid layout shows
-    // every day. Read-only with respect to Tee-On's actual slot data.
-    'tee_sheet_config',
+    // (`tee_sheet_config` retired 2026-05-12 — the old local Tee Sheet
+    // page was removed in favour of the Live Tee-On Sheet, which is
+    // server-driven and needs no per-tenant grid config. Existing rows
+    // remain in the DB but are unused.)
     // Free-form policy text the AI consults when callers ask about
     // 9-hole availability / twilight rates. Example:
     //   "9-hole back-nine runs during twilight only. May–Sept after

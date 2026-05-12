@@ -537,86 +537,71 @@ async function checkAvailabilityPuppeteer(date, partySize, cfg) {
 async function checkAvailability(date, partySize = 1, teeOnConfig = null) {
   const cfg = resolveConfig(teeOnConfig);
 
-  // Tier 0 — authoritative admin tee sheet via tee-sheet-mirror.
-  // Tee-On's PUBLIC sheet silently hides same-day slots within ~1 hour
-  // of "now" (real-call observed 2026-05-11: caller asked "this
-  // afternoon", public sheet returned slots starting at 2:30 PM, but
-  // 1:02 PM through 2:22 PM Front 9 were fully open per the admin
-  // sheet). The admin sheet has no such filter. We try it first; if
-  // it succeeds we return immediately without ever hitting the public
-  // sheet. Falls through to the existing HTTP / Puppeteer chain when
-  // businessId isn't set, when the admin session can't be established
-  // (e.g. no credentials configured), or when the parse returns no
-  // rows.
-  if (cfg.businessId) {
-    try {
-      const mirror = require('./tee-sheet-mirror');
-      const adminSlots = await mirror.getOpenSlotsForBooking(cfg.businessId, date);
-      if (Array.isArray(adminSlots) && adminSlots.length > 0) {
-        console.log(`[TeeOn:${cfg.key}] Admin tee sheet used (${adminSlots.length} slot products) — no public-sheet hit needed`);
-        setCachedSlots(cfg.key, date, adminSlots);
-        return adminSlots;
-      }
-    } catch (err) {
-      console.warn(`[TeeOn:${cfg.key}] Admin tee sheet path failed (falling back to public sheet):`, err.message);
-    }
+  // ─── ADMIN-ONLY MODE ──────────────────────────────────────────────
+  //
+  // Per ops policy (2026-05-12): the AI may ONLY use the authenticated
+  // admin tee sheet — the same view the clubhouse staff sees. The
+  // public sheet path is intentionally NOT consulted, ever. Reasons:
+  //
+  //   - Public sheet silently hides same-day slots within ~1 hour of
+  //     "now" (anti-walk-up filter). Admin sheet shows everything.
+  //   - Public sheet rate-limits anonymous IPs. Admin sheet doesn't.
+  //   - One source of truth = no skew between what the Live Tee-On
+  //     Command Center page shows and what the AI offers callers.
+  //
+  // The admin session is kept warm by teeon-admin's 15-min keep-alive,
+  // so it stays "logged in" indefinitely while the process is up.
+  // First-call cold-start (post-deploy) triggers a fresh login via
+  // ensureWarmAdminSession.
+  //
+  // If the admin path can't be reached (no businessId, no credentials,
+  // network failure), we return an empty array and let the caller's
+  // empty-result handler take over. We do NOT silently fall back to
+  // the public sheet — that's the bug Nelson explicitly killed
+  // (real-call observed today: public sheet hid morning slots because
+  // a config drift caused the admin path to be skipped).
+
+  if (!cfg.businessId) {
+    // No businessId on the config → can't reach the admin session.
+    // This used to fall through to the public sheet; now we fail
+    // cleanly so the empty-result handler kicks in upstream.
+    console.error(`[TeeOn:${cfg.key}] checkAvailability called without businessId — admin path unavailable, returning empty`);
+    return [];
   }
 
-  // Tier 1 — fresh cache hit. Today's data is held for 3 min (real
-  // bookings fill up fast); future dates ride 20 min (much steadier).
-  // This single optimization absorbs ~80% of customer-traffic queries
-  // on busy days because a handful of popular dates dominate.
-  const cached = getCachedSlots(cfg.key, date);
-  if (cached) {
-    return cached;
-  }
-
-  // Tier 2 — try Tee-On HTTP. If it returns slots, cache + return.
-  // If it returns empty, save that fact and try the other paths
-  // before giving up.
-  let httpSlots = null;
+  let adminSlots = [];
   try {
-    console.log(`[TeeOn:${cfg.key}] Trying HTTP method (primary)...`);
-    httpSlots = await checkAvailabilityHTTP(date, partySize, cfg);
-    if (httpSlots.length > 0) {
-      // checkAvailabilityHTTP already calls setCachedSlots internally.
-      return httpSlots;
-    }
-    console.log(`[TeeOn:${cfg.key}] HTTP returned 0 slots — checking Puppeteer + stale-cache fallback`);
+    const mirror = require('./tee-sheet-mirror');
+    adminSlots = await mirror.getOpenSlotsForBooking(cfg.businessId, date);
   } catch (err) {
-    console.warn(`[TeeOn:${cfg.key}] HTTP method failed:`, err.message);
-  }
-
-  // Tier 3 — Puppeteer fallback (if installed). Slower but more
-  // resilient against flaky API responses.
-  if (puppeteer) {
-    try {
-      console.log(`[TeeOn:${cfg.key}] Trying Puppeteer fallback...`);
-      const puppeteerSlots = await checkAvailabilityPuppeteer(date, partySize, cfg);
-      if (puppeteerSlots.length > 0) {
-        setCachedSlots(cfg.key, date, puppeteerSlots);
-        return puppeteerSlots;
-      }
-    } catch (err) {
-      console.warn(`[TeeOn:${cfg.key}] Puppeteer also failed:`, err.message);
-      if (browser) { try { await browser.close(); } catch (e) {} browser = null; }
+    console.error(`[TeeOn:${cfg.key}] Admin tee sheet fetch failed for ${date}:`, err.message);
+    // Last-resort: try the stale-cache fallback. This is still admin-
+    // sheet data (cached from an earlier successful admin fetch) —
+    // never the public sheet.
+    const stale = getStaleSlotsFallback(cfg.key, date);
+    if (stale) {
+      console.log(`[TeeOn:${cfg.key}] Returning stale admin-sheet cache for ${date} (${stale.length} slots)`);
+      return stale;
     }
+    return [];
   }
 
-  // Tier 4 — stale-cache fallback. Tee-On's HTTP endpoint occasionally
-  // returns empty pages when rate-limited (a single Railway IP can
-  // hit ~5-10 req/min before getting muted). Rather than tell the
-  // caller "fully booked" — which would be a lie based on stale data
-  // — return the most recent cached slots within 30 min. The grok-
-  // voice prompt already explicitly bans "fully booked" wording for
-  // empty tool results, so callers get accurate "slightly stale"
-  // data with an offer to take a request.
+  if (Array.isArray(adminSlots) && adminSlots.length > 0) {
+    console.log(`[TeeOn:${cfg.key}] Admin tee sheet OK for ${date} (${adminSlots.length} slot products)`);
+    setCachedSlots(cfg.key, date, adminSlots);
+    return adminSlots;
+  }
+
+  // Admin sheet parsed but returned zero slot products. Try the stale
+  // cache before giving up — still admin-sheet data, just from an
+  // earlier successful fetch.
   const stale = getStaleSlotsFallback(cfg.key, date);
   if (stale) {
+    console.log(`[TeeOn:${cfg.key}] Admin returned 0 slots, falling back to stale admin cache for ${date} (${stale.length} slots)`);
     return stale;
   }
 
-  console.error(`[TeeOn:${cfg.key}] All methods exhausted (no fresh, no puppeteer, no stale) — returning empty for ${date}`);
+  console.warn(`[TeeOn:${cfg.key}] Admin tee sheet returned 0 slots for ${date} and no stale cache available — returning empty`);
   return [];
 }
 

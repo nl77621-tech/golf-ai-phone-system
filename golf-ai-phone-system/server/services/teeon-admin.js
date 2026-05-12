@@ -1004,6 +1004,13 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
       }
     };
 
+    // Compute "name in FRESH sheet" — the only authoritative signal of
+    // whether the booking actually landed. Used by both the success
+    // path (as a fallback when BookerID can't be pinned) and the
+    // forensic dump (so we can see why extraction missed).
+    const nameInSheet = !!(customerName && customerName.length >= 3 && sheetBody.includes(customerName));
+    const nameSheetIdx = nameInSheet ? sheetBody.indexOf(customerName) : -1;
+
     if (extracted.bookerId) {
       await recordSyncSuccess(businessId, bookingRequestId, extracted.bookerId);
       invalidateMirror();
@@ -1014,29 +1021,51 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
       return { ok: true, bookerId: extracted.bookerId, strategy: extracted.strategy };
     }
 
-    // ─── BookerID extraction failed — booking did NOT land ────────────
+    // ─── Lenient success: name IS on the fresh tee sheet ──────────────
     //
-    // Previously this had a "lenient" path that marked the booking as
-    // successful when the POST response body contained the customer
-    // name (even if BookerID extraction failed on the fresh tee sheet).
-    // That was wrong: the POST response just ECHOES the form inputs we
-    // submitted, so `cleanBody.includes("Nelson Lopes")` was always
-    // true after we typed "Nelson Lopes" into GolferName0 — even when
-    // Tee-On silently rejected the booking.
+    // BookerID extraction missed all three strategies, but the customer
+    // name is in the fresh GET'd tee sheet (not the POST response —
+    // that one echoes form inputs and is a false-positive trap). That
+    // means Tee-On *did* render a tile with our name on it — the
+    // booking landed. We just can't pin the BookerID, which means
+    // cancel-from-our-UI will need ops to manually reconcile (rare).
     //
-    // Real-call bug observed 2026-05-12 11:05 EDT: caller's booking
-    // was confirmed in our UI and an SMS was sent, but Tee-On had no
-    // record of it. The lenient path masked this as "PROBABLY OK".
+    // This is the corrected version of the lenient path that was
+    // removed in PR #40 because it used the wrong source (POST echo).
+    // 2026-05-12 follow-up: PR #40 swung too far — a real successful
+    // booking at 11:58/F got marked as failed because the new tile
+    // uses a marker the BookerID extractor doesn't recognize yet.
+    // We dump diagnostic info around the name position so we can
+    // teach the extractor what the new marker looks like.
+    if (looksLikeTeeSheet && nameInSheet) {
+      await recordSyncSuccess(businessId, bookingRequestId, null);
+      invalidateMirror();
+      // Show what's actually around the name in the sheet so we can
+      // see what marker the newly-booked tile uses. The 30-char floor
+      // / 600-char ceiling is enough for a tile's onclick + label.
+      const ctxStart = Math.max(0, nameSheetIdx - 600);
+      const ctxEnd   = Math.min(sheetBody.length, nameSheetIdx + 600);
+      const nameCtx  = sheetBody.slice(ctxStart, ctxEnd).replace(/\s+/g, ' ').trim();
+      // Find nearby submit* calls (any kind) so we can see what the
+      // new tile is wired to.
+      const nearbyWindow = sheetBody.slice(Math.max(0, nameSheetIdx - 3000), Math.min(sheetBody.length, nameSheetIdx + 3000));
+      const nearbySubmitCalls = (nearbyWindow.match(/submit[A-Za-z]*\([^)]*\)/g) || []).slice(0, 12);
+      console.warn(
+        `[tenant:${businessId}] [TeeOn-Admin] createBooking SOFT-OK ` +
+        `(name "${customerName}" in fresh tee sheet @${nameSheetIdx}, ` +
+        `but BookerID extraction missed for ${time}/${resolvedNine}). ` +
+        `Booking is on Tee-On; cancel-from-our-UI may need manual reconcile.\n` +
+        `  nameContext[±600]: ${nameCtx}\n` +
+        `  nearbySubmitCalls: ${nearbySubmitCalls.join(' | ') || '(none in ±3000)'}`
+      );
+      return { ok: true, bookerId: null, warning: 'no-booker-id', strategy: 'lenient-sheet-name-match' };
+    }
+
+    // ─── Real failure: name is NOT on the fresh sheet ─────────────────
     //
-    // The fresh tee sheet (GET'd right after POST) is the SOURCE OF
-    // TRUTH. extractBookerIdMultiStrategy already runs three strategies
-    // against it (including name-proximity, which finds the name
-    // anywhere in the sheet and looks for a nearby slot). If all three
-    // miss, the booking is not on Tee-On — full stop.
-    //
-    // Force a fresh login next attempt in case the failure was a stale
-    // cookie, and dump full forensic info so we can see what Tee-On
-    // actually returned.
+    // No name on the fresh sheet = booking did not land on Tee-On.
+    // Dump full forensic info so we can see why. Force a fresh login
+    // next attempt (in the outer catch) in case it was a stale cookie.
 
     const allSubmitTimes = [];
     const submitRe = /submitExistingTime\('([^']+)','([A-Z])','([A-Z0-9]+)'/g;
@@ -1045,8 +1074,6 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
       allSubmitTimes.push(`${st[1]}/${st[2]}/${st[3]}`);
       if (allSubmitTimes.length >= 30) break;
     }
-    const nameInSheet = customerName && sheetBody.includes(customerName);
-    const nameSheetIdx = customerName ? sheetBody.indexOf(customerName) : -1;
     console.warn(
       `[tenant:${businessId}] [TeeOn-Admin] POST rejected — booking did NOT land:\n` +
       `  bodyShape:    looksLikeReRenderedForm=${looksLikeReRenderedForm} looksLikeTeeSheet=${looksLikeTeeSheet}\n` +

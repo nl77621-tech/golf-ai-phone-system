@@ -810,7 +810,11 @@ function buildToolDefinitions() {
         properties: {
           customer_name: { type: 'string', description: 'FULL name of the customer — MUST include both first AND last name (e.g. "Nelson Lopes", not just "Nelson"). If the caller gave only one name, ASK for their surname before calling this tool. The Tee-On tee sheet shows this name to staff and other golfers; a single first name looks unprofessional and creates ambiguity when there are multiple bookings under the same first name. NEVER pass a single-word name to this tool.' },
           customer_phone: { type: 'string', description: 'Customer phone number' },
-          customer_email: { type: 'string', description: 'Customer email address' },
+          // `customer_email` removed 2026-05-12: we send SMS confirmations,
+          // never email, so collecting an email address adds friction and
+          // surprised callers with an irrelevant question. Confirmation
+          // texts use the inbound phone (or save_alternate_phone if it
+          // was a landline). Re-add only when a tenant actually needs it.
           date: { type: 'string', description: 'Requested date in YYYY-MM-DD format' },
           time: { type: 'string', description: 'EXACT slot time in HH:MM 24h format — must be character-for-character one of the times from your most recent check_tee_times response. If check_tee_times offered "1:58 PM", pass "13:58" (NOT "14:00"). NEVER round to a friendlier minute. If you don\'t have an exact slot from check_tee_times, do not call this tool — call check_tee_times first.' },
           party_size: { type: 'integer', description: 'Number of players (1-8)' },
@@ -924,12 +928,16 @@ function buildToolDefinitions() {
     {
       type: 'function',
       name: 'save_customer_info',
-      description: 'Save or update customer information (name, email, phone) when a new or existing caller provides their details.',
+      // `email` parameter removed 2026-05-12: we don't email customers
+      // (SMS only), and mentioning email in the description was enough
+      // to make the AI proactively ask for one even when the caller had
+      // no reason to provide it. Re-add only when a tenant actually
+      // needs email for notifications.
+      description: 'Save or update customer information (name, phone) when a new or existing caller provides their details.',
       parameters: {
         type: 'object',
         properties: {
           name: { type: 'string', description: 'Customer full name' },
-          email: { type: 'string', description: 'Customer email address' },
           phone: { type: 'string', description: 'Customer phone number' }
         },
         required: ['name']

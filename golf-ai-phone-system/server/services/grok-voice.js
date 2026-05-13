@@ -933,38 +933,38 @@ function buildToolDefinitions() {
     {
       type: 'function',
       name: 'edit_booking',
-      description: 'Request to modify a specific confirmed booking. You MUST call lookup_my_bookings first and read the bookings back to the caller. Then use the booking_id from the booking they want to change. The modification goes to staff for approval.',
+      description: 'Request to modify a booking — change party size, time, etc. PREFERRED FLOW: call lookup_my_bookings first, read the bookings back to the caller, then pass the booking_id from the result. FALLBACK FLOW (no booking_id): if lookup_my_bookings returns no results (e.g. caller is calling from a different number than the one used to book originally), STILL call this tool — just OMIT the booking_id and pass original_date + original_time + customer_name + details so staff can manually reconcile. Never tell the caller "I\'ve submitted the request" without actually calling this tool — the modification will NOT exist in our system unless this tool runs. Real-call bug observed 2026-05-13: caller asked to add a 4th player to a 3-player booking but called from a different number, lookup returned nothing, AI said "submitted" without calling any tool. The modification was lost.',
       parameters: {
         type: 'object',
         properties: {
-          booking_id: { type: 'integer', description: 'The ID of the confirmed booking to modify (from lookup_my_bookings result)' },
-          customer_name: { type: 'string', description: 'Customer name' },
+          booking_id: { type: 'integer', description: 'The ID of the confirmed booking to modify (from lookup_my_bookings result). OMIT this field if lookup_my_bookings did not find the booking — staff will reconcile manually using the other fields.' },
+          customer_name: { type: 'string', description: 'Customer name (REQUIRED when booking_id is omitted)' },
           customer_phone: { type: 'string', description: 'Customer phone' },
-          original_date: { type: 'string', description: 'Original booking date (YYYY-MM-DD)' },
-          original_time: { type: 'string', description: 'Original booking time (HH:MM)' },
+          original_date: { type: 'string', description: 'Original booking date (YYYY-MM-DD). REQUIRED when booking_id is omitted so staff can find the booking on Tee-On.' },
+          original_time: { type: 'string', description: 'Original booking time (HH:MM 24h). REQUIRED when booking_id is omitted.' },
           new_date: { type: 'string', description: 'New requested date (YYYY-MM-DD)' },
           new_time: { type: 'string', description: 'New requested time (HH:MM)' },
           new_party_size: { type: 'integer', description: 'New party size if changing' },
-          details: { type: 'string', description: 'Description of what needs to change' }
+          details: { type: 'string', description: 'Description of what needs to change (e.g. "add 4th player", "move to 10 AM")' }
         },
-        required: ['booking_id', 'details']
+        required: ['details']
       }
     },
     {
       type: 'function',
       name: 'cancel_booking',
-      description: 'Request to cancel a specific confirmed booking. You MUST call lookup_my_bookings first and read the bookings back to the caller. Then use the booking_id from the booking they want to cancel. The cancellation goes to staff for approval.',
+      description: 'Request to cancel a booking. PREFERRED FLOW: call lookup_my_bookings first, read the bookings back, then pass the booking_id from the result. FALLBACK FLOW (no booking_id): if lookup_my_bookings returns no results, STILL call this tool — just OMIT the booking_id and pass original_date + original_time + customer_name so staff can manually reconcile. Never tell the caller "I\'ve cancelled" without actually calling this tool.',
       parameters: {
         type: 'object',
         properties: {
-          booking_id: { type: 'integer', description: 'The ID of the confirmed booking to cancel (from lookup_my_bookings result)' },
-          customer_name: { type: 'string', description: 'Customer name' },
+          booking_id: { type: 'integer', description: 'The ID of the confirmed booking to cancel (from lookup_my_bookings result). OMIT this field if lookup_my_bookings did not find the booking — staff will reconcile manually using the other fields.' },
+          customer_name: { type: 'string', description: 'Customer name (REQUIRED when booking_id is omitted)' },
           customer_phone: { type: 'string', description: 'Customer phone' },
-          original_date: { type: 'string', description: 'Booking date being cancelled (YYYY-MM-DD)' },
-          original_time: { type: 'string', description: 'Booking time being cancelled (HH:MM)' },
+          original_date: { type: 'string', description: 'Booking date being cancelled (YYYY-MM-DD). REQUIRED when booking_id is omitted.' },
+          original_time: { type: 'string', description: 'Booking time being cancelled (HH:MM 24h). REQUIRED when booking_id is omitted.' },
           details: { type: 'string', description: 'Reason for cancellation or additional notes' }
         },
-        required: ['booking_id']
+        required: []
       }
     },
     {

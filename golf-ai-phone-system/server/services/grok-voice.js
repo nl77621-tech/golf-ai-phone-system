@@ -1631,6 +1631,52 @@ If you are about to say a time and it does NOT appear above, STOP. Either re-cal
           const holesArg = args.holes === 9 || args.holes === '9' ? 9
                          : args.holes === 18 || args.holes === '18' ? 18
                          : null;
+
+          // ─── Idempotency guard ──────────────────────────────────────
+          //
+          // The AI has been observed firing book_tee_time TWICE in
+          // rapid succession (within 1 second) with identical args
+          // during a single call. That creates duplicate
+          // booking_request rows that staff sees on the Bookings page.
+          // Real bookings observed twinning this way: Kevin Hornberg
+          // (#109/#110), Brian Duff (#118/#119), Dave Taylor
+          // (#120/#121), Carter Biekle (#123/#124), Mark Stewart
+          // (#127/#128), Craig Neil (#130/#131) — same call_id,
+          // <2s apart, identical args.
+          //
+          // We stash each successful booking on callState.recentBookings.
+          // Before creating a new one, we check whether the same call
+          // already booked the same (customerName, date, time, partySize)
+          // within the last 30 seconds. If so, return the EXISTING
+          // booking_request_id with the same success message — the AI
+          // sees no behavioural change but no duplicate row is created.
+          //
+          // 30 sec window is generous; the typical retry-burst is <2s.
+          // We keep the array small (last 8) so the linear scan stays
+          // cheap.
+          if (!Array.isArray(callState.recentBookings)) {
+            callState.recentBookings = [];
+          }
+          const dedupKey = `${(args.customer_name || '').toLowerCase().trim()}|${args.date}|${args.time}|${args.party_size}`;
+          const now = Date.now();
+          const recent = callState.recentBookings.find(b =>
+            b.key === dedupKey && (now - b.t) < 30_000
+          );
+          if (recent) {
+            console.warn(
+              `[tenant:${businessId}][${callLogId}] ⚠️ book_tee_time DUPLICATE suppressed — ` +
+              `same (${dedupKey}) was just booked as #${recent.id} ` +
+              `${Math.round((now - recent.t) / 100) / 10}s ago. ` +
+              `Returning existing booking instead of creating a new row.`
+            );
+            return {
+              success: true,
+              message: `Booking request already submitted for ${args.customer_name}, ${args.date} at ${args.time}, ${args.party_size} player${args.party_size === 1 ? '' : 's'}. Confirmation text will follow once staff approves.`,
+              bookingId: recent.id,
+              deduplicated: true
+            };
+          }
+
           const booking = await createBookingRequest({
             businessId,
             customerId: callerContext.customerId,
@@ -1646,6 +1692,13 @@ If you are about to say a time and it does NOT appear above, STOP. Either re-cal
             cardLastFour: args.card_last_four || null,
             callId: callLogId
           });
+
+          // Record for the idempotency guard above. Trim to last 8 to
+          // keep callState small for long calls.
+          callState.recentBookings.push({ key: dedupKey, id: booking.id, t: now });
+          if (callState.recentBookings.length > 8) {
+            callState.recentBookings.splice(0, callState.recentBookings.length - 8);
+          }
 
           // Auto-save caller's name into the tenant's customer row
           if (callerContext.customerId && args.customer_name) {

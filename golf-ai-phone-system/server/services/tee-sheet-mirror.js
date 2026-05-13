@@ -114,6 +114,32 @@ function stripTags(html) {
 function parseAdminTeeSheetHTML(html) {
   if (!html || typeof html !== 'string') return [];
 
+  // ─── Step 0: detect LEAGUE / GROUP rows ───────────────────────────
+  //
+  // Tee-On marks rows reserved for league play with `class="league-row"`
+  // on the <tr> wrapper, and the row id encodes the time as `0HHMM`
+  // (leading zero + zero-padded hour + zero-padded minute in 24h):
+  //
+  //   <tr class="odd league-row" id="00902"> = 09:02 row, league
+  //   <tr class="even league-row" id="01430"> = 14:30 row, league
+  //
+  // These rows are CLOSED to the public — they belong to the named
+  // group (rendered in a separate <tr class="league-header"> row
+  // showing e.g. "Ralph's Golf Group"). The AI's check_tee_times
+  // must never offer these slots, even when individual seats look
+  // open (a league row with 3/4 occupied still can't accept a 1-
+  // player public booking).
+  //
+  // Real-call bug observed 2026-05-13: AI was happily offering
+  // bookings inside the 9:02–9:50 AM Ralph's Golf Group block on
+  // May 19.
+  const leagueTimes = new Set();
+  const leagueRowRe = /<tr\b[^>]*\bclass="[^"]*\bleague-row\b[^"]*"[^>]*\bid="0(\d{2})(\d{2})"/gi;
+  let lr;
+  while ((lr = leagueRowRe.exec(html)) !== null) {
+    leagueTimes.add(`${lr[1]}:${lr[2]}`);
+  }
+
   // ─── Step 1: find every BOOKED tile ───────────────────────────────
   // Tee-On wraps each booked tile in a <div class="...player..."
   // onclick="submitExistingTime('06:24','F','COLU4130',true,2,0);">…</div>
@@ -153,7 +179,7 @@ function parseAdminTeeSheetHTML(html) {
     const paid = /\bpaid\b/i.test(classes);
     const noShow = /\bno-?show\b/i.test(classes);
 
-    const row = byTime.get(time) || { time, front: {}, back: {}, partyCount: 0, hasFront: false, hasBack: false };
+    const row = byTime.get(time) || { time, front: {}, back: {}, partyCount: 0, hasFront: false, hasBack: false, isLeague: leagueTimes.has(time) };
     const side = nine === 'B' ? row.back : row.front;
     side[slotIndex] = { slotIndex, name, bookerId, holes, hasCart, paid, noShow };
     if (nine === 'B') row.hasBack = true; else row.hasFront = true;
@@ -177,7 +203,7 @@ function parseAdminTeeSheetHTML(html) {
   while ((e = emptyRe.exec(html)) !== null) {
     const time = e[1];
     const nine = e[2];
-    const row = byTime.get(time) || { time, front: {}, back: {}, partyCount: 0, hasFront: false, hasBack: false };
+    const row = byTime.get(time) || { time, front: {}, back: {}, partyCount: 0, hasFront: false, hasBack: false, isLeague: leagueTimes.has(time) };
     // Just register the (time, nine) pair as "this slot is real on the
     // sheet". Front/back arrays stay empty so the UI renders "— empty —".
     if (nine === 'B') row.hasBack = true; else row.hasFront = true;
@@ -198,7 +224,11 @@ function parseAdminTeeSheetHTML(html) {
       front: [0, 1, 2, 3].map(i => r.front[i] || null),
       back:  [0, 1, 2, 3].map(i => r.back[i]  || null),
       hasFront: r.hasFront,
-      hasBack: r.hasBack
+      hasBack: r.hasBack,
+      // `isLeague` propagated to the consumer so getOpenSlotsForBooking
+      // can drop these rows from the AI's available-times list and the
+      // Live Tee-On page can render them with a distinguishing style.
+      isLeague: !!r.isLeague
     }));
 
   return rows;
@@ -347,11 +377,24 @@ async function getOpenSlotsForBooking(businessId, date) {
 
   const out = [];
   let droppedPast = 0;
+  let droppedLeague = 0;
   for (const row of sheet.rows) {
     // Drop past slots when the request is for today. row.time is
     // already in "HH:MM" 24h form, same as nowLocalHHMM.
     if (isToday && nowLocalHHMM && row.time < nowLocalHHMM) {
       droppedPast++;
+      continue;
+    }
+
+    // Drop league / group-block rows entirely. These belong to a
+    // named recurring group ("Ralph's Golf Group", "Tuesday Men's
+    // League", etc.) — they're closed to public booking even when
+    // individual seats look open. The user's policy: "Anytime in
+    // here cannot be allowed to be booked." Real-call bug observed
+    // 2026-05-13: AI was offering bookings inside a league block
+    // on May 19 because we weren't parsing the `league-row` class.
+    if (row.isLeague) {
+      droppedLeague++;
       continue;
     }
 
@@ -396,6 +439,9 @@ async function getOpenSlotsForBooking(businessId, date) {
 
   if (droppedPast > 0) {
     console.log(`[tenant:${businessId}] [TeeSheet-Mirror] dropped ${droppedPast} past slot(s) for ${date} (now=${nowLocalHHMM})`);
+  }
+  if (droppedLeague > 0) {
+    console.log(`[tenant:${businessId}] [TeeSheet-Mirror] dropped ${droppedLeague} league/group row(s) for ${date} — closed to public booking`);
   }
   return out;
 }

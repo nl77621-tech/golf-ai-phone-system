@@ -787,7 +787,7 @@ async function getRandomGreeting(businessId, isKnown, callerName, businessName) 
  * Define the tools (functions) available to Grok.
  */
 function buildToolDefinitions() {
-  return [
+  const all = [
     {
       type: 'function',
       name: 'check_tee_times',
@@ -808,7 +808,13 @@ function buildToolDefinitions() {
       parameters: {
         type: 'object',
         properties: {
-          customer_name: { type: 'string', description: 'FULL name of the customer — MUST include both first AND last name (e.g. "Nelson Lopes", not just "Nelson"). If the caller gave only one name, ASK for their surname before calling this tool. The Tee-On tee sheet shows this name to staff and other golfers; a single first name looks unprofessional and creates ambiguity when there are multiple bookings under the same first name. NEVER pass a single-word name to this tool.' },
+          // NOTE: never use a real name (especially the owner's) as the
+          // example — the AI sometimes leaks it back to unknown callers
+          // as a greeting ("Hey Nelson, great to hear from you again").
+          // Real-call regression observed 2026-05-13: three different
+          // unknown callers got addressed as "Nelson" because that was
+          // the example name. Use neutral placeholder names instead.
+          customer_name: { type: 'string', description: 'FULL name of the customer — MUST include both first AND last name (e.g. "Jane Smith", not just "Jane"). If the caller gave only one name, ASK for their surname before calling this tool. The Tee-On tee sheet shows this name to staff and other golfers; a single first name looks unprofessional and creates ambiguity when there are multiple bookings under the same first name. NEVER pass a single-word name to this tool.' },
           customer_phone: { type: 'string', description: 'Customer phone number' },
           // `customer_email` removed 2026-05-12: we send SMS confirmations,
           // never email, so collecting an email address adds friction and
@@ -1022,6 +1028,23 @@ function buildToolDefinitions() {
       }
     }
   ];
+
+  // ─── Conditional removal: check_weather ───────────────────────────
+  //
+  // The weather tool always returns `{ error: 'Weather service not
+  // configured' }` when OPENWEATHER_API_KEY is unset, but the AI
+  // happily calls it anyway and then HALLUCINATES a weather answer
+  // ("No rain issues today" with zero data). Real-call regression
+  // observed 2026-05-13: caller asked if it had rained, AI invented
+  // a confident no, caller transferred to clubhouse to verify.
+  //
+  // Cleanest fix: don't even expose the tool if there's no API key.
+  // No tool → no hallucinated tool call → AI falls back to "I don't
+  // have current weather info, let me transfer you."
+  if (!process.env.OPENWEATHER_API_KEY) {
+    return all.filter(t => t.name !== 'check_weather');
+  }
+  return all;
 }
 
 /**
@@ -1423,7 +1446,7 @@ If you are about to say a time and it does NOT appear above, STOP. Either re-cal
           console.warn(`[tenant:${businessId}][${callLogId}] ⚠️ book_tee_time called with single-word name: "${trimmedName}"`);
           return {
             success: false,
-            message: `The name you passed ("${trimmedName}") only has one word. Tee-On bookings need both first AND last name. ASK the caller now: "And your last name?" Then re-call book_tee_time with the full name (e.g. "Nelson Lopes"). Do NOT proceed with just a first name.`
+            message: `The name you passed ("${trimmedName}") only has one word. Tee-On bookings need both first AND last name. ASK the caller now: "And your last name?" Then re-call book_tee_time with the full name (e.g. "Jane Smith"). Do NOT proceed with just a first name.`
           };
         }
         if (!args.date || typeof args.date !== 'string') {

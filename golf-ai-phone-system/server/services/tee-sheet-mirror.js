@@ -140,6 +140,45 @@ function parseAdminTeeSheetHTML(html) {
     leagueTimes.add(`${lr[1]}:${lr[2]}`);
   }
 
+  // ─── Step 0b: count TRULY-OPEN seats per (time, nine) ─────────────
+  //
+  // The previous parser assumed every row had 4 bookable seats. That
+  // was wrong for rows with intentionally-blocked seats (chained
+  // groups, starter blocks, league overflow into adjacent times,
+  // etc.). Tee-On renders each of the 4 seat positions in a row as
+  // a clickable <div class="player ..."> tile. The onclick handler
+  // tells us whether the seat is occupied, open, or blocked:
+  //
+  //   onclick="submitExistingTime('HH:MM','F','COLU…',true,N,idx)"
+  //     → seat is OCCUPIED (someone's booked here). Tile shows name.
+  //   onclick="submitTime('HH:MM','F',N,-1)"
+  //     → seat is OPEN and bookable. Tile shows "Book this seat" UI.
+  //   onclick="loadGenericMessage4Popup()" / loadGenericMessage7Popup()…
+  //     → seat is BLOCKED (chained, league-locked, etc.). Tile is
+  //       inert — clicking shows an "unavailable" popup. NOT bookable.
+  //
+  // (We use lowercase `onclick=` for tile-level handlers. The row's
+  // header anchor uses `onClick=` with capital C and isn't a seat —
+  // it's a "click this row to enter the booking form" button. We
+  // ignore that one.)
+  //
+  // Real-call bug observed 2026-05-13: AI offered 09:42 AM on May 21
+  // as fitting a party of 4. The row had:
+  //   2 occupied (Brian Duff + Guest, both submitExistingTime)
+  //   0 open    (no submitTime tiles)
+  //   2 blocked (both loadGenericMessage4Popup)
+  // True open seats: 0. But the old parser saw 2 occupied + assumed
+  // 4-seat capacity → 2 open. The AI claimed it fit four. Wrong.
+  // Same pattern at 06:54 (2 open reported, actually 0) and 11:26
+  // (1 open reported, actually 0).
+  const openSeatsByTimeNine = new Map(); // key: 'HH:MM/F' or 'HH:MM/B' → integer open count
+  const openTileRe = /<div\b[^>]*\bclass="[^"]*\bplayer\b[^"]*"[^>]*\bonclick="submitTime\('(\d{1,2}:\d{2})','([FB])'/gi;
+  let ot;
+  while ((ot = openTileRe.exec(html)) !== null) {
+    const key = `${ot[1]}/${ot[2]}`;
+    openSeatsByTimeNine.set(key, (openSeatsByTimeNine.get(key) || 0) + 1);
+  }
+
   // ─── Step 1: find every BOOKED tile ───────────────────────────────
   // Tee-On wraps each booked tile in a <div class="...player..."
   // onclick="submitExistingTime('06:24','F','COLU4130',true,2,0);">…</div>
@@ -179,7 +218,13 @@ function parseAdminTeeSheetHTML(html) {
     const paid = /\bpaid\b/i.test(classes);
     const noShow = /\bno-?show\b/i.test(classes);
 
-    const row = byTime.get(time) || { time, front: {}, back: {}, partyCount: 0, hasFront: false, hasBack: false, isLeague: leagueTimes.has(time) };
+    const row = byTime.get(time) || {
+      time, front: {}, back: {}, partyCount: 0,
+      hasFront: false, hasBack: false,
+      isLeague: leagueTimes.has(time),
+      openFront: openSeatsByTimeNine.get(`${time}/F`) || 0,
+      openBack:  openSeatsByTimeNine.get(`${time}/B`) || 0
+    };
     const side = nine === 'B' ? row.back : row.front;
     side[slotIndex] = { slotIndex, name, bookerId, holes, hasCart, paid, noShow };
     if (nine === 'B') row.hasBack = true; else row.hasFront = true;
@@ -203,7 +248,13 @@ function parseAdminTeeSheetHTML(html) {
   while ((e = emptyRe.exec(html)) !== null) {
     const time = e[1];
     const nine = e[2];
-    const row = byTime.get(time) || { time, front: {}, back: {}, partyCount: 0, hasFront: false, hasBack: false, isLeague: leagueTimes.has(time) };
+    const row = byTime.get(time) || {
+      time, front: {}, back: {}, partyCount: 0,
+      hasFront: false, hasBack: false,
+      isLeague: leagueTimes.has(time),
+      openFront: openSeatsByTimeNine.get(`${time}/F`) || 0,
+      openBack:  openSeatsByTimeNine.get(`${time}/B`) || 0
+    };
     // Just register the (time, nine) pair as "this slot is real on the
     // sheet". Front/back arrays stay empty so the UI renders "— empty —".
     if (nine === 'B') row.hasBack = true; else row.hasFront = true;
@@ -228,7 +279,15 @@ function parseAdminTeeSheetHTML(html) {
       // `isLeague` propagated to the consumer so getOpenSlotsForBooking
       // can drop these rows from the AI's available-times list and the
       // Live Tee-On page can render them with a distinguishing style.
-      isLeague: !!r.isLeague
+      isLeague: !!r.isLeague,
+      // `openFront`/`openBack` count the TRULY-BOOKABLE empty seats
+      // (tiles with onclick="submitTime(…)"). Blocked seats (chained,
+      // league-locked, etc. — tiles with onclick="loadGenericMessage…")
+      // are excluded. This replaces the old "4 - occupied" assumption
+      // which over-stated availability on slot-partial rows. See
+      // Step 0b for the bug context.
+      openFront: typeof r.openFront === 'number' ? r.openFront : 0,
+      openBack:  typeof r.openBack === 'number' ? r.openBack : 0
     }));
 
   return rows;
@@ -401,12 +460,18 @@ async function getOpenSlotsForBooking(businessId, date) {
     const time12 = hhmm24To12(row.time);
     if (!time12) continue;
 
-    // Front 9 column — bookable as 18-hole (start hole 1). We emit
-    // even when fully empty (maxPlayers=4); the downstream filter in
-    // check_tee_times drops slots that don't fit the party size.
+    // `maxPlayers` = TRULY-OPEN seats for this nine, counted from the
+    // admin sheet's `<div class="player" onclick="submitTime(…)">`
+    // tiles. Blocked seats (onclick="loadGenericMessage…") and
+    // occupied seats are excluded. This replaces the old
+    // `4 - occupied` formula, which assumed every row had 4 bookable
+    // seats and over-stated availability on slot-partial rows.
+    // Real-call bug 2026-05-13 (now fixed): AI offered 09:42/F as
+    // fitting 4 players when the row had 0 truly-open seats.
+
+    // Front 9 column — bookable as 18-hole (start hole 1).
     if (row.hasFront) {
-      const occupied = Array.isArray(row.front) ? row.front.filter(Boolean).length : 0;
-      const maxPlayers = Math.max(0, 4 - occupied);
+      const maxPlayers = typeof row.openFront === 'number' ? row.openFront : 0;
       out.push({
         time: time12,
         raw: time12.replace(' ', ''),
@@ -423,8 +488,7 @@ async function getOpenSlotsForBooking(businessId, date) {
     // in check_tee_times, slots outside the window get filtered out;
     // we just emit what the admin sheet shows.
     if (row.hasBack) {
-      const occupied = Array.isArray(row.back) ? row.back.filter(Boolean).length : 0;
-      const maxPlayers = Math.max(0, 4 - occupied);
+      const maxPlayers = typeof row.openBack === 'number' ? row.openBack : 0;
       out.push({
         time: time12,
         raw: time12.replace(' ', ''),

@@ -126,6 +126,82 @@ function mulaw8kToPcm16(inputBuf) {
  *   - columns on the `businesses` row (teeon_course_code, teeon_course_group_id)
  * Returns null to let teeon-automation fall back to Valleymede defaults.
  */
+/**
+ * Detect a party-size number from free-form caller speech.
+ *
+ * Used as a SAFETY NET when the AI calls check_tee_times with
+ * party_size=1 (the default) — we re-scan recent caller utterances
+ * for an explicit party-size phrase and, if found, override the
+ * arg before calling Tee-On. This prevents the "AI defaults to 1
+ * but caller actually said four" failure mode that surfaces when
+ * the AI ignores the prompt's "don't re-ask party size" rule.
+ *
+ * Returns a number 1..8 if confidently detected, else null.
+ *
+ * Patterns recognised (text is lowercased upstream):
+ *   - "(N|number-word) players|golfers|guys|people"
+ *   - "(N|number-word) of us"
+ *   - "for (N|number-word)"
+ *   - "group of (N|number-word)"
+ *   - "foursome" → 4, "threesome" → 3, "twosome" → 2
+ *   - "just me", "by myself", "myself", "for myself" → 1
+ *   - "me and my buddy", "myself and a friend" → 2
+ *
+ * Conservative: returns null on ambiguity rather than guessing.
+ */
+function detectPartySizeFromText(text) {
+  if (!text || typeof text !== 'string') return null;
+  const t = text.toLowerCase();
+
+  // Word-form numbers (one..eight). Higher first so "fourteen" doesn't
+  // match "four" accidentally — though party sizes never go that high
+  // and we cap at 8 anyway.
+  const wordToNum = {
+    one: 1, two: 2, three: 3, four: 4, five: 5,
+    six: 6, seven: 7, eight: 8,
+    single: 1, solo: 1
+  };
+
+  // Single-word collective nouns map directly to a size.
+  if (/\b(foursome)\b/.test(t)) return 4;
+  if (/\b(threesome)\b/.test(t)) return 3;
+  if (/\b(twosome|pair)\b/.test(t)) return 2;
+  // Multi-person phrases must be checked BEFORE the solo "just me"
+  // pattern — "just me and my buddy" is 2, not 1.
+  if (/\b(me|myself) (and|plus|with|\+) (a |my |one |another )?(friend|buddy|partner|wife|husband|son|daughter|kid|guest|colleague)\b/.test(t)) return 2;
+  // "play with my wife", "going with my buddy" → 2 (caller + 1 partner)
+  if (/\b(with|alongside|plus) my (wife|husband|partner|friend|buddy|son|daughter|kid|colleague)\b/.test(t)) return 2;
+  // Solo patterns last.
+  if (/\b(just me|by myself|for myself|playing alone|all alone|on my own)\b/.test(t)) return 1;
+
+  // Numeric forms.
+  // "for 4 players", "for four players", "for 3 golfers", "for two guys"
+  const playersRe = /\b(\d+|one|two|three|four|five|six|seven|eight)\s+(players?|golfers?|guys|people|of us)\b/;
+  const pm = t.match(playersRe);
+  if (pm) {
+    const n = /^\d+$/.test(pm[1]) ? parseInt(pm[1], 10) : wordToNum[pm[1]];
+    if (n >= 1 && n <= 8) return n;
+  }
+
+  // "group of 5", "party of three"
+  const groupRe = /\b(?:group|party) of (\d+|one|two|three|four|five|six|seven|eight)\b/;
+  const gm = t.match(groupRe);
+  if (gm) {
+    const n = /^\d+$/.test(gm[1]) ? parseInt(gm[1], 10) : wordToNum[gm[1]];
+    if (n >= 1 && n <= 8) return n;
+  }
+
+  // "we are 4" / "we're a group of 5" / "there are 3 of us"
+  const usRe = /\bthere (?:are|will be) (\d+|one|two|three|four|five|six|seven|eight)\b/;
+  const um = t.match(usRe);
+  if (um) {
+    const n = /^\d+$/.test(um[1]) ? parseInt(um[1], 10) : wordToNum[um[1]];
+    if (n >= 1 && n <= 8) return n;
+  }
+
+  return null;
+}
+
 async function getTeeOnConfigForBusiness(businessId) {
   // Reuse teeon-admin's tenant config lookup (matching settings →
   // businesses → DEFAULT_COURSE_CODE chain) so we never return null
@@ -1066,7 +1142,35 @@ async function executeToolCall(toolName, args, ctx) {
           };
         }
         try {
-          const partySize = args.party_size || 1;
+          let partySize = args.party_size || 1;
+
+          // ─── Server-side party-size recovery ──────────────────────
+          // If the AI called check_tee_times with party_size=1 (or
+          // defaulted), scan the caller's recent utterances for an
+          // explicit party-size mention and OVERRIDE the arg. This is
+          // the belt-and-braces backup to the prompt's "don't re-ask
+          // party size" rule. Even if the AI ignores the prompt and
+          // either guesses or asks again, this guarantees we don't
+          // pass a wrong size to the tee-sheet filter.
+          //
+          // Real-call bug observed 2026-05-13 (twice): caller said
+          // "tee time for four players" and the AI still asked +
+          // sometimes defaulted to 1.
+          if (partySize === 1 && callState?.transcriptParts?.length) {
+            const recentCallerText = callState.transcriptParts
+              .filter(p => p.role === 'caller')
+              .slice(-6) // last 6 caller turns is plenty
+              .map(p => p.text)
+              .join(' ')
+              .toLowerCase();
+            const detected = detectPartySizeFromText(recentCallerText);
+            if (detected && detected !== 1) {
+              console.warn(`[tenant:${businessId}][${callLogId}] ⚠️ check_tee_times called with party_size=1 but caller said "${detected}" — overriding to ${detected}`);
+              partySize = detected;
+              args.party_size = detected;
+            }
+          }
+
           const teeOnCfg = await getTeeOnConfigForBusiness(businessId);
           console.log(`[tenant:${businessId}][${callLogId}] check_tee_times | date: ${args.date} | party_size: ${partySize} | raw args:`, JSON.stringify(args));
           let allSlots = await teeon.checkAvailability(args.date, partySize, teeOnCfg);

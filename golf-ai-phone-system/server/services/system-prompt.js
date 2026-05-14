@@ -435,6 +435,13 @@ ${todayHours ? `- Today's hours: ${todayHours.open} - ${todayHours.close}` : '- 
 ## DATE REFERENCE (use this to convert what callers say to YYYY-MM-DD)
 ${buildDateReference(timezone)}
 
+⚠️⚠️⚠️ WHICH DAY DOES A BARE WEEKDAY NAME MEAN?
+- When a caller says JUST a weekday name with no qualifier — "Saturday", "Monday", "Friday morning" — they ALWAYS mean the SOONEST one. Use the entry tagged "(this <Day>)" in the list above. NEVER use the "(NEXT <Day>)" entry for a bare weekday name.
+- ONLY use the "(NEXT <Day>)" entry if the caller EXPLICITLY says "next Saturday", "the Saturday after this one", "Saturday week", or similar.
+- The 14-day list above has TWO of every weekday. Picking the wrong one sends the caller a week off — they get told a slot is "open" when their real date is fully booked (or vice versa).
+- REAL-CALL BUG 2026-05-14: today was Thursday May 14, caller asked for "Saturday morning", the AI resolved it to May 23 (the SECOND Saturday) instead of May 16 (this Saturday). It offered a 6:08 AM slot that was open on May 23 but completely full on May 16. The caller would have shown up to a booked course. NEVER pick the far weekday for a bare day name.
+- When you read the date back to the caller, say it naturally AND include the month + day number once so they can catch a mistake: "this Saturday, May sixteenth" — not just "Saturday".
+
 ## COURSE INFORMATION
 - Name: ${businessName}
 - Address: ${courseInfo?.address || business?.address || ''}
@@ -715,6 +722,16 @@ Callers sometimes call from a DIFFERENT phone number than the one used to make t
 /**
  * Build a "today = YYYY-MM-DD, tomorrow = YYYY-MM-DD, ..." block in the
  * given IANA timezone. Defaults to America/Toronto for legacy callers.
+ *
+ * The 14-day window contains TWO of every weekday name (e.g. two
+ * Saturdays). A bare weekday name from a caller ("Saturday") always
+ * means the SOONEST one. We label days 2–7 as "(this <Day>)" and
+ * days 8–14 as "(next <Day>)" so the model can't grab the wrong week.
+ *
+ * Real-call bug observed 2026-05-14: today was Thursday, caller said
+ * "Saturday morning", the AI resolved it to the SECOND Saturday in
+ * the list (May 23) instead of the first (May 16) and offered a
+ * 6:08 AM slot that was open on May 23 but full on May 16.
  */
 function buildDateReference(timezone = 'America/Toronto') {
   const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: timezone });
@@ -727,7 +744,16 @@ function buildDateReference(timezone = 'America/Toronto') {
     dt.setDate(dt.getDate() + i);
     const dateKey = dt.toLocaleDateString('en-CA');
     const dayLabel = dt.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' });
-    const prefix = i === 0 ? ' (TODAY)' : i === 1 ? ' (tomorrow)' : '';
+    const weekday = dt.toLocaleDateString('en-US', { weekday: 'long' });
+    // i=0 TODAY, i=1 tomorrow, i=2–7 = the soonest occurrence of each
+    // weekday ("this <Day>"), i=8–14 = the second occurrence
+    // ("next <Day>"). This is what disambiguates "Saturday" → which
+    // Saturday.
+    let prefix;
+    if (i === 0)      prefix = ' (TODAY)';
+    else if (i === 1) prefix = ` (tomorrow — this ${weekday})`;
+    else if (i <= 7)  prefix = ` (this ${weekday})`;
+    else              prefix = ` (NEXT ${weekday} — a week after "this ${weekday}")`;
     lines.push(`- ${dayLabel}${prefix} = ${dateKey}`);
   }
   return lines.join('\n');

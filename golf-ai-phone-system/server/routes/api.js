@@ -607,6 +607,40 @@ router.put('/bookings/:id/no-show', async (req, res) => {
   }
 });
 
+// DELETE /api/bookings/:id — Permanently remove a booking_request row.
+//
+// This is a hard delete, used by staff from the Command Center Bookings
+// page when an entry needs to be removed entirely — e.g. the slot is no
+// longer available on Tee-On and the staff member just wants the row
+// gone, not marked rejected/cancelled. It does NOT touch Tee-On — staff
+// handle the Tee-On side manually. Scoped to the tenant: a business can
+// only delete its own bookings.
+router.delete('/bookings/:id', async (req, res) => {
+  const businessId = tenantId(req);
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ error: 'Invalid booking id' });
+    }
+    const result = await query(
+      `DELETE FROM booking_requests
+        WHERE id = $1 AND business_id = $2
+        RETURNING id, customer_name, requested_date, requested_time`,
+      [id, businessId]
+    );
+    const deleted = result.rows[0];
+    if (!deleted) return res.status(404).json({ error: 'Booking not found' });
+    console.log(
+      `[tenant:${businessId}] Booking #${deleted.id} deleted from Command Center ` +
+      `(${deleted.customer_name} — ${deleted.requested_date} ${deleted.requested_time})`
+    );
+    res.json({ ok: true, id: deleted.id });
+  } catch (err) {
+    console.error(`[tenant:${businessId}] Booking delete failed:`, err.message);
+    res.status(500).json({ error: 'Failed to delete booking' });
+  }
+});
+
 // POST /api/reminders/send — Manually trigger day-before reminders for this tenant
 router.post('/reminders/send', async (req, res) => {
   const businessId = tenantId(req);

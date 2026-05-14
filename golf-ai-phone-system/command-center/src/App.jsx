@@ -808,6 +808,25 @@ function BookingsPage() {
     } catch (err) { alert('Failed: ' + err.message); }
   };
 
+  // Hard-delete a booking row. Used when staff just want the entry GONE
+  // from this page (e.g. the slot is no longer available on Tee-On).
+  // Does not touch Tee-On — staff handle that side manually. Reuses the
+  // pendingActions set so the button disables while the request is in
+  // flight.
+  const deleteBooking = async (b) => {
+    if (pendingActions.has(b.id)) return;
+    if (!confirm(`Delete ${b.customer_name}'s booking entry (${b.requested_date})? This removes it from this page permanently. It does NOT change anything on Tee-On.`)) return;
+    setPendingActions(prev => { const n = new Set(prev); n.add(b.id); return n; });
+    try {
+      await api(`/api/bookings/${b.id}`, { method: 'DELETE' });
+      loadData();
+    } catch (err) {
+      alert('Failed to delete: ' + err.message);
+    } finally {
+      setPendingActions(prev => { const n = new Set(prev); n.delete(b.id); return n; });
+    }
+  };
+
   const statusColors = { pending: 'bg-yellow-100 text-yellow-800', confirmed: 'bg-green-100 text-green-800', rejected: 'bg-red-100 text-red-800', cancelled: 'bg-gray-100 text-gray-800' };
 
   return React.createElement('div', null,
@@ -901,7 +920,12 @@ function BookingsPage() {
                       ),
                       b.special_requests && React.createElement('div', { className: 'text-sm text-gray-600 mt-1 italic' }, b.special_requests)
                     ),
-                    b.status === 'pending' && React.createElement('div', { className: 'flex gap-2 ml-4' },
+                    // Action area — always rendered. Status-specific
+                    // buttons PLUS a Delete button on EVERY row so staff
+                    // can permanently remove an entry (e.g. when the slot
+                    // is no longer available on Tee-On).
+                    React.createElement('div', { className: 'flex gap-2 ml-4 items-start' },
+                      b.status === 'pending' && React.createElement('div', { className: 'flex gap-2' },
                       React.createElement('button', {
                         onClick: () => updateStatus(b.id, 'confirmed'),
                         disabled: pendingActions.has(b.id),
@@ -923,7 +947,7 @@ function BookingsPage() {
                         className: 'bg-blue-500 hover:bg-blue-600 disabled:bg-blue-300 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg text-sm font-medium'
                       }, '\uD83D\uDCAC Reply')
                     ),
-                    b.status === 'confirmed' && React.createElement('div', { className: 'flex gap-2 ml-4' },
+                      b.status === 'confirmed' && React.createElement('div', { className: 'flex gap-2' },
                       !b.no_show
                         ? React.createElement('button', {
                             onClick: () => { if (confirm(`Mark ${b.customer_name} as no-show?`)) markNoShow(b.id, true); },
@@ -950,6 +974,18 @@ function BookingsPage() {
                             'Cancelling…'
                           )
                         : 'Cancel')
+                      ),
+                      // Delete — permanently removes this booking entry
+                      // from the page. Available on every row, every
+                      // status. Subtle styling so it doesn't compete with
+                      // the primary actions, but always reachable. Does
+                      // NOT touch Tee-On — staff handle that side.
+                      React.createElement('button', {
+                        onClick: () => deleteBooking(b),
+                        disabled: pendingActions.has(b.id),
+                        title: 'Permanently remove this entry from the Bookings page (does not change Tee-On)',
+                        className: 'bg-white hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed text-gray-500 hover:text-red-600 border border-gray-300 px-3 py-1.5 rounded-lg text-sm font-medium'
+                      }, '🗑 Delete')
                     )
                   ),
                   // Inline reply panel — expands when Reply is clicked

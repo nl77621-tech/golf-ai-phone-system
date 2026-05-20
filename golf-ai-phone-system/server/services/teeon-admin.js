@@ -856,6 +856,24 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
       Nine: payload.Nine,
     };
 
+    // Power carts. Tee-On marks each golfer's cart with a per-slot
+    // Cart{i} hidden field = "Y" (this golfer rides) or "N" (no cart).
+    // Verified against live bookings on 2026-05-16:
+    //   06:08 booked with 2 carts → Cart0..3 all "Y" (4 riders)
+    //   06:00 booked with 1 cart  → Cart0..2 "N", Cart3 "Y" (1 rider)
+    // Each cart seats 2 golfers, so numCarts carts → up to numCarts*2
+    // riders. The number of "Y" slots is what drives the cart icon on
+    // the tee sheet.
+    //
+    // BUG fixed here (real-call regression observed 2026-05-20): we
+    // never set the per-slot Cart fields, so every AI booking went to
+    // Tee-On with no carts — the tee sheet showed none even when the
+    // caller explicitly asked for power carts. We assign riders from
+    // the booker outward: the first `riderCount` golfers of our party
+    // get "Y", the rest "N".
+    const numCarts = Math.max(0, Number(booking.num_carts) || 0);
+    const riderCount = Math.min(partySize, numCarts * 2);
+
     // Write the caller's data into the first empty slot, then "Guest"
     // entries for the rest of their party. We never touch already-
     // occupied slots — those are someone else's booking and must be
@@ -867,6 +885,11 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
       overrides[`Phone${slotIdx}`]      = isBooker ? (payload.Phone0 || '')      : '';
       overrides[`Email${slotIdx}`]      = isBooker ? (payload.Email0 || '')      : '';
       overrides[`Holes${slotIdx}`]      = payload.Holes0 || payload.Holes;
+      // Per-slot cart flag — "Y" for the first riderCount golfers of
+      // our party, "N" for the rest. Only OUR slots; existing golfers'
+      // Cart fields are left untouched (they stay as parsed from the
+      // live form).
+      overrides[`Cart${slotIdx}`]       = (i < riderCount) ? 'Y' : 'N';
       // MemberID + SlotBookerID stay blank for the new slot — that's how
       // Tee-On represents a non-member walk-in / phone booking.
       overrides[`MemberID${slotIdx}`]   = '';
@@ -876,7 +899,8 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
     const merged = { ...liveFields, ...overrides };
     console.log(
       `[tenant:${businessId}] [TeeOn-Admin] slot placement: existing=${existingCount} occupied=[${occupied.map(b => b ? '✓' : '·').join('')}] ` +
-      `→ writing ${partySize} player${partySize === 1 ? '' : 's'} starting at slot ${firstEmpty} (Players field=${overrides.Players})`
+      `→ writing ${partySize} player${partySize === 1 ? '' : 's'} starting at slot ${firstEmpty} ` +
+      `(Players field=${overrides.Players}, ${numCarts} cart${numCarts === 1 ? '' : 's'} → ${riderCount} rider${riderCount === 1 ? '' : 's'})`
     );
     console.log(
       `[tenant:${businessId}] [TeeOn-Admin] payload merge: ` +

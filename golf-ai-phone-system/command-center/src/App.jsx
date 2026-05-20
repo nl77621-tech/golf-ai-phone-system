@@ -837,6 +837,15 @@ function BookingsPage() {
       React.createElement('h2', { className: 'text-lg font-semibold text-orange-800 mb-4' },
         `\u270f\ufe0f ${modifications.length} Pending Change Request${modifications.length > 1 ? 's' : ''}`
       ),
+      // Change requests do NOT auto-update Tee-On \u2014 staff must make the
+      // change in Tee-On manually. "Done" only marks it processed here
+      // and texts the customer a confirmation. Make that explicit so
+      // staff don't mark Done before actually changing Tee-On (which
+      // would send the customer a confirmation for a change that never
+      // happened \u2014 observed 2026-05-16).
+      React.createElement('div', { className: 'text-sm text-orange-700 bg-orange-100 rounded-lg px-3 py-2 mb-4' },
+        '\u26a0\ufe0f These do NOT update Tee-On automatically. Make the change in Tee-On FIRST, then click "Done" \u2014 that texts the customer their confirmation.'
+      ),
       modifications.map(m =>
         React.createElement('div', { key: m.id, className: 'bg-white rounded-lg p-4 mb-3 flex items-center justify-between' },
           React.createElement('div', null,
@@ -849,7 +858,11 @@ function BookingsPage() {
           ),
           React.createElement('div', { className: 'flex gap-2' },
             React.createElement('button', {
-              onClick: () => processModification(m.id, 'processed'),
+              onClick: () => {
+                if (confirm(`Have you already made this change in Tee-On?\n\n${m.customer_name} — ${m.details || m.request_type}\n\nClicking "Done" texts the customer a confirmation but does NOT update Tee-On. Only click Done AFTER you've made the change in Tee-On.`)) {
+                  processModification(m.id, 'processed');
+                }
+              },
               className: 'bg-green-500 hover:bg-green-600 text-white px-3 py-1 rounded text-sm'
             }, 'Done'),
             React.createElement('button', {

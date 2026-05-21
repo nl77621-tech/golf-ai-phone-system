@@ -578,6 +578,21 @@ ${callerLine}
     try {
       const event = JSON.parse(data.toString());
 
+      // Track whether Grok currently has a response being generated.
+      // The barge-in handler uses this to decide whether sending
+      // `response.cancel` is valid — cancelling when no response is
+      // active makes Grok return "Cancellation failed: no active
+      // response found" (observed 15× in one day's logs). `response.
+      // created` opens the window; `response.done` (and the cancelled
+      // / failed terminals) close it.
+      if (event.type === 'response.created') {
+        callState.responseActive = true;
+      } else if (event.type === 'response.done'
+              || event.type === 'response.cancelled'
+              || event.type === 'response.failed') {
+        callState.responseActive = false;
+      }
+
       if (event.type === 'response.output_audio.delta') {
         if (!callState._audioLogged) {
           callState._audioLogged = true;
@@ -595,10 +610,21 @@ ${callerLine}
 
       switch (event.type) {
         case 'input_audio_buffer.speech_started':
-          console.log(`[tenant:${businessId}][${callSid}] Barge-in detected — cancelling AI response`);
-          if (grokWs.readyState === WebSocket.OPEN) {
-            grokWs.send(JSON.stringify({ type: 'response.cancel' }));
+          // Only send response.cancel when Grok actually has a response
+          // in progress. Cancelling when nothing is active is rejected
+          // with "Cancellation failed: no active response found" — noise,
+          // and an invalid request to Grok.
+          if (callState.responseActive) {
+            console.log(`[tenant:${businessId}][${callSid}] Barge-in detected — cancelling AI response`);
+            if (grokWs.readyState === WebSocket.OPEN) {
+              grokWs.send(JSON.stringify({ type: 'response.cancel' }));
+            }
           }
+          // The Twilio audio-buffer clear ALWAYS fires: even after Grok
+          // finished generating (response.done), the generated audio can
+          // still be draining out to the caller. Clearing it cuts the AI
+          // off mid-sentence in the caller's ear, which is the point of
+          // barge-in. Harmless when the buffer is already empty.
           if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
             twilioWs.send(JSON.stringify({ event: 'clear', streamSid: streamSid }));
           }

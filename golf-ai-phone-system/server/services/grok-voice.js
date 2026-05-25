@@ -734,6 +734,22 @@ ${callerLine}
         }
 
         case 'error':
+          // Suppress the harmless "Cancellation failed: no active
+          // response found" race. When a caller barges in IMMEDIATELY
+          // after response.created (before any audio is generated),
+          // Grok's own server-side VAD often terminates the response
+          // before our manual response.cancel arrives. Our state
+          // tracking (PR #66) already prevents most of these, but a
+          // race window exists between our response.created update
+          // and our cancel reaching Grok. It's not a real error — the
+          // call continues normally — but it's log noise.
+          if (event.error
+              && event.error.code === 'invalid_request_error'
+              && /Cancellation failed: no active response/i.test(event.error.message || '')) {
+            // Silently ignore. (Comment kept so future ops can grep
+            // for the message and find this rationale.)
+            break;
+          }
           console.error(`[tenant:${businessId}][${callSid}] Grok error:`, event.error);
           break;
       }

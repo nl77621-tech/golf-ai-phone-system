@@ -171,6 +171,34 @@ app.get('/health/deep', async (req, res) => {
   // if there are any soft issues, else ok.
   if (out.status !== 'alert' && issues.length > 0) out.status = 'warn';
 
+  // Optional SMS notification. When the caller passes &sms=<number>
+  // (the scheduled monitor does), text a concise summary to that
+  // number via the tenant's existing Twilio line. Fire-and-forget so
+  // a Twilio hiccup never fails the health response. business_id 1
+  // (Valleymede) owns the SMS line.
+  const smsTo = req.query.sms;
+  if (smsTo) {
+    const icon = out.status === 'ok' ? '✅' : out.status === 'warn' ? '⚠️' : '🚨';
+    const head = out.status === 'ok' ? 'Golf phone system OK'
+               : out.status === 'warn' ? 'Golf phone system WARNING'
+               : 'Golf phone system ALERT';
+    let body;
+    if (out.status === 'ok') {
+      const b = out.bookings24h || {};
+      body = `${icon} ${head} — ${b.synced ?? 0}/${b.confirmed ?? 0} bookings on Tee-On (24h), Tee-On reachable. All clear.`;
+    } else {
+      body = `${icon} ${head}:\n- ${issues.join('\n- ')}`;
+    }
+    body += `\n(${out.checkedAt})`;
+    try {
+      const { sendSMS } = require('./services/notification');
+      sendSMS(1, String(smsTo), body).catch(e => console.warn('[health/deep] SMS notify failed:', e.message));
+      out.smsSentTo = String(smsTo);
+    } catch (e) {
+      console.warn('[health/deep] SMS notify error:', e.message);
+    }
+  }
+
   res.json(out);
 });
 

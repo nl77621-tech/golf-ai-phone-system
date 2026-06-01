@@ -591,6 +591,14 @@ ${callerLine}
               || event.type === 'response.cancelled'
               || event.type === 'response.failed') {
         callState.responseActive = false;
+        // The FIRST response of every call is the greeting. Mark the
+        // greeting as delivered the moment it reaches a terminal state
+        // so the barge-in handler can stop protecting it. Until then,
+        // barge-in is suppressed (see speech_started handler) so a
+        // false VAD trigger at call-pickup can't cut off the greeting.
+        if (!callState.greetingComplete) {
+          callState.greetingComplete = true;
+        }
       }
 
       if (event.type === 'response.output_audio.delta') {
@@ -610,6 +618,24 @@ ${callerLine}
 
       switch (event.type) {
         case 'input_audio_buffer.speech_started':
+          // ─── GREETING GUARD ──────────────────────────────────────
+          // NEVER barge in over the greeting. Grok's VAD frequently
+          // fires a FALSE speech_started within the first ~700ms of a
+          // call — line noise, echo, or the caller's handset settling.
+          // If we honour that as a barge-in we cancel the greeting
+          // before the caller hears a single word: the call goes dead
+          // silent and the golfer hangs up + calls back.
+          //
+          // Real-call bug observed 2026-05/06: ~18% of calls had the
+          // greeting killed this way; the golf-course manager reported
+          // "the AI just stayed silent." Until the greeting has fully
+          // played (first response.done → greetingComplete=true), we
+          // ignore barge-in entirely — no cancel, no Twilio clear.
+          if (!callState.greetingComplete) {
+            console.log(`[tenant:${businessId}][${callSid}] speech_started during greeting — ignoring (greeting must play fully)`);
+            break;
+          }
+
           // Only send response.cancel when Grok actually has a response
           // in progress. Cancelling when nothing is active is rejected
           // with "Cancellation failed: no active response found" — noise,

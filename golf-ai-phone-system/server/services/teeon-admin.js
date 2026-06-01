@@ -874,6 +874,30 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
     const numCarts = Math.max(0, Number(booking.num_carts) || 0);
     const riderCount = Math.min(partySize, numCarts * 2);
 
+    // ─── Guest booker ID ───────────────────────────────────────────
+    //
+    // Tee-On identifies a booking group by a "booker ID" so staff can
+    // copy/move/cancel the whole booking as a unit. For a MEMBER the
+    // booker ID is their member id (e.g. COLU4130). For a non-member
+    // GUEST / phone booking, Tee-On's own UI generates the booker id
+    // on submit as "T" + the booker's phone digits — verified from
+    // Tee-On's getBookerId() JS:
+    //   bookerId = MemberID[booker]; if "" → bookerId = "T" + Phone.replace(/\D/g,'')
+    //
+    // We were sending MemberID and SlotBookerID empty, so guest
+    // bookings landed with NO booker id — orphaned slots that staff
+    // could NOT copy/move in Tee-On (manager report 2026-05). Setting
+    // the booker slot's MemberID + the whole party's SlotBookerID to
+    // this "T"+phone token mirrors exactly what staff get when they
+    // book a walk-in in Tee-On's UI, making the booking a movable,
+    // cancellable unit. Verified with a live test booking 2026-05-25:
+    // the slot gained booker id T#### and became movable.
+    //
+    // Falls back to empty (old behaviour) when there's no usable phone
+    // — a "T" with no digits is not a valid booker id.
+    const bookerDigits = String(payload.Phone0 || booking.customer_phone || '').replace(/\D/g, '');
+    const guestBookerId = bookerDigits ? `T${bookerDigits}` : '';
+
     // Write the caller's data into the first empty slot, then "Guest"
     // entries for the rest of their party. We never touch already-
     // occupied slots — those are someone else's booking and must be
@@ -890,10 +914,13 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
       // Cart fields are left untouched (they stay as parsed from the
       // live form).
       overrides[`Cart${slotIdx}`]       = (i < riderCount) ? 'Y' : 'N';
-      // MemberID + SlotBookerID stay blank for the new slot — that's how
-      // Tee-On represents a non-member walk-in / phone booking.
-      overrides[`MemberID${slotIdx}`]   = '';
-      overrides[`SlotBookerID${slotIdx}`] = '';
+      // Booker linkage. The BOOKER slot's MemberID = the "T"+phone
+      // guest token (mirrors Tee-On's getBookerId()); other party
+      // slots keep MemberID blank (they're guests, not the booker).
+      // EVERY slot in our party shares the booker's SlotBookerID so
+      // Tee-On groups them into one movable/cancellable booking.
+      overrides[`MemberID${slotIdx}`]   = isBooker ? guestBookerId : '';
+      overrides[`SlotBookerID${slotIdx}`] = guestBookerId;
     }
 
     const merged = { ...liveFields, ...overrides };

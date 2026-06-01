@@ -464,6 +464,16 @@ ${courseInfo?.signature_holes ? `- Signature holes: ${courseInfo.signature_holes
 - 9 Holes: $${pricing?.green_fees?.weekend_holiday?.['9_holes'] ?? ''}
 - Twilight: $${pricing?.green_fees?.weekend_holiday?.twilight ?? ''}
 
+### ⏰ TWILIGHT TIMING — WHEN THE TWILIGHT RATE STARTS
+${(() => {
+  const month = Number(new Date().toLocaleString('en-US', { timeZone: timezone, month: 'numeric' }));
+  const summer = month >= 5 && month <= 9; // May–September
+  const cut = summer ? '4 PM' : '3 PM';
+  return `- RIGHT NOW (${summer ? 'May–September season' : 'October–April season'}), twilight pricing starts at **${cut}**. Any tee time BEFORE ${cut} is the regular daytime rate, NOT twilight.
+- Full schedule: May through September → twilight after 4 PM. From October 1 → twilight after 3 PM.
+- ⚠️ Do NOT assume twilight starts at 3 PM. In summer a 3 PM tee time is a REGULAR daytime rate. Only quote the twilight rate for times at or after ${cut} today. A real complaint came in when the AI called a 3 PM summer slot "twilight" — never do that.`;
+})()}
+
 ### Cart Fees:
 - Power Cart (18 holes): $${pricing?.rentals?.power_cart_18 ?? ''}
 - Power Cart (9 holes): $${pricing?.rentals?.power_cart_9 ?? ''}

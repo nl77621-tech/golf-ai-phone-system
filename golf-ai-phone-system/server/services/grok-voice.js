@@ -1446,12 +1446,16 @@ async function executeToolCall(toolName, args, ctx) {
               const earlyPM = afternoon18Fits.slice(0, 6);
               message += `\nAfternoon 18-hole: ${earlyPM.map(s => s.time).join(', ')}`;
               if (afternoon18Fits.length > 6) message += ` and ${afternoon18Fits.length - 6} more`;
-              const latePM = afternoon18Fits.filter(s => {
-                const h = parseInt(s.time.split(':')[0]);
-                return s.time.includes('PM') && h >= 3 && h < 6;
-              });
+              // Twilight starts at 4 PM May–September, 3 PM from Oct 1
+              // (Valleymede policy). Was hardcoded to 3 PM year-round,
+              // which mislabeled summer 3 PM slots as twilight (manager
+              // report). Compute the season-correct cutoff in 24h.
+              const twMonth = Number(new Date().toLocaleString('en-US', { timeZone: 'America/Toronto', month: 'numeric' }));
+              const twilightHour24 = (twMonth >= 5 && twMonth <= 9) ? 16 : 15;
+              const to24h = (t) => { const m = String(t).match(/(\d+):(\d+)\s*(AM|PM)/i); if (!m) return 0; let h = parseInt(m[1], 10); if (/PM/i.test(m[3]) && h !== 12) h += 12; if (/AM/i.test(m[3]) && h === 12) h = 0; return h; };
+              const latePM = afternoon18Fits.filter(s => { const h = to24h(s.time); return h >= twilightHour24 && h < 21; });
               if (latePM.length > 0 && latePM[0].price && latePM[0].price !== morning18Fits?.[0]?.price) {
-                message += ` (twilight rate ${latePM[0].price} starts around 3 PM)`;
+                message += ` (twilight rate ${latePM[0].price} starts at ${twilightHour24 === 16 ? '4 PM' : '3 PM'})`;
               }
             }
             if (morningBack9Fits.length > 0) {

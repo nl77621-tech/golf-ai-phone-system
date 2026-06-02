@@ -94,105 +94,19 @@ app.get('/health/deep', async (req, res) => {
     return res.status(401).json({ status: 'unauthorized' });
   }
 
-  const issues = [];
-  const out = {
-    status: 'ok',
-    checkedAt: new Date().toISOString(),
-    uptimeSeconds: Math.round(process.uptime()),
-    issues,
-  };
+  // Shared logic lives in services/health-monitor (also used by the
+  // in-app scheduler that texts the operator every few hours).
+  const healthMonitor = require('./services/health-monitor');
+  const out = await healthMonitor.runDeepHealthCheck();
 
-  // 1. DB reachable + booking pipeline (last 24h, platform-wide aggregates)
-  try {
-    const pipe = await pool.query(`
-      SELECT
-        COUNT(*) FILTER (WHERE status='confirmed') AS confirmed,
-        COUNT(*) FILTER (WHERE status='confirmed' AND teeon_synced_at IS NOT NULL) AS synced,
-        COUNT(*) FILTER (WHERE status='confirmed' AND teeon_synced_at IS NULL AND teeon_last_error IS NOT NULL) AS push_failed,
-        COUNT(*) FILTER (WHERE status='pending') AS pending,
-        COUNT(*) FILTER (WHERE status='rejected') AS rejected
-      FROM booking_requests
-      WHERE created_at > NOW() - INTERVAL '24 hours'`);
-    const p = pipe.rows[0];
-    out.bookings24h = {
-      confirmed: +p.confirmed, synced: +p.synced, pushFailed: +p.push_failed,
-      pending: +p.pending, rejected: +p.rejected,
-    };
-    out.dbReachable = true;
-    if (+p.push_failed > 0) issues.push(`${p.push_failed} confirmed booking(s) failed to push to Tee-On in the last 24h`);
-  } catch (err) {
-    out.dbReachable = false;
-    out.status = 'alert';
-    issues.push('Database unreachable: ' + err.message);
-  }
-
-  // 2. Pending staff queue (all-time)
-  if (out.dbReachable) {
-    try {
-      const pend = await pool.query(`
-        SELECT
-          (SELECT COUNT(*) FROM booking_requests WHERE status='pending') AS bookings,
-          (SELECT COUNT(*) FROM modification_requests WHERE status='pending') AS modifications`);
-      out.pendingQueue = { bookings: +pend.rows[0].bookings, modifications: +pend.rows[0].modifications };
-    } catch (err) {
-      issues.push('Pending-queue check failed: ' + err.message);
-    }
-
-    // 3. In-call duplicate booking rows (last 24h) — idempotency regression signal
-    try {
-      const dup = await pool.query(`
-        SELECT COUNT(*) AS groups FROM (
-          SELECT 1 FROM booking_requests
-          WHERE created_at > NOW() - INTERVAL '24 hours'
-          GROUP BY call_id, customer_name, requested_date, requested_time, party_size
-          HAVING COUNT(*) > 1
-        ) d`);
-      out.inCallDuplicates24h = +dup.rows[0].groups;
-      if (+dup.rows[0].groups > 0) issues.push(`${dup.rows[0].groups} in-call duplicate booking group(s) in the last 24h`);
-    } catch (err) {
-      issues.push('Duplicate check failed: ' + err.message);
-    }
-  }
-
-  // 4. Tee-On reachability (time-boxed; non-fatal). Confirms the warm
-  //    admin session can reach the live tee sheet.
-  try {
-    const teeonAdmin = require('./services/teeon-admin');
-    const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 12000));
-    const cookies = await Promise.race([teeonAdmin.ensureWarmAdminSession(1).catch(() => null), timeout]);
-    out.teeonReachable = !!cookies;
-    if (!cookies) { out.status = 'alert'; issues.push('Tee-On admin session could not be established'); }
-  } catch (err) {
-    out.teeonReachable = false;
-    issues.push('Tee-On check error: ' + err.message);
-  }
-
-  // Roll up status: alert already set on hard failures; otherwise warn
-  // if there are any soft issues, else ok.
-  if (out.status !== 'alert' && issues.length > 0) out.status = 'warn';
-
-  // Optional SMS notification. When the caller passes &sms=<number>
-  // (the scheduled monitor does), text a concise summary to that
-  // number via the tenant's existing Twilio line. Fire-and-forget so
-  // a Twilio hiccup never fails the health response. business_id 1
-  // (Valleymede) owns the SMS line.
+  // Optional SMS — when called with &sms=<number>, fire-and-forget a
+  // text via the tenant's Twilio line. (The in-app scheduler texts on
+  // its own; this param is for ad-hoc / external pings.)
   const smsTo = req.query.sms;
   if (smsTo) {
-    const icon = out.status === 'ok' ? '✅' : out.status === 'warn' ? '⚠️' : '🚨';
-    const head = out.status === 'ok' ? 'Golf phone system OK'
-               : out.status === 'warn' ? 'Golf phone system WARNING'
-               : 'Golf phone system ALERT';
-    let body;
-    if (out.status === 'ok') {
-      const b = out.bookings24h || {};
-      body = `${icon} ${head} — ${b.synced ?? 0}/${b.confirmed ?? 0} bookings on Tee-On (24h), Tee-On reachable. All clear.`;
-    } else {
-      body = `${icon} ${head}:\n- ${issues.join('\n- ')}`;
-    }
-    body += `\n(${out.checkedAt})`;
     try {
       const { sendSMS } = require('./services/notification');
-      sendSMS(1, String(smsTo), body).catch(e => console.warn('[health/deep] SMS notify failed:', e.message));
+      sendSMS(1, String(smsTo), healthMonitor.formatHealthSms(out)).catch(e => console.warn('[health/deep] SMS notify failed:', e.message));
       out.smsSentTo = String(smsTo);
     } catch (e) {
       console.warn('[health/deep] SMS notify error:', e.message);
@@ -467,6 +381,12 @@ async function startServer() {
     // Start the day-before reminder scheduler
     const { startReminderScheduler } = require('./services/scheduled-tasks');
     startReminderScheduler();
+
+    // Start the in-app health monitor — texts the operator a system
+    // health summary at 6/9/12/3/6/9 (local). Runs inside the app so
+    // delivery is guaranteed (no external/remote agent dependency).
+    const { startHealthScheduler } = require('./services/health-monitor');
+    startHealthScheduler();
   });
 }
 

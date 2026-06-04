@@ -478,6 +478,30 @@ ${callerLine}
     }
   };
 
+  // Hard call-duration cap (cost / denial-of-wallet protection). A call
+  // left open — pocket-dial, caller walked away, or deliberate abuse —
+  // otherwise streams realtime voice + Twilio minutes with no upper
+  // bound. We replace the live <Stream> with a short spoken goodbye +
+  // <Hangup/> once the call hits the cap. Reuses failoverFired so only
+  // one terminal TwiML is ever sent for a given call.
+  const endCallForTimeLimit = async () => {
+    if (failoverFired) return;
+    failoverFired = true;
+    try {
+      const client = getTwilioClient();
+      if (!client || !callSid) {
+        if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
+        return;
+      }
+      const twiml = `<Response><Say voice="alice">Thanks so much for calling. I have to wrap things up here, but please call us back anytime and we'll be glad to help. Goodbye!</Say><Hangup/></Response>`;
+      await client.calls(callSid).update({ twiml });
+      console.log(`[tenant:${businessId}][${callSid}] ⏰ Max-duration reached — goodbye TwiML sent, call ending`);
+    } catch (err) {
+      console.error(`[tenant:${businessId}][${callSid}] Max-duration hangup failed, force-closing:`, err.message);
+      try { if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close(); } catch (_) {}
+    }
+  };
+
   const grokConnectTimeout = setTimeout(() => {
     if (grokWs.readyState !== WebSocket.OPEN) {
       console.error(`[tenant:${businessId}][${callSid}] Grok connection timeout — playing failover message`);
@@ -504,6 +528,8 @@ ${callerLine}
   };
 
   let keepAlive = null;
+  let callWarnTimer = null;
+  let callMaxTimer = null;
 
   grokWs.on('open', () => {
     console.log(`[tenant:${businessId}][${callSid}] Connected to Grok`);
@@ -512,6 +538,45 @@ ${callerLine}
     keepAlive = setInterval(() => {
       if (grokWs.readyState === WebSocket.OPEN) grokWs.ping();
     }, 25000);
+
+    // ─── Max call-duration guard ──────────────────────────────────────
+    // WARN: a friendly spoken heads-up ~1 min before the cap so a real
+    // caller can finish (or call back) instead of being cut off mid-
+    // sentence. MAX: hard hangup. Longest legitimate booking call seen in
+    // production is ~5 min — both values are one-line constants, tune
+    // freely. Timers are cleared on every call-end path below, so a
+    // normal short call never touches this logic.
+    const MAX_CALL_MS = 5 * 60 * 1000;
+    const WARN_CALL_MS = 4 * 60 * 1000;
+
+    callWarnTimer = setTimeout(() => {
+      if (!conversationActive || grokWs.readyState !== WebSocket.OPEN) return;
+      console.log(`[tenant:${businessId}][${callSid}] ⏰ ${Math.round(WARN_CALL_MS / 1000)}s elapsed — sending wrap-up heads-up`);
+      try {
+        grokWs.send(JSON.stringify({
+          type: 'conversation.item.create',
+          item: {
+            type: 'message',
+            role: 'user',
+            content: [{
+              type: 'input_text',
+              text: '[System: The call is approaching its time limit. In ONE short, warm sentence, tell the caller you need to wrap up in about a minute and ask if there is anything quick you can finish for them. If they are mid-booking, complete it now. Do NOT mention time limits, systems, or settings.]'
+            }]
+          }
+        }));
+        grokWs.send(JSON.stringify({ type: 'response.create' }));
+      } catch (e) {
+        console.warn(`[tenant:${businessId}][${callSid}] wrap-up heads-up failed: ${e.message}`);
+      }
+    }, WARN_CALL_MS);
+
+    callMaxTimer = setTimeout(() => {
+      console.warn(`[tenant:${businessId}][${callSid}] ⏰ Hard call cap (${Math.round(MAX_CALL_MS / 1000)}s) reached — ending call`);
+      conversationActive = false;
+      endCallForTimeLimit().finally(() => {
+        try { if (grokWs.readyState === WebSocket.OPEN) grokWs.close(); } catch (_) {}
+      });
+    }, MAX_CALL_MS);
 
     grokWs.send(JSON.stringify({
       type: 'session.update',
@@ -787,6 +852,8 @@ ${callerLine}
   grokWs.on('close', () => {
     console.log(`[tenant:${businessId}][${callSid}] Grok connection closed`);
     clearInterval(keepAlive);
+    clearTimeout(callWarnTimer);
+    clearTimeout(callMaxTimer);
     if (conversationActive) {
       console.warn(`[tenant:${businessId}][${callSid}] Grok disconnected unexpectedly while call was active — playing failover message`);
       conversationActive = false;
@@ -844,6 +911,8 @@ ${callerLine}
   twilioWs.on('close', async () => {
     console.log(`[tenant:${businessId}][${callSid}] Call ended`);
     conversationActive = false;
+    clearTimeout(callWarnTimer);
+    clearTimeout(callMaxTimer);
 
     if (grokWs.readyState === WebSocket.OPEN) {
       grokWs.close();

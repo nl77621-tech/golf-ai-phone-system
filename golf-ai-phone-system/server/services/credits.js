@@ -109,6 +109,7 @@ async function getBalance(businessId) {
     in_trial: row.trial_granted_at != null,
     trial_active: trialActive,
     is_legacy: row.plan === 'legacy',
+    is_unlimited: row.plan === 'unlimited',
     updated_at: new Date()
   };
 }
@@ -415,6 +416,14 @@ async function canAcceptCall(businessId) {
     const snap = await getBalance(businessId);
     if (snap.is_legacy) {
       return { allowed: true, reason: 'legacy', seconds_remaining: snap.seconds_remaining };
+    }
+    if (snap.is_unlimited) {
+      // 'unlimited' plan: same credit-gate bypass as legacy, but WITHOUT
+      // the golf-UI lock. The sidebar/page routing (sidebarItemsFor /
+      // tenantPagesFor) keys off plan==='legacy' ONLY, so an unlimited
+      // tenant keeps its real template UI (business / restaurant / etc.).
+      // For operator-owned non-golf lines that should never lapse.
+      return { allowed: true, reason: 'unlimited', seconds_remaining: snap.seconds_remaining };
     }
     if (snap.trial_active) {
       return {

@@ -3383,10 +3383,10 @@ function CreditsPanel({ businessId }) {
 
   // Legacy tenants don't go through the credit gate, so the controls
   // are useless. Show a clear note instead of a broken form.
-  if (snap?.plan === 'legacy') {
+  if (snap?.plan === 'legacy' || snap?.plan === 'unlimited') {
     return React.createElement('div', { className: 'text-sm text-gray-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2' },
-      React.createElement('strong', null, 'Plan: legacy. '),
-      'This tenant bypasses the credit gate (every call is allowed regardless of balance). Granting credits has no effect.'
+      React.createElement('strong', null, `Plan: ${snap.plan}. `),
+      'This line bypasses the credit gate — every call is allowed regardless of balance, so it never runs out. (Granting credits has no effect while on this plan.)'
     );
   }
 
@@ -4130,7 +4130,11 @@ function EditTenantModal({ business, onClose, onSaved }) {
                 // pages to render for them and locked the Delete button.
                 selectField('Plan', form.plan, v => set('plan', v), [
                   ['free', 'free'], ['starter', 'starter'], ['growth', 'growth'],
-                  ['pro', 'pro'], ['trial', 'trial']
+                  ['pro', 'pro'], ['trial', 'trial'],
+                  // 'unlimited' — bypasses the credit gate (line never runs
+                  // out of minutes) WITHOUT the golf-UI lock that 'legacy'
+                  // carries. Safe to set on any non-golf tenant.
+                  ['unlimited', 'unlimited (never runs out)']
                 ])
               )
             ),

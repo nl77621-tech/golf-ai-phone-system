@@ -546,8 +546,8 @@ ${callerLine}
     // production is ~5 min — both values are one-line constants, tune
     // freely. Timers are cleared on every call-end path below, so a
     // normal short call never touches this logic.
-    const MAX_CALL_MS = 5 * 60 * 1000;
-    const WARN_CALL_MS = 4 * 60 * 1000;
+    const MAX_CALL_MS = 7 * 60 * 1000;
+    const WARN_CALL_MS = 6 * 60 * 1000;
 
     callWarnTimer = setTimeout(() => {
       if (!conversationActive || grokWs.readyState !== WebSocket.OPEN) return;

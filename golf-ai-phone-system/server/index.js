@@ -395,6 +395,40 @@ startServer().catch(err => {
   process.exit(1);
 });
 
+// ─── Crash protection ────────────────────────────────────────────────
+//
+// Without these handlers, Node's default behaviour kills the WHOLE
+// process — every live call on every tenant — the moment any code path
+// throws where nothing catches it. With Railway's ON_FAILURE restart
+// capped at 5 retries, a repeating error doesn't just blip the line,
+// it can leave it dead until a human notices. These two handlers are
+// the difference between "one background job logged an error" and
+// "the phone system went down and nobody knows why".
+//
+// unhandledRejection — a promise rejected with no .catch(). Since Node
+// 15 the default is to CRASH. For this app that trade is wrong: a Tee-On
+// fetch, reminder job, or SMS send hitting a network blip must never
+// drop live calls. Log loudly and keep serving; anything persistent
+// shows up in the health monitor's texts and the deep health check.
+process.on('unhandledRejection', (reason) => {
+  const detail = reason instanceof Error ? (reason.stack || reason.message) : JSON.stringify(reason);
+  console.error('🚨 [CRASH-GUARD] Unhandled promise rejection (process kept alive):', detail);
+});
+
+// uncaughtException — a synchronous throw escaped everything. Process
+// state can no longer be trusted, so the correct move is the opposite:
+// log WHY (which silent crashes never gave us), then exit non-zero so
+// Railway restarts us clean in seconds. The short timer lets the error
+// line flush to the log pipe before we die; the flag stops a second
+// exception during that window from stacking exit timers.
+let crashExitPending = false;
+process.on('uncaughtException', (err, origin) => {
+  console.error(`🚨 [CRASH-GUARD] Uncaught exception (${origin}) — restarting:`, err && (err.stack || err.message));
+  if (crashExitPending) return;
+  crashExitPending = true;
+  setTimeout(() => process.exit(1), 200);
+});
+
 // Graceful shutdown
 function gracefulShutdown(signal) {
   console.log(`${signal} received. Shutting down gracefully...`);

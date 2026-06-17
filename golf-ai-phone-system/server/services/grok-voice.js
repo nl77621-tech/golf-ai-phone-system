@@ -242,6 +242,30 @@ async function getTeeOnConfigForBusiness(businessId) {
  * @param {string}    streamSid
  * @param {string}    appUrl
  */
+// ─── Advance-booking window ───────────────────────────────────────────
+// Courses cap how far ahead they take bookings (Valleymede: 14 days).
+// `booking_settings.max_advance_days` holds the per-tenant cap; unset or
+// <= 0 means NO cap, so other tenants are unaffected. Returns
+// { exceeded, maxDays, ahead } — `exceeded` is true when the requested
+// date is further out than the cap. Fails OPEN (exceeded:false) on any
+// error so a settings hiccup never blocks a legitimate near-term booking.
+// Reported 2026-06-17: the AI was taking bookings more than 14 days out.
+async function checkBookingWindow(businessId, dateStr) {
+  try {
+    const bs = await getSetting(businessId, 'booking_settings').catch(() => null);
+    const maxDays = bs && Number(bs.max_advance_days) > 0 ? Number(bs.max_advance_days) : null;
+    if (!maxDays || !dateStr) return { exceeded: false, maxDays };
+    const tz = (await getBusinessById(businessId).catch(() => null))?.timezone || 'America/Toronto';
+    const [ty, tm, td] = new Date().toLocaleDateString('en-CA', { timeZone: tz }).split('-').map(Number);
+    const [ry, rm, rd] = String(dateStr).split('T')[0].split('-').map(Number);
+    if (!ry || !rm || !rd) return { exceeded: false, maxDays };
+    const ahead = Math.round((Date.UTC(ry, rm - 1, rd) - Date.UTC(ty, tm - 1, td)) / 86400000);
+    return { exceeded: ahead > maxDays, maxDays, ahead };
+  } catch (e) {
+    return { exceeded: false };
+  }
+}
+
 async function handleMediaStream(twilioWs, businessId, callerPhone, callSid, streamSid, appUrl) {
   requireBusinessId(businessId, 'handleMediaStream');
   console.log(`[tenant:${businessId}][${callSid}] New call from ${callerPhone}`);
@@ -1308,6 +1332,20 @@ async function executeToolCall(toolName, args, ctx) {
             }
           }
 
+          // ─── Advance-booking window guard ─────────────────────────
+          // Refuse dates beyond the tenant's booking window (e.g. 14 days)
+          // BEFORE hitting Tee-On, so the AI never offers or "requests" a
+          // far-out slot. The message tells the AI exactly what to say.
+          const ctWin = await checkBookingWindow(businessId, args.date);
+          if (ctWin.exceeded) {
+            console.log(`[tenant:${businessId}][${callLogId}] check_tee_times REFUSED — ${args.date} is ${ctWin.ahead}d out (cap ${ctWin.maxDays}d)`);
+            return {
+              beyond_booking_window: true,
+              max_advance_days: ctWin.maxDays,
+              message: `That date is beyond our booking window — we only take tee times up to ${ctWin.maxDays} days in advance, and the caller asked for a date further out than that. Tell them plainly: "We only book up to ${ctWin.maxDays} days ahead, so I can't book that date yet — the furthest I can go right now is ${ctWin.maxDays} days out. Want me to check a date within that window?" Do NOT take a booking request for the far-out date, and do NOT say staff will confirm it later.`
+            };
+          }
+
           const teeOnCfg = await getTeeOnConfigForBusiness(businessId);
           console.log(`[tenant:${businessId}][${callLogId}] check_tee_times | date: ${args.date} | party_size: ${partySize} | raw args:`, JSON.stringify(args));
           let allSlots = await teeon.checkAvailability(args.date, partySize, teeOnCfg);
@@ -1701,6 +1739,20 @@ If you are about to say a time and it does NOT appear above, STOP. Either re-cal
         if (!args.party_size || args.party_size < 1 || args.party_size > 8) {
           console.warn(`[tenant:${businessId}][${callLogId}] ⚠️ book_tee_time called with invalid party_size:`, args.party_size);
           return { success: false, message: 'How many players will be in your group?' };
+        }
+
+        // Advance-booking window backstop — catches the case where the AI
+        // skipped check_tee_times and tried to book a far-out date directly.
+        {
+          const bkWin = await checkBookingWindow(businessId, args.date);
+          if (bkWin.exceeded) {
+            console.warn(`[tenant:${businessId}][${callLogId}] ⚠️ book_tee_time REFUSED — ${args.date} is ${bkWin.ahead}d out (cap ${bkWin.maxDays}d)`);
+            return {
+              success: false,
+              error: 'beyond_booking_window',
+              message: `I can't book that — it's beyond our ${bkWin.maxDays}-day booking window. Tell the caller we only book up to ${bkWin.maxDays} days in advance and offer to find a date within that window. Do NOT submit this as a request.`
+            };
+          }
         }
 
         // ⚠️ ANTI-HALLUCINATION GUARD ⚠️

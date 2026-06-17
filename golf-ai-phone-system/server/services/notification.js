@@ -301,11 +301,18 @@ function formatShortDateTime(dateStr, timeStr, timezone = 'America/Toronto') {
     }
 
     const d = new Date(Date.UTC(year, month - 1, day));
+    // requested_date is a pure CALENDAR date (no meaningful time-of-day) that
+    // we built at midnight UTC above. Format it in UTC too — NOT the tenant tz.
+    // Formatting midnight-UTC in America/Toronto (UTC-4/-5) rolls the clock
+    // back into the previous evening, so "2026-06-18" printed as "Wed, Jun 17".
+    // Real bug reported 2026-06-17: every confirmation SMS showed the day BEFORE
+    // the actual tee time. The HH:MM time below is parsed verbatim and is
+    // unaffected by this.
     const dayPart = d.toLocaleDateString('en-US', {
       weekday: 'short',
       month: 'short',
       day: 'numeric',
-      timeZone: timezone
+      timeZone: 'UTC'
     });
 
     if (!timeStr) return dayPart;

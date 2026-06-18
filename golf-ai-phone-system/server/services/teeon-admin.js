@@ -651,6 +651,24 @@ async function recordSyncError(businessId, bookingRequestId, error) {
  * 'confirmed' transition. (If ok=false and not dry-run, the caller should
  * keep the booking pending.)
  */
+// A 9-hole booking is played on the FRONT nine (start hole 1) when its
+// tee time falls in an evening/afternoon "twilight" 9-hole window — at
+// that hour the back nine is full of 18-hole groups finishing, so the
+// course only opens the front for twilight 9s. Detected from
+// nine_hole_windows (an entry whose `from` is midday+). Morning 9-hole
+// stays on the back nine. `hhmm` is 24h "HH:mm". Course report 2026-06-17.
+async function isTwilightFrontNine(businessId, hhmm) {
+  try {
+    const nhw = await getSetting(businessId, 'nine_hole_windows').catch(() => null);
+    if (!Array.isArray(nhw) || !/^\d{1,2}:\d{2}$/.test(String(hhmm || ''))) return false;
+    const t = String(hhmm).padStart(5, '0');
+    return nhw.some(w => typeof w?.from === 'string' && typeof w?.to === 'string'
+      && w.from >= '12:00' && t >= w.from && t <= w.to);
+  } catch (e) {
+    return false;
+  }
+}
+
 async function createBooking(businessId, bookingRequestId, { dateOverride, nine } = {}) {
   if (!(await isEnabledForBusiness(businessId))) {
     return { ok: true, skipped: true, reason: 'flag-off' };
@@ -688,13 +706,23 @@ async function createBooking(businessId, bookingRequestId, { dateOverride, nine 
     return { ok: false, error: err.message };
   }
 
-  // Route 9-hole bookings to the Back nine, 18-hole to the Front. Tee-On
-  // models the two nines as separate columns (NineCode=F vs B) and the
-  // booking POST must target the right one. Without this, every 9-hole
-  // call hit Front 9 (which at peak times is full of 18-hole groups),
-  // Tee-On rejected silently, and our extractor matched an existing
-  // group's BookerID — false-positive success.
-  const resolvedNine = nine || (Number(booking.holes) === 9 ? 'B' : 'F');
+  // Route 9-hole bookings to the correct nine. Tee-On models the two
+  // nines as separate columns (NineCode=F vs B) and the booking POST must
+  // target the right one. MORNING 9-hole = Back nine (start hole 10) —
+  // without this, every 9-hole call hit Front 9 (full of 18-hole groups
+  // at peak), Tee-On rejected silently, and our extractor matched an
+  // existing group's BookerID (false-positive success). EVENING twilight
+  // 9-hole is the reverse: the back nine is full of finishing 18-hole
+  // groups, so twilight 9s are played on the FRONT nine — route those to
+  // 'F'. Decided from the tee time vs nine_hole_windows. Course 2026-06-17.
+  let resolvedNine = nine;
+  if (!resolvedNine) {
+    if (Number(booking.holes) === 9) {
+      resolvedNine = (await isTwilightFrontNine(businessId, time)) ? 'F' : 'B';
+    } else {
+      resolvedNine = 'F';
+    }
+  }
 
   const payload = buildBookingPayload({
     cfg,

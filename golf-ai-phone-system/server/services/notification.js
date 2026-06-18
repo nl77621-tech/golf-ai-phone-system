@@ -290,10 +290,23 @@ function formatShortDateTime(dateStr, timeStr, timezone = 'America/Toronto') {
   try {
     if (!dateStr) return timeStr || '';
 
-    // Extract just the date part if it has extra junk (YYYY-MM-DD format)
-    let cleanDate = String(dateStr);
-    if (cleanDate.includes('T')) cleanDate = cleanDate.split('T')[0];
-    if (cleanDate.includes(' ')) cleanDate = cleanDate.split(' ')[0];
+    // Normalize to YYYY-MM-DD regardless of input type. pg returns a DATE
+    // column as a JS Date OBJECT (midnight UTC), NOT a string. The old
+    // `String(dateStr)` path mangled that: Date.toString() is
+    // "Thu Jun 18 2026 ..." and on the UTC production server the leading
+    // "T" of "Thu"/"Tue" made split('T')[0] empty — so customer texts for
+    // Thursday/Tuesday bookings showed ONLY the time ("CONFIRMED for
+    // 17:02:00", no date). Reported 2026-06-17. Handle Date objects
+    // explicitly (toISOString is always UTC); strip any T/space suffix
+    // from a string.
+    let cleanDate;
+    if (dateStr instanceof Date && !isNaN(dateStr.getTime())) {
+      cleanDate = dateStr.toISOString().slice(0, 10);
+    } else {
+      cleanDate = String(dateStr).trim();
+      if (cleanDate.includes('T')) cleanDate = cleanDate.split('T')[0];
+      if (cleanDate.includes(' ')) cleanDate = cleanDate.split(' ')[0];
+    }
 
     const [year, month, day] = cleanDate.split('-').map(Number);
     if (!year || !month || !day) {
@@ -329,7 +342,16 @@ function formatShortDateTime(dateStr, timeStr, timezone = 'America/Toronto') {
     return `${dayPart} at ${hr12}:${mm} ${ampm}`;
   } catch (err) {
     console.error('formatShortDateTime error:', err.message, { dateStr, timeStr });
-    return `${String(dateStr).split('T')[0]} ${timeStr || ''}`.trim();
+    // Best-effort fallback that also tolerates Date objects (String(Date)
+    // is not YYYY-MM-DD and split('T') would blank it on a UTC server).
+    try {
+      const ds = dateStr instanceof Date
+        ? dateStr.toISOString().slice(0, 10)
+        : String(dateStr || '').split('T')[0].split(' ')[0];
+      return `${ds} ${timeStr || ''}`.trim();
+    } catch (_) {
+      return String(timeStr || '').trim();
+    }
   }
 }
 

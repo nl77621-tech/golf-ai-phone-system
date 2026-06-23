@@ -454,24 +454,40 @@ ${courseInfo?.directions ? `- Directions: ${courseInfo.directions}` : ''}
 ${courseInfo?.signature_holes ? `- Signature holes: ${courseInfo.signature_holes.map(h => `Hole ${h.hole}: ${h.description}`).join('; ')}` : ''}
 
 ## GREEN FEES & PRICING
-### Monday - Thursday:
-- 18 Holes: $${pricing?.green_fees?.weekday?.['18_holes'] ?? ''}
-- 9 Holes: $${pricing?.green_fees?.weekday?.['9_holes'] ?? ''}
-- Twilight: $${pricing?.green_fees?.weekday?.twilight ?? ''}
-
-### Friday - Sunday & Holidays:
-- 18 Holes: $${pricing?.green_fees?.weekend_holiday?.['18_holes'] ?? ''}
-- 9 Holes: $${pricing?.green_fees?.weekend_holiday?.['9_holes'] ?? ''}
-- Twilight: $${pricing?.green_fees?.weekend_holiday?.twilight ?? ''}
-
-### ⏰ TWILIGHT TIMING — WHEN THE TWILIGHT RATE STARTS
 ${(() => {
+  const wd = (pricing && pricing.green_fees && pricing.green_fees.weekday) || {};
+  const we = (pricing && pricing.green_fees && pricing.green_fees.weekend_holiday) || {};
   const month = Number(new Date().toLocaleString('en-US', { timeZone: timezone, month: 'numeric' }));
   const summer = month >= 5 && month <= 9; // May–September
-  const cut = summer ? '4 PM' : '3 PM';
-  return `- RIGHT NOW (${summer ? 'May–September season' : 'October–April season'}), twilight pricing starts at **${cut}**. Any tee time BEFORE ${cut} is the regular daytime rate, NOT twilight.
-- Full schedule: May through September → twilight after 4 PM. From October 1 → twilight after 3 PM.
-- ⚠️ Do NOT assume twilight starts at 3 PM. In summer a 3 PM tee time is a REGULAR daytime rate. Only quote the twilight rate for times at or after ${cut} today. A real complaint came in when the AI called a 3 PM summer slot "twilight" — never do that.`;
+  const twi = summer ? '4 PM' : '3 PM';           // twilight start (seasonal)
+  const preEnd = summer ? '3:59 PM' : '2:59 PM';  // pre-twilight ends right before twilight
+  const px = (v) => (v || v === 0) ? `$${v}` : 'n/a';
+  return `ALL PRICES BELOW ARE TAX INCLUDED — quote them directly (e.g. "that's $50, tax included"). NEVER add "plus tax" or "plus HST" on top.
+
+### Weekday rates (Monday–Thursday)
+18 holes:
+- Regular (before 2 PM): ${px(wd['18_regular'])}
+- Pre-twilight (2:00 PM–${preEnd}): ${px(wd['18_pretwilight'])}
+- Twilight (${twi}–close): ${px(wd['18_twilight'])}
+9 holes (sold early-morning OR twilight only):
+- Morning (first hour of the day): ${px(wd['9_morning'])}
+- Twilight (${twi}+): ${px(wd['9_twilight'])}
+
+### Weekend rates (Friday, Saturday, Sunday & Ontario holidays / long weekends)
+18 holes:
+- Daytime (before ${twi}): ${px(we['18_daytime'])}
+- Twilight (${twi}–close): ${px(we['18_twilight'])}
+9 holes (sold early-morning OR twilight only):
+- Morning (first hour of the day): ${px(we['9_morning'])}
+- Twilight (${twi}+): ${px(we['9_twilight'])}
+
+### ⚠️ HOW TO QUOTE THE RIGHT PRICE
+- Pick the rate by DAY TYPE and TIME OF DAY. Monday–Thursday = weekday rates; Friday, Saturday, Sunday, and holidays / long weekends = weekend rates.
+- Twilight starts at ${twi} right now (${summer ? 'May–September' : 'October–April'} season). Anything BEFORE ${twi} is NEVER twilight. (A real complaint came in when the AI called a 3 PM summer slot "twilight" — never do that.)
+- WEEKDAYS have a pre-twilight step: 2:00 PM–${preEnd} is the pre-twilight rate — NOT regular, NOT twilight. So a weekday 3:58 PM 18-hole round is PRE-TWILIGHT.
+- WEEKENDS have NO pre-twilight tier — it's the daytime rate right up until ${twi}, then twilight.
+- 9-hole is only sold early morning (first hour of the day) or at twilight — there is no mid-day 9-hole rate.
+- When a caller asks the price for a specific tee time: match the day + time to the rate above, say it as a tax-in price, then add the cart fee below if they want a cart.`;
 })()}
 
 ### Cart Fees:

@@ -28,6 +28,10 @@ function getTwilioClient() {
 }
 const { buildSystemPrompt } = require('./system-prompt');
 const { sendPostCallSummary, sendSMS, sendEmail } = require('./notification');
+// Real-time voice-failure alarm. We feed every call's Grok-connection
+// outcome here; a watcher texts the operator the moment failures spike
+// (e.g. xAI 429s when the credit balance runs low). See voice-health.js.
+const voiceHealth = require('./voice-health');
 const {
   lookupByPhone, lookupByName, registerCall, updateCustomer,
   lookupAdminByPhone, verifyAdminPin, markAdminPinSuccess,
@@ -484,6 +488,17 @@ ${callerLine}
   // which is a terrible caller experience for a service outage.
   // failoverFired prevents double-firing if multiple handlers run.
   let failoverFired = false;
+
+  // One-shot voice-health recorder. Each call yields exactly one outcome —
+  // `success` once the Grok session is confirmed, or `failure` on the first
+  // connect error / unexpected close / timeout — feeding the real-time spike
+  // alarm in services/voice-health.js. Best-effort; never affects the call.
+  let voiceOutcomeRecorded = false;
+  const recordVoiceOutcome = (outcome, meta) => {
+    if (voiceOutcomeRecorded) return;
+    voiceOutcomeRecorded = true;
+    try { voiceHealth.record({ businessId, callSid, outcome, ...(meta || {}) }); } catch (_) {}
+  };
   const playFailoverAndHangup = async (reason) => {
     if (failoverFired) return;
     failoverFired = true;
@@ -529,6 +544,7 @@ ${callerLine}
   const grokConnectTimeout = setTimeout(() => {
     if (grokWs.readyState !== WebSocket.OPEN) {
       console.error(`[tenant:${businessId}][${callSid}] Grok connection timeout — playing failover message`);
+      recordVoiceOutcome('failure', { reason: 'connect_timeout' });
       playFailoverAndHangup('connect_timeout').finally(() => {
         try { grokWs.close(); } catch (_) {}
         if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
@@ -701,6 +717,7 @@ ${callerLine}
       } else if (event.type === 'session.updated') {
         const s = event.session || {};
         console.log(`[tenant:${businessId}][${callSid}] Session confirmed - input_fmt: ${s.input_audio_format}, output_fmt: ${s.output_audio_format}, voice: ${s.voice}`);
+        recordVoiceOutcome('success');
       } else {
         console.log(`[tenant:${businessId}][${callSid}] Grok event: ${event.type}`, JSON.stringify(event).slice(0, 200));
       }
@@ -881,6 +898,7 @@ ${callerLine}
     if (conversationActive) {
       console.warn(`[tenant:${businessId}][${callSid}] Grok disconnected unexpectedly while call was active — playing failover message`);
       conversationActive = false;
+      recordVoiceOutcome('failure', { reason: 'grok_close' });
       // Fire-and-forget failover so the caller hears something instead
       // of dead air. We close the Twilio WS afterward so Twilio knows
       // we're done streaming audio; calls.update() supersedes our
@@ -895,6 +913,8 @@ ${callerLine}
 
   grokWs.on('error', (err) => {
     console.error(`[tenant:${businessId}][${callSid}] Grok WebSocket error:`, err.message);
+    const grokHttpMatch = /response:\s*(\d{3})/.exec(String((err && err.message) || ''));
+    recordVoiceOutcome('failure', { reason: 'grok_error', httpStatus: grokHttpMatch ? Number(grokHttpMatch[1]) : null });
     conversationActive = false;
     playFailoverAndHangup('grok_error').finally(() => {
       if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();

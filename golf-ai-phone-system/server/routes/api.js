@@ -1027,6 +1027,32 @@ router.get('/calls/:id', async (req, res) => {
   }
 });
 
+// POST /api/notify-admin — send an SMS alert to THIS tenant's admin phone.
+// Used by the external monitoring routine to escalate findings (dead calls /
+// no-answer spikes) to the operator as a text. Tenant-scoped: the number is
+// resolved from this business's admins, never taken from the request body.
+router.post('/notify-admin', async (req, res) => {
+  const businessId = tenantId(req);
+  const message = (req.body && req.body.message ? String(req.body.message) : '').trim();
+  if (!message) return res.status(400).json({ error: 'message required' });
+  try {
+    const r = await query(
+      `SELECT phone_number FROM business_admins
+        WHERE business_id = $1 AND phone_number IS NOT NULL
+        ORDER BY id LIMIT 1`,
+      [businessId]
+    );
+    const to = r.rows[0]?.phone_number || process.env.HEALTH_SMS_TO || null;
+    if (!to) return res.status(400).json({ error: 'no admin phone on file' });
+    const { sendSMS } = require('../services/notification');
+    await sendSMS(businessId, String(to), message.slice(0, 600));
+    res.json({ ok: true, sentTo: to });
+  } catch (err) {
+    console.error(`[tenant:${businessId}] notify-admin failed:`, err.message);
+    res.status(500).json({ error: 'send failed' });
+  }
+});
+
 // ============================================
 // GREETINGS
 // ============================================

@@ -98,6 +98,9 @@ app.get('/health/deep', async (req, res) => {
   // in-app scheduler that texts the operator every few hours).
   const healthMonitor = require('./services/health-monitor');
   const out = await healthMonitor.runDeepHealthCheck();
+  // Surface in-memory voice-path health (last 10 min) next to the
+  // booking/Tee-On checks so a remote monitor can see call connectivity too.
+  try { out.voiceLast10Min = require('./services/voice-health').statsWithin(10 * 60 * 1000); } catch (_) {}
 
   // Optional SMS — when called with &sms=<number>, fire-and-forget a
   // text via the tenant's Twilio line. (The in-app scheduler texts on
@@ -387,6 +390,11 @@ async function startServer() {
     // delivery is guaranteed (no external/remote agent dependency).
     const { startHealthScheduler } = require('./services/health-monitor');
     startHealthScheduler();
+
+    // Real-time voice-failure alarm — texts the operator within minutes if
+    // Grok connections start failing (e.g. xAI 429s when the balance is low).
+    const { startVoiceHealthWatcher } = require('./services/voice-health');
+    startVoiceHealthWatcher();
   });
 }
 

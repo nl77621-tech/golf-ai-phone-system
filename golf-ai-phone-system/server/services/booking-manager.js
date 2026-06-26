@@ -144,8 +144,8 @@ async function createModificationRequest({
   const res = await query(
     `INSERT INTO modification_requests
      (business_id, customer_id, customer_name, customer_phone, request_type,
-      original_date, original_time, new_date, new_time, details, call_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      original_date, original_time, new_date, new_time, details, call_id, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending')
      RETURNING *`,
     [businessId, customerId, customerName, customerPhone, requestType,
      originalDate, originalTime, newDate, newTime, details, callId]

@@ -1084,10 +1084,12 @@ function buildToolDefinitions() {
     {
       type: 'function',
       name: 'lookup_my_bookings',
-      description: 'Look up the caller\'s confirmed upcoming bookings. Call this when: (1) a caller wants to cancel or modify — read bookings back so they can pick which one, (2) a caller forgot their tee time or wants to know when they\'re booked — read their bookings back to them. Only returns confirmed upcoming bookings.',
+      description: 'Look up the caller\'s upcoming bookings — BOTH bookings made through this phone line AND bookings on the live pro-shop tee sheet (booked in person, by staff, or online). Call this when: (1) a caller wants to cancel or modify — read bookings back so they can pick which one, (2) a caller forgot their tee time or wants to know when they\'re booked. If the caller mentioned a specific day ("tomorrow", "next Wednesday"), pass it as `date` — that makes the tee-sheet check faster and more reliable.',
       parameters: {
         type: 'object',
-        properties: {},
+        properties: {
+          date: { type: 'string', description: 'Optional YYYY-MM-DD. The specific day the caller asked about, if they mentioned one. Omit to scan the next several days.' }
+        },
         required: []
       }
     },
@@ -1940,34 +1942,91 @@ If you are about to say a time and it does NOT appear above, STOP. Either re-cal
           return { found: false, message: 'I don\'t have your phone number on file, so I can\'t look up your bookings. Can you give me the name or date of your booking?' };
         }
         const bookings = await getConfirmedBookingsByPhone(businessId, phone);
-        console.log(`[tenant:${businessId}][${callLogId}] lookup_my_bookings for ${phone}: ${bookings.length} confirmed bookings`);
 
-        if (bookings.length === 0) {
-          return { found: false, count: 0, message: 'No confirmed upcoming bookings found for this phone number. If they believe they have a booking, take their details and create a cancellation/modification request for staff.' };
+        // ── Live tee-sheet search ──────────────────────────────────────
+        // Phone-line bookings are only part of the story: pro-shop /
+        // online bookings never enter booking_requests, and staff can
+        // hard-delete rows from the Command Center (observed 2026-07-10 —
+        // callers were told "no bookings" for tee times that exist on the
+        // sheet). Scan the authenticated tee sheet too: caller-named a
+        // day → just that day; otherwise today + next 4 days. Failures
+        // fall back to phone-line-only results — never break the call.
+        let sheet = { checked: false, scannedDates: [], matches: [] };
+        try {
+          const teeonAdmin = require('./teeon-admin');
+          const tz = (await getBusinessById(businessId).catch(() => null))?.timezone || 'America/Toronto';
+          let dates;
+          if (args.date && /^\d{4}-\d{2}-\d{2}$/.test(args.date)) {
+            dates = [args.date];
+          } else {
+            dates = Array.from({ length: 5 }, (_, i) =>
+              new Date(Date.now() + i * 86400e3).toLocaleDateString('en-CA', { timeZone: tz }));
+          }
+          sheet = await teeonAdmin.findCallerBookingsOnSheet(businessId, {
+            phone,
+            name: callerContext.name,
+            dates,
+            deadlineMs: 8000
+          });
+        } catch (err) {
+          console.warn(`[tenant:${businessId}][${callLogId}] tee-sheet lookup failed (using phone-line results only):`, err.message);
         }
 
-        const formatted = bookings.map(b => {
-          const date = new Date(b.requested_date);
-          const dayName = date.toLocaleDateString('en-US', { weekday: 'long' });
-          const monthDay = date.toLocaleDateString('en-US', { month: 'long', day: 'numeric' });
-          const time = b.requested_time || 'no specific time';
-          return {
-            booking_id: b.id,
-            date: b.requested_date,
-            display_date: `${dayName}, ${monthDay}`,
-            time: time,
-            party_size: b.party_size,
-            name: b.customer_name
-          };
-        });
+        // Merge: drop sheet hits that duplicate a phone-line booking
+        // (same date + same HH:mm), then present both kinds.
+        const dbKey = b => `${String(b.requested_date instanceof Date ? b.requested_date.toISOString().slice(0, 10) : b.requested_date).slice(0, 10)}|${String(b.requested_time || '').slice(0, 5)}`;
+        const dbKeys = new Set(bookings.map(dbKey));
+        const sheetOnly = (sheet.matches || []).filter(m => !dbKeys.has(`${m.date}|${m.time24}`));
 
-        let message = `Found ${bookings.length} confirmed upcoming booking${bookings.length > 1 ? 's' : ''}:\n`;
+        console.log(`[tenant:${businessId}][${callLogId}] lookup_my_bookings for ${phone}: ${bookings.length} phone-line + ${sheetOnly.length} sheet-only (sheetChecked=${sheet.checked})`);
+
+        const fmtDate = (isoDate) => {
+          const d = new Date(`${String(isoDate).slice(0, 10)}T12:00:00`);
+          return `${d.toLocaleDateString('en-US', { weekday: 'long' })}, ${d.toLocaleDateString('en-US', { month: 'long', day: 'numeric' })}`;
+        };
+        const fmt12h = (hhmm) => {
+          const [h, mi] = String(hhmm).slice(0, 5).split(':').map(Number);
+          const ap = h >= 12 ? 'PM' : 'AM';
+          return `${((h + 11) % 12) + 1}:${String(mi).padStart(2, '0')} ${ap}`;
+        };
+
+        if (bookings.length === 0 && sheetOnly.length === 0) {
+          const note = sheet.checked
+            ? `No upcoming bookings found for this caller — checked both phone-line bookings and the live tee sheet (${sheet.scannedDates.length} day(s): ${sheet.scannedDates.join(', ')}). If they insist they have one on a day outside that range, ask for the date and call this tool again with it — or take their details and create a request for staff to check.`
+            : 'No phone-line bookings found, and the live tee sheet could not be checked right now. If the caller believes they have a booking, take their details and create a cancellation/modification request for staff to verify against the tee sheet.';
+          return { found: false, count: 0, message: note };
+        }
+
+        const formatted = bookings.map(b => ({
+          booking_id: b.id,
+          date: b.requested_date,
+          display_date: fmtDate(b.requested_date instanceof Date ? b.requested_date.toISOString() : b.requested_date),
+          time: b.requested_time || 'no specific time',
+          party_size: b.party_size,
+          name: b.customer_name,
+          source: 'phone_line'
+        }));
+        const sheetFormatted = sheetOnly.map(m => ({
+          booking_id: null,
+          date: m.date,
+          display_date: fmtDate(m.date),
+          time: fmt12h(m.time24),
+          party_size: m.players,
+          name: callerContext.name || null,
+          source: 'tee_sheet'
+        }));
+
+        const all = [...formatted, ...sheetFormatted];
+        let message = `Found ${all.length} upcoming booking${all.length > 1 ? 's' : ''}:\n`;
         formatted.forEach((b, i) => {
           message += `\n${i + 1}. ${b.display_date} at ${b.time} — ${b.party_size} player${b.party_size !== 1 ? 's' : ''} (booking #${b.booking_id})`;
         });
-        message += '\n\nRead these back to the caller naturally and ask which booking they want to cancel or change. Use the booking_id when calling cancel_booking or edit_booking.';
+        sheetFormatted.forEach((b, i) => {
+          message += `\n${formatted.length + i + 1}. ${b.display_date} at ${b.time}${b.party_size ? ` — ${b.party_size} player${b.party_size !== 1 ? 's' : ''}` : ''} (on the pro-shop tee sheet)`;
+        });
+        message += '\n\nRead these back naturally. For cancel/edit: use booking_id when present; for TEE-SHEET bookings (no booking_id) call cancel_booking/edit_booking WITHOUT booking_id and include original_date + original_time + customer_name so staff reconcile it on the sheet.';
 
-        return { found: true, count: bookings.length, bookings: formatted, message };
+        return { found: true, count: all.length, bookings: all, sheetChecked: sheet.checked, message };
       }
 
       case 'edit_booking': {

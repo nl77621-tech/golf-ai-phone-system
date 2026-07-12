@@ -1345,6 +1345,145 @@ async function ensureWarmAdminSession(businessId) {
   }
 }
 
+// ─── Caller-booking search on the live tee sheet ──────────────────────────
+//
+// lookup_my_bookings historically searched only booking_requests — bookings
+// made through the phone line. Anything booked at the pro shop / on Tee-On
+// directly was invisible, so callers heard "no bookings under your number"
+// for tee times that absolutely exist (observed 2026-07-10: Nelson's own
+// 7:20 AM sheet booking; same pattern for several pro-shop customers). This
+// read-only search closes that gap by scanning the authenticated tee sheet.
+//
+// Matching, in order of confidence:
+//   1. bookerId — AI-made bookings tag every slot's SlotBookerID with
+//      'T'+<10-digit caller phone> (see createBooking), and that token is
+//      rendered as the third arg of the tile's submitExistingTime(...).
+//   2. name — pro-shop bookings carry the golfer's name in the tile text.
+//      We require EVERY name token (len>=3) to appear in the tile window,
+//      order-independent, so both "Nelson Lopes" and "Lopes, Nelson" match.
+//
+// READ path: like ensureWarmAdminSession, this is deliberately NOT gated on
+// isEnabledForBusiness (that flag governs writes). Missing credentials fail
+// naturally in getSession and we report { checked: false }.
+//
+// Latency: runs mid-call while the caller waits, so it takes a hard
+// deadline (default 8s). Dates are scanned in order and we stop when the
+// budget is nearly spent — partial coverage is reported via scannedDates
+// so the tool layer can tell the AI what was and wasn't checked.
+
+const SHEET_TILE_RE = /submitExistingTime\('(\d{1,2}:\d{2})','([A-Z])','([A-Z0-9]*)'(?:,[a-z]+,(\d+))?/g;
+
+function stripHtml(fragment) {
+  return String(fragment || '')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function parseSheetForCaller(html, { phoneToken, nameTokens }) {
+  const found = new Map(); // key: time|nine → match (phone match wins over name)
+  if (!html) return [];
+  // Two passes: first collect every tile with its position, then window
+  // each tile's text from its onclick to the NEXT tile's onclick (capped
+  // at 700 chars). Bounding at the next tile stops a caller's name from
+  // "bleeding" a match onto the neighbouring group's slot on dense sheets.
+  const tiles = [];
+  SHEET_TILE_RE.lastIndex = 0;
+  let m;
+  while ((m = SHEET_TILE_RE.exec(html)) !== null) {
+    tiles.push({ index: m.index, time: m[1], nine: m[2], bookerId: m[3], playersRaw: m[4] });
+  }
+  for (let i = 0; i < tiles.length; i++) {
+    const { index, time, nine, bookerId, playersRaw } = tiles[i];
+    const windowEnd = Math.min(i + 1 < tiles.length ? tiles[i + 1].index : html.length, index + 700);
+    const windowText = stripHtml(html.slice(index, windowEnd)).toLowerCase();
+
+    let matchedBy = null;
+    if (phoneToken && bookerId && bookerId.toUpperCase() === phoneToken) {
+      matchedBy = 'phone';
+    } else if (nameTokens.length && nameTokens.every(t => windowText.includes(t))) {
+      matchedBy = 'name';
+    }
+    if (!matchedBy) continue;
+
+    const key = `${time}|${nine}`;
+    const players = playersRaw ? Number(playersRaw) : null;
+    const existing = found.get(key);
+    if (!existing || (existing.matchedBy === 'name' && matchedBy === 'phone')) {
+      found.set(key, {
+        time24: time.padStart(5, '0'),
+        nine,
+        bookerId: bookerId || null,
+        matchedBy,
+        players: Number.isInteger(players) && players >= 1 && players <= 8 ? players : null
+      });
+    }
+  }
+  return [...found.values()];
+}
+
+async function findCallerBookingsOnSheet(businessId, { phone, name, dates, deadlineMs = 8000 } = {}) {
+  const startedAt = Date.now();
+  const digits = String(phone || '').replace(/\D/g, '');
+  const phoneToken = digits.length >= 10 ? `T${digits.slice(-10)}` : null;
+  const nameTokens = String(name || '')
+    .toLowerCase()
+    .split(/[^a-z]+/)
+    .filter(t => t.length >= 3);
+  // Single-token names ("Nelson") are too collision-prone on a busy sheet;
+  // require either a usable phone token or a 2+-token name to search at all.
+  const nameUsable = nameTokens.length >= 2;
+  if (!phoneToken && !nameUsable) {
+    return { checked: false, reason: 'no-usable-identity', scannedDates: [], matches: [] };
+  }
+
+  let cfg, cookies;
+  try {
+    ({ cfg, cookies } = await getSession(businessId));
+  } catch (err) {
+    console.warn(`[tenant:${businessId}] [TeeOn-Admin] sheet lookup skipped (no session): ${err.message}`);
+    return { checked: false, reason: 'no-session', scannedDates: [], matches: [] };
+  }
+
+  const scannedDates = [];
+  const matches = [];
+  let first = true;
+  for (const date of (dates || [])) {
+    const remaining = deadlineMs - (Date.now() - startedAt);
+    if (remaining < 1500) break; // not enough budget for another fetch
+    try {
+      if (first) { await throttle(businessId); first = false; }
+      else { await new Promise(r => setTimeout(r, 300)); }
+      const res = await httpsRequest({
+        method: 'GET',
+        path: `${TEE_SHEET_PATH}?Course=${cfg.courseCode}&Date=${encodeURIComponent(date)}&Default=true`,
+        headers: { Cookie: cookies, Referer: `https://${TEEON_HOST}/` }
+      });
+      const body = res.body || '';
+      const authed = res.status === 200 && /submitExistingTime|submitTime\(|tee-sheet-body/i.test(body);
+      if (!authed) {
+        console.warn(`[tenant:${businessId}] [TeeOn-Admin] sheet lookup: ${date} page not authenticated (status=${res.status}) — stopping scan`);
+        break;
+      }
+      scannedDates.push(date);
+      for (const hit of parseSheetForCaller(body, { phoneToken, nameTokens: nameUsable ? nameTokens : [] })) {
+        matches.push({ date, ...hit });
+      }
+    } catch (err) {
+      console.warn(`[tenant:${businessId}] [TeeOn-Admin] sheet lookup failed for ${date}: ${err.message}`);
+    }
+  }
+
+  console.log(
+    `[tenant:${businessId}] [TeeOn-Admin] sheet lookup: scanned ${scannedDates.length}/${(dates || []).length} day(s) ` +
+    `in ${Date.now() - startedAt}ms — ${matches.length} match(es) [token=${phoneToken ? 'yes' : 'no'} name=${nameUsable ? nameTokens.join('+') : 'unusable'}]`
+  );
+  return { checked: scannedDates.length > 0, scannedDates, matches };
+}
+
 // ─── Keep-alive runner ────────────────────────────────────────────────────
 //
 // Pings the authenticated tee sheet every KEEPALIVE_INTERVAL_MS for every
@@ -1405,4 +1544,8 @@ module.exports = {
   // teeon-admin already uses, so all downstream consumers share the
   // same DEFAULT_COURSE_CODE fallback chain.
   getTenantTeeOnConfig,
+  // Read-only caller-booking search on the live tee sheet (lookup_my_bookings).
+  findCallerBookingsOnSheet,
+  // Exported for unit tests.
+  parseSheetForCaller,
 };

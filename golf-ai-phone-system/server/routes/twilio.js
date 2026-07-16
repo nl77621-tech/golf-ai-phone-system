@@ -182,26 +182,30 @@ router.post('/status', (req, res) => {
  *   1. businesses.transfer_number (tenant column)
  *   2. getSetting(businessId, 'transfer_number')  (per-tenant setting blob)
  */
+// Settings → column precedence. The in-tenant Settings UI is the
+// place a tenant admin actually sets their dispatcher number, so
+// it should win over the auto-populated business.transfer_number
+// column. Originally we read the column first; that meant a
+// tenant updating their number from inside the Settings UI saw
+// their change get silently ignored on real calls. (Mirror
+// change in services/grok-voice.js transfer_call tool executor.)
+// Shared by /transfer and the /transfer-fallback busy-retry.
+async function resolveTransferNumber(businessId, business) {
+  const fromSettings = await getSetting(businessId, 'transfer_number').catch(() => null);
+  let rawNumber = typeof fromSettings === 'string'
+    ? fromSettings
+    : (fromSettings?.number || fromSettings?.value || null);
+  if (!rawNumber) {
+    rawNumber = business?.transfer_number || null;
+  }
+  return toE164(rawNumber);
+}
+
 router.post('/transfer', attachTenantFromCallSid, async (req, res) => {
   const business = req.business;
   const businessId = business.id;
   try {
-    // Settings → column precedence. The in-tenant Settings UI is the
-    // place a tenant admin actually sets their dispatcher number, so
-    // it should win over the auto-populated business.transfer_number
-    // column. Originally we read the column first; that meant a
-    // tenant updating their number from inside the Settings UI saw
-    // their change get silently ignored on real calls. (Mirror
-    // change in services/grok-voice.js transfer_call tool executor.)
-    const fromSettings = await getSetting(businessId, 'transfer_number').catch(() => null);
-    let rawNumber = typeof fromSettings === 'string'
-      ? fromSettings
-      : (fromSettings?.number || fromSettings?.value || null);
-    if (!rawNumber) {
-      rawNumber = business.transfer_number || null;
-    }
-
-    const transferNumber = toE164(rawNumber);
+    const transferNumber = await resolveTransferNumber(businessId, business);
     console.log(`[tenant:${businessId}] 📞 Transfer endpoint hit — resolved number: ${transferNumber}`);
 
     if (!transferNumber) {
@@ -239,25 +243,71 @@ router.post('/transfer', attachTenantFromCallSid, async (req, res) => {
 
 /**
  * POST /twilio/transfer-fallback — If transfer fails (no answer, busy).
+ *
+ * Busy-retry: the clubhouse is a single line with no call waiting, so a
+ * large share of transfers bounce 'busy' (2026-07-16 logs: 15 of 28 in
+ * 24h; 2026-07-13 evening: 21 of 21 while the handset was off-hook). A
+ * busy line often frees within seconds, so on the FIRST busy/no-answer
+ * we wait ~8s and dial once more (?attempt=2 marks the retry). If the
+ * retry also fails, we give the caller the direct number instead of a
+ * dead end. 'completed' still just hangs up (the human conversation
+ * already happened).
  */
-router.post('/transfer-fallback', attachTenantFromCallSid, (req, res) => {
+router.post('/transfer-fallback', attachTenantFromCallSid, async (req, res) => {
   const dialStatus = req.body.DialCallStatus;
   const dialSid = req.body.DialCallSid;
-  const businessId = req.business?.id;
-  console.log(`[tenant:${businessId}] 📞 Transfer fallback — DialCallStatus: ${dialStatus}, DialCallSid: ${dialSid}`);
+  const business = req.business;
+  const businessId = business?.id;
+  const attempt = req.query.attempt === '2' ? 2 : 1;
+  console.log(`[tenant:${businessId}] 📞 Transfer fallback — DialCallStatus: ${dialStatus}, attempt: ${attempt}, DialCallSid: ${dialSid}`);
   res.type('text/xml');
 
   if (dialStatus === 'completed') {
     res.send('<Response><Hangup/></Response>');
-  } else {
-    console.log(`[tenant:${businessId}] 📞 Transfer failed (${dialStatus}) — telling caller nobody picked up`);
-    res.send(`
-      <Response>
-        <Say voice="alice">Sorry, nobody was able to pick up. You can try again later, or I can continue helping you. Goodbye!</Say>
-        <Hangup/>
-      </Response>
-    `);
+    return;
   }
+
+  // First failure → one retry. Resolve the number again (cheap, and the
+  // setting may have just been fixed by staff mid-incident).
+  if (attempt === 1) {
+    let transferNumber = null;
+    try {
+      transferNumber = await resolveTransferNumber(businessId, business);
+    } catch (err) {
+      console.warn(`[tenant:${businessId}] 📞 Retry number resolution failed:`, err.message);
+    }
+    if (transferNumber) {
+      console.log(`[tenant:${businessId}] 📞 Transfer ${dialStatus} on attempt 1 — retrying ${transferNumber} once after a short pause`);
+      res.send(`
+        <Response>
+          <Say voice="alice">The line is busy right now. Give me a moment — I'll try them one more time.</Say>
+          <Pause length="8"/>
+          <Dial timeout="30" action="/twilio/transfer-fallback?attempt=2">
+            ${xmlEscape(transferNumber)}
+          </Dial>
+        </Response>
+      `);
+      return;
+    }
+  }
+
+  // Retry also failed (or no number resolvable) — leave the caller with
+  // something actionable instead of a dead end.
+  console.log(`[tenant:${businessId}] 📞 Transfer failed (${dialStatus}, attempt ${attempt}) — giving caller the direct number`);
+  let spoken = '';
+  try {
+    const n = await resolveTransferNumber(businessId, business);
+    spoken = n ? spokenTransferNumber(n) : '';
+  } catch (_) { /* speak generic message below */ }
+  const reachThem = spoken
+    ? ` You can reach them directly at ${spoken}, or`
+    : ' You can';
+  res.send(`
+    <Response>
+      <Say voice="alice">Sorry — the clubhouse line is still busy.${xmlEscape(reachThem)} call me back anytime and I can take a message or help with your booking. Goodbye!</Say>
+      <Hangup/>
+    </Response>
+  `);
 });
 
 /**

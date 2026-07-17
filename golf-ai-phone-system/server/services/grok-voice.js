@@ -494,7 +494,7 @@ ${callerLine}
       const tenantName = business?.name || 'us';
       const xmlEscape = (s) => String(s).replace(/[&<>"']/g, c =>
         ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[c]);
-      const twiml = `<Response><Say voice="alice">Thanks for calling ${xmlEscape(tenantName)}. Our voice system is having a brief hiccup. Please call back in a minute and we'll get you sorted out.</Say><Hangup/></Response>`;
+      const twiml = `<Response><Say voice="Polly.Joanna-Neural">Thanks for calling ${xmlEscape(tenantName)}. Our voice system is having a brief hiccup. Please call back in a minute and we'll get you sorted out.</Say><Hangup/></Response>`;
       await client.calls(callSid).update({ twiml });
       console.log(`[tenant:${businessId}][${callSid}] Failover TwiML sent (${reason})`);
     } catch (err) {
@@ -517,7 +517,7 @@ ${callerLine}
         if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
         return;
       }
-      const twiml = `<Response><Say voice="alice">Thanks so much for calling. I have to wrap things up here, but please call us back anytime and we'll be glad to help. Goodbye!</Say><Hangup/></Response>`;
+      const twiml = `<Response><Say voice="Polly.Joanna-Neural">Thanks so much for calling. I have to wrap things up here, but please call us back anytime and we'll be glad to help. Goodbye!</Say><Hangup/></Response>`;
       await client.calls(callSid).update({ twiml });
       console.log(`[tenant:${businessId}][${callSid}] ⏰ Max-duration reached — goodbye TwiML sent, call ending`);
     } catch (err) {

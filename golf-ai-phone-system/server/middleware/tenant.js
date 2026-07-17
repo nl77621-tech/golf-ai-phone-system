@@ -186,7 +186,7 @@ async function attachTenantFromTwilioTo(req, res, next) {
       console.warn(`[tenant] Rejecting Twilio request — no business for To=${to}`);
       res.type('text/xml');
       return res.send(
-        `<Response><Say voice="alice">We're sorry, this number is not currently in service. Goodbye.</Say><Hangup/></Response>`
+        `<Response><Say voice="Polly.Joanna-Neural">We're sorry, this number is not currently in service. Goodbye.</Say><Hangup/></Response>`
       );
     }
     req.business = business;
@@ -197,7 +197,7 @@ async function attachTenantFromTwilioTo(req, res, next) {
   } catch (err) {
     console.error('attachTenantFromTwilioTo error:', err.message);
     res.type('text/xml');
-    res.send('<Response><Say voice="alice">Sorry, something went wrong. Please try again.</Say><Hangup/></Response>');
+    res.send('<Response><Say voice="Polly.Joanna-Neural">Sorry, something went wrong. Please try again.</Say><Hangup/></Response>');
   }
 }
 

@@ -104,7 +104,7 @@ router.post('/voice', attachTenantFromTwilioTo, async (req, res) => {
       res.type('text/xml');
       res.send(`
         <Response>
-          <Say voice="alice">Thank you for calling ${xmlEscape(businessName)}. Our phone service is temporarily paused. Please contact us directly and we'll get back to you shortly.</Say>
+          <Say voice="Polly.Joanna-Neural">Thank you for calling ${xmlEscape(businessName)}. Our phone service is temporarily paused. Please contact us directly and we'll get back to you shortly.</Say>
           <Hangup/>
         </Response>
       `);
@@ -131,7 +131,7 @@ router.post('/voice', attachTenantFromTwilioTo, async (req, res) => {
         res.type('text/xml');
         res.send(`
           <Response>
-            <Say voice="alice">Thank you for calling ${xmlEscape(businessName)}. Our phone system is currently being updated. Please call back shortly.</Say>
+            <Say voice="Polly.Joanna-Neural">Thank you for calling ${xmlEscape(businessName)}. Our phone system is currently being updated. Please call back shortly.</Say>
             <Hangup/>
           </Response>
         `);
@@ -213,17 +213,21 @@ router.post('/transfer', attachTenantFromCallSid, async (req, res) => {
       res.type('text/xml');
       res.send(`
         <Response>
-          <Say voice="alice">I'm sorry, no staff members are available right now. Please try again later.</Say>
+          <Say voice="Polly.Joanna-Neural">I'm sorry, no staff members are available right now. Please try again later.</Say>
           <Hangup/>
         </Response>
       `);
       return;
     }
 
+    // No <Say> here on purpose: the AI already told the caller "one sec,
+    // let me connect you" in its own voice during the 3s pre-redirect
+    // window (grok-voice transfer executor). A second announcement in a
+    // different TTS voice was jarring and redundant — caller now hears
+    // the AI, then ringing, then a human.
     res.type('text/xml');
     res.send(`
       <Response>
-        <Say voice="alice">One moment, I'm connecting you with a staff member.</Say>
         <Dial timeout="30" action="/twilio/transfer-fallback">
           ${xmlEscape(transferNumber)}
         </Dial>
@@ -234,7 +238,7 @@ router.post('/transfer', attachTenantFromCallSid, async (req, res) => {
     res.type('text/xml');
     res.send(`
       <Response>
-        <Say voice="alice">I'm sorry, I wasn't able to transfer your call. Please try calling again.</Say>
+        <Say voice="Polly.Joanna-Neural">I'm sorry, I wasn't able to transfer your call. Please try calling again.</Say>
         <Hangup/>
       </Response>
     `);
@@ -280,7 +284,7 @@ router.post('/transfer-fallback', attachTenantFromCallSid, async (req, res) => {
       console.log(`[tenant:${businessId}] 📞 Transfer ${dialStatus} on attempt 1 — retrying ${transferNumber} once after a short pause`);
       res.send(`
         <Response>
-          <Say voice="alice">The line is busy right now. Give me a moment — I'll try them one more time.</Say>
+          <Say voice="Polly.Joanna-Neural">The line is busy right now. Give me a moment — I'll try them one more time.</Say>
           <Pause length="8"/>
           <Dial timeout="30" action="/twilio/transfer-fallback?attempt=2">
             ${xmlEscape(transferNumber)}
@@ -304,7 +308,7 @@ router.post('/transfer-fallback', attachTenantFromCallSid, async (req, res) => {
     : ' You can';
   res.send(`
     <Response>
-      <Say voice="alice">Sorry — the clubhouse line is still busy.${xmlEscape(reachThem)} call me back anytime and I can take a message or help with your booking. Goodbye!</Say>
+      <Say voice="Polly.Joanna-Neural">Sorry — the clubhouse line is still busy.${xmlEscape(reachThem)} call me back anytime and I can take a message or help with your booking. Goodbye!</Say>
       <Hangup/>
     </Response>
   `);

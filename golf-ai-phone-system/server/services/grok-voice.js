@@ -1618,6 +1618,32 @@ async function executeToolCall(toolName, args, ctx) {
             if (s.holes === 18) holesByTime[t].eighteen = true;
             if (s.holes === 9)  holesByTime[t].nine = true;
           }
+
+          // ─── Twilight 9-hole on the FRONT nine ──────────────────────
+          // Evening twilight 9-hole rounds are played on the FRONT nine
+          // (start hole 1), NOT the back — in the evening the back nine is
+          // full of 18-hole groups finishing, so Tee-On only opens front
+          // (18-hole) slots. Without this, a caller asking for "9 holes
+          // this evening" is wrongly told nothing's open. So inside an
+          // afternoon/evening 9-hole window (nine_hole_windows entry whose
+          // `from` is midday+), an open front slot is ALSO bookable as a
+          // 9-hole twilight round — mark it so the slot tags "18+9" and the
+          // AI offers the choice. The Tee-On write (teeon-admin) routes
+          // these to the front nine. Reported by the course 2026-06-17.
+          let twilightFront9 = false;
+          try {
+            const nhw = await getSetting(businessId, 'nine_hole_windows').catch(() => null);
+            const twWins = Array.isArray(nhw) ? nhw.filter(w => typeof w?.from === 'string' && w.from >= '12:00') : [];
+            if (twWins.length > 0) {
+              const to24tw = (ts) => { const m = String(ts || '').trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i); if (!m) return null; let h = parseInt(m[1], 10); const ap = m[3].toUpperCase(); if (ap === 'PM' && h !== 12) h += 12; if (ap === 'AM' && h === 12) h = 0; return `${String(h).padStart(2, '0')}:${m[2]}`; };
+              for (const t of Object.keys(holesByTime)) {
+                if (!holesByTime[t].eighteen || holesByTime[t].nine) continue;
+                const t24 = to24tw(t);
+                if (t24 && twWins.some(w => t24 >= w.from && t24 <= w.to)) { holesByTime[t].nine = true; twilightFront9 = true; }
+              }
+              if (twilightFront9) console.log(`[tenant:${businessId}][${callLogId}] twilight front-9: evening front slot(s) marked 9-hole-eligible`);
+            }
+          } catch (e) { /* non-fatal — fall back to standard tagging */ }
           // Stringify for prompt embedding. Sort by time so AI reads in order.
           const holesAnnotated = Object.entries(holesByTime)
             .map(([time, h]) => {
@@ -1650,6 +1676,9 @@ async function executeToolCall(toolName, args, ctx) {
           message += `\n  3. If ALL of those times are tagged "9-only" → DO NOT ASK. Just say "for 9 holes back nine" and continue.`;
           message += `\n  4. ONLY if AT LEAST ONE offered time is tagged "18+9" should you ask the holes question.`;
           message += `\n  5. Real example: caller asks for "around 8 AM" and you offer 8:06 AM (18-only), 8:14 AM (18-only), 8:22 AM (18-only) — ALL 18-only — so DON'T ask the holes question. Just say "I've got 8:06, 8:14, and 8:22 open for 18 holes — which works?"`;
+          if (twilightFront9) {
+            message += `\n\n🌅 TWILIGHT 9-HOLE: Some evening times are tagged "18+9" because of twilight. In the EVENING, the 9-hole option is a TWILIGHT round played on the FRONT nine (the caller starts on hole 1) — NOT the back nine. So when offering an evening 9-hole, say "9 holes twilight" — do NOT say "back nine" for evening times. (Morning 9-hole IS the back nine; only the evening twilight 9 is the front.)`;
+          }
 
           // ---------- KEY FACTS — flat facts the AI can quote directly ----------
           message += `\n\nKEY FACTS:`;

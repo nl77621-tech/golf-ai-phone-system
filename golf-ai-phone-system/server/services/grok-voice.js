@@ -266,19 +266,42 @@ async function checkBookingWindow(businessId, dateStr) {
   }
 }
 
-async function handleMediaStream(twilioWs, businessId, callerPhone, callSid, streamSid, appUrl) {
+// `resumeReason` is set when the caller is handed BACK to the AI part-way
+// through a call instead of starting fresh. Today the only value is
+// 'transfer_busy' — both dial attempts to the clubhouse hit a busy line, so
+// rather than a recorded dead end the caller returns to the same voice that
+// offered to connect them, and the AI offers to take a message.
+async function handleMediaStream(twilioWs, businessId, callerPhone, callSid, streamSid, appUrl, resumeReason = null) {
   requireBusinessId(businessId, 'handleMediaStream');
   console.log(`[tenant:${businessId}][${callSid}] New call from ${callerPhone}`);
 
   // Create call log entry (business-scoped)
   let callLogId = null;
   try {
-    const res = await query(
-      `INSERT INTO call_logs (business_id, twilio_call_sid, caller_phone, started_at)
-       VALUES ($1, $2, $3, NOW()) RETURNING id`,
-      [businessId, callSid, callerPhone]
-    );
-    callLogId = res.rows[0].id;
+    // Resumed session (e.g. busy transfer bounced the caller back): reuse
+    // the existing row for this CallSid so one phone call stays ONE call
+    // record — transcript and actions append instead of splitting in two
+    // (which would also skew dead-call / repeat-caller reporting).
+    if (resumeReason) {
+      const existing = await query(
+        `SELECT id FROM call_logs
+          WHERE business_id = $1 AND twilio_call_sid = $2
+          ORDER BY id DESC LIMIT 1`,
+        [businessId, callSid]
+      );
+      if (existing.rows[0]) {
+        callLogId = existing.rows[0].id;
+        console.log(`[tenant:${businessId}][${callSid}] Resuming call log #${callLogId} (${resumeReason})`);
+      }
+    }
+    if (!callLogId) {
+      const res = await query(
+        `INSERT INTO call_logs (business_id, twilio_call_sid, caller_phone, started_at)
+         VALUES ($1, $2, $3, NOW()) RETURNING id`,
+        [businessId, callSid, callerPhone]
+      );
+      callLogId = res.rows[0].id;
+    }
   } catch (err) {
     console.error(`[tenant:${businessId}][${callSid}] Failed to create call log:`, err.message);
   }
@@ -640,7 +663,12 @@ ${callerLine}
       }
     }));
 
-    const greetingInstruction = callerContext.isAdmin
+    const greetingInstruction = resumeReason === 'transfer_busy'
+      // Mid-call return after a failed transfer. This is NOT a new call —
+      // re-greeting would be confusing ("hi, thanks for calling" after
+      // they've already been talking to us for a minute).
+      ? `[System: You just tried TWICE to connect this caller to the clubhouse and the line was busy both times. You are now back on the line with them. Do NOT greet them again and do NOT ask their name — this is the same call. Open IMMEDIATELY with a short, genuine apology and a concrete offer, e.g. "Sorry about that — the pro shop line is tied up right now. I can take a message and have them call you back, or I can help you right here with a booking." If they want to leave a message, call take_topic_message and confirm staff will get it. If they insist on being transferred again, you may call transfer_call once more. Keep it brief and warm — they have already been waiting.]`
+      : callerContext.isAdmin
       // Admin call — short, businesslike. PIN gate is mandatory; the
       // system prompt's 🔐 ADMIN CALL block covers what to do with the
       // answer. We just kick off the gate here.

@@ -297,13 +297,18 @@ wss.on('connection', (ws, req) => {
         }
 
         const streamSid = msg.start.streamSid;
+        // Set when the caller is being handed BACK to the AI mid-call
+        // (currently: the clubhouse line was busy on both dial attempts).
+        // grok-voice uses it to apologise instead of re-greeting.
+        const resumeReason = params.resumeReason || null;
         console.log(
-          `[tenant:${businessId}] Media stream started: caller=${callerPhone}, sid=${callSid}, stream=${streamSid}, appUrl=${appUrl}`
+          `[tenant:${businessId}] Media stream started: caller=${callerPhone}, sid=${callSid}, stream=${streamSid}, appUrl=${appUrl}` +
+          (resumeReason ? `, resume=${resumeReason}` : '')
         );
 
         // Hand off to the Grok voice bridge — businessId is the tenant scope
         // for every DB write, settings read, and tool call it performs.
-        handleMediaStream(ws, businessId, callerPhone, callSid, streamSid, appUrl);
+        handleMediaStream(ws, businessId, callerPhone, callSid, streamSid, appUrl, resumeReason);
       }
     } catch (err) {
       // Not JSON or not a start event — ignore, the handler will process it

@@ -282,10 +282,13 @@ router.post('/transfer-fallback', attachTenantFromCallSid, async (req, res) => {
     }
     if (transferNumber) {
       console.log(`[tenant:${businessId}] 📞 Transfer ${dialStatus} on attempt 1 — retrying ${transferNumber} once after a short pause`);
+      // Silent retry on purpose. Any <Say> here is a THIRD voice in the
+      // caller's ear (AI → robot → human), which is exactly what the
+      // owner flagged. A short pause reads as normal hold; if this dial
+      // also fails the AI returns below and explains in her own voice.
       res.send(`
         <Response>
-          <Say voice="Polly.Joanna-Neural">The line is busy right now. Give me a moment — I'll try them one more time.</Say>
-          <Pause length="8"/>
+          <Pause length="4"/>
           <Dial timeout="30" action="/twilio/transfer-fallback?attempt=2">
             ${xmlEscape(transferNumber)}
           </Dial>
@@ -295,21 +298,28 @@ router.post('/transfer-fallback', attachTenantFromCallSid, async (req, res) => {
     }
   }
 
-  // Retry also failed (or no number resolvable) — leave the caller with
-  // something actionable instead of a dead end.
-  console.log(`[tenant:${businessId}] 📞 Transfer failed (${dialStatus}, attempt ${attempt}) — giving caller the direct number`);
-  let spoken = '';
-  try {
-    const n = await resolveTransferNumber(businessId, business);
-    spoken = n ? spokenTransferNumber(n) : '';
-  } catch (_) { /* speak generic message below */ }
-  const reachThem = spoken
-    ? ` You can reach them directly at ${spoken}, or`
-    : ' You can';
+  // Retry also failed — hand the caller BACK to the AI instead of a
+  // recorded dead end. Re-opening the media stream means the same voice
+  // that said "let me connect you" comes back and can take a message
+  // (owner feedback 2026-07-30: a golfer called 7 times in an hour
+  // trying to reach a busy pro shop and never left a message).
+  // resumeReason tells grok-voice to skip the greeting and apologise.
+  const appUrl = process.env.APP_URL || `https://${req.headers.host}`;
+  const wsUrl = appUrl.replace('https://', 'wss://').replace('http://', 'ws://');
+  const callSid = req.body.CallSid || '';
+  const callerPhone = req.body.From || 'unknown';
+  console.log(`[tenant:${businessId}] 📞 Transfer failed (${dialStatus}, attempt ${attempt}) — returning caller to the AI to take a message`);
   res.send(`
     <Response>
-      <Say voice="Polly.Joanna-Neural">Sorry — the clubhouse line is still busy.${xmlEscape(reachThem)} call me back anytime and I can take a message or help with your booking. Goodbye!</Say>
-      <Hangup/>
+      <Connect>
+        <Stream url="${xmlEscape(wsUrl)}/twilio/media-stream">
+          <Parameter name="businessId" value="${businessId}" />
+          <Parameter name="callerPhone" value="${xmlEscape(callerPhone)}" />
+          <Parameter name="callSid" value="${xmlEscape(callSid)}" />
+          <Parameter name="appUrl" value="${xmlEscape(appUrl)}" />
+          <Parameter name="resumeReason" value="transfer_busy" />
+        </Stream>
+      </Connect>
     </Response>
   `);
 });

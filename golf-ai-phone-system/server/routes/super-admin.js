@@ -2700,4 +2700,50 @@ router.post('/businesses/:id/credits', async (req, res) => {
   }
 });
 
+/**
+ * POST /api/super/businesses/:id/team-messages — file and dispatch a message
+ * to one of a tenant's team members, on their behalf.
+ *
+ * Ops recovery tool. When the AI tells a caller "I'll make sure this gets to
+ * the team" but never calls the message tool (the say/do bug — see
+ * SAY_DO_CLAIMS in services/grok-voice.js), the message exists only in the
+ * transcript. This lets an operator re-file it through the normal pipeline so
+ * it lands in the Messages page AND actually reaches the recipient, with real
+ * delivery_detail — rather than being hand-inserted into the DB with a fake
+ * "sent" status.
+ *
+ * Body: { member_id, message, caller_name?, caller_phone?, call_id? }
+ */
+router.post('/businesses/:id/team-messages', async (req, res) => {
+  const businessId = parseInt(req.params.id, 10);
+  if (!Number.isInteger(businessId) || businessId <= 0) {
+    return res.status(400).json({ error: 'Invalid business id' });
+  }
+  const memberId = parseInt(req.body?.member_id, 10);
+  const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+  if (!Number.isInteger(memberId) || memberId <= 0) {
+    return res.status(400).json({ error: 'member_id required' });
+  }
+  if (!message) {
+    return res.status(400).json({ error: 'message required' });
+  }
+  try {
+    const { sendMessageToTeamMember } = require('../services/team-directory');
+    const business = await getBusinessById(businessId).catch(() => null);
+    const result = await sendMessageToTeamMember(businessId, memberId, {
+      callerName: req.body?.caller_name || null,
+      callerPhone: req.body?.caller_phone || null,
+      message,
+      businessName: business?.name || null,
+      callId: Number.isInteger(req.body?.call_id) ? req.body.call_id : null,
+      routedToDefault: false
+    });
+    console.log(`[super] team message filed for business ${businessId} → member ${memberId} (status=${result?.status})`);
+    res.json(result);
+  } catch (err) {
+    console.error(`[super] team-messages POST for ${businessId} error:`, err.message);
+    res.status(500).json({ error: err.message || 'Failed to send team message' });
+  }
+});
+
 module.exports = router;

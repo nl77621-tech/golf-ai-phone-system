@@ -266,6 +266,92 @@ async function checkBookingWindow(businessId, dateStr) {
   }
 }
 
+// ─── Say/do mismatch detection ──────────────────────────────────────────────
+//
+// Each entry pairs a spoken COMPLETION CLAIM with the tool(s) that make that
+// claim true. If the AI said it and none of the tools ran, the caller was
+// misled and the request was silently lost.
+//
+// Patterns are deliberately narrow — they match past/committed phrasing
+// ("I've submitted", "I'll make sure this gets to") and NOT offers or
+// descriptions of process ("I can put in a request", "these are booking
+// requests staff confirms"), which are legitimate mid-call speech.
+const SAY_DO_CLAIMS = [
+  {
+    label: 'message-taken',
+    tools: ['take_message_for_team_member', 'take_topic_message'],
+    patterns: [
+      /\bi'?ll make sure (?:this|that|it|the message|someone)\b[^.?!]{0,40}\b(?:gets?|get|reach|gets? to)\b/i,
+      /\bi'?ll (?:pass|relay) (?:this|that|it|your message)\b[^.?!]{0,30}\b(?:along|on|to)\b/i,
+      /\bi'?ll let (?:him|her|them|the team|paul|gia|nelson)\b[^.?!]{0,20}\bknow\b/i,
+      /\b(?:i'?ve|i have) (?:taken|noted|got) (?:that|this|your|the) (?:message|details?|down)\b/i,
+      /\byour message (?:is|has been|will be) (?:sent|passed|delivered|with)\b/i
+    ]
+  },
+  {
+    label: 'booking-made',
+    tools: ['book_tee_time'],
+    patterns: [
+      /\b(?:i'?ve|i have) (?:booked|got you (?:booked|down)|put (?:you|that) (?:in|down))\b/i,
+      /\b(?:i'?ve|i have) submitted (?:your|the) (?:booking|tee time|request for)\b/i,
+      /\byour (?:booking|tee time) (?:is|has been) (?:booked|confirmed|submitted|in the system)\b/i
+    ]
+  },
+  {
+    label: 'cancellation-filed',
+    tools: ['cancel_booking'],
+    patterns: [
+      /\b(?:i'?ve|i have) (?:cancelled|canceled)\b/i,
+      /\b(?:i'?ve|i have) (?:submitted|put in|filed) (?:the|your|that) cancellation\b/i,
+      /\b(?:the |your )?cancellation (?:request )?(?:is|has been) (?:submitted|in|filed|placed)\b/i
+    ]
+  },
+  {
+    // Catch-all for the "it's in the queue" phrasing that doesn't name which
+    // kind of request it was. Satisfied by ANY filing tool. Kept narrow on
+    // purpose: the routine check_tee_times line ("these are booking requests
+    // that staff will confirm by text") describes the process and must NOT
+    // trip this — these patterns require a definite, already-submitted thing.
+    label: 'request-filed',
+    tools: ['book_tee_time', 'cancel_booking', 'edit_booking',
+            'take_message_for_team_member', 'take_topic_message'],
+    patterns: [
+      /\b(?:this|that) is just a request\b[^.?!]{0,80}\bstaff will (?:process|handle)\b/i,
+      /\byou'?ll (?:get|receive) a (?:confirmation )?text[^.?!]{0,40}\bonce (?:our )?staff (?:processes|has processed|handles)\b/i
+    ]
+  },
+  {
+    label: 'change-filed',
+    tools: ['edit_booking'],
+    patterns: [
+      /\b(?:i'?ve|i have) submitted (?:the|your) (?:change|modification|request to (?:change|reduce|update|add))\b/i,
+      /\byour (?:change|modification) (?:request )?(?:is|has been) submitted\b/i
+    ]
+  }
+];
+
+/**
+ * Return the labels of any completion claims the AI spoke without the
+ * matching tool having run. Empty array = clean call.
+ *
+ * transcriptParts: [{ role, text }] — only `assistant` lines are scanned.
+ * toolsUsed:       array of tool names actually invoked this call.
+ */
+function detectUnconfirmedClaims(transcriptParts, toolsUsed) {
+  const spoken = (transcriptParts || [])
+    .filter(p => p && p.role === 'assistant' && typeof p.text === 'string')
+    .map(p => p.text)
+    .join(' ');
+  if (!spoken) return [];
+  const used = new Set(toolsUsed || []);
+  const hits = [];
+  for (const claim of SAY_DO_CLAIMS) {
+    if (claim.tools.some(t => used.has(t))) continue; // tool ran — claim is true
+    if (claim.patterns.some(re => re.test(spoken))) hits.push(claim.label);
+  }
+  return hits;
+}
+
 // `resumeReason` is set when the caller is handed BACK to the AI part-way
 // through a call instead of starting fresh. Today the only value is
 // 'transfer_busy' — both dial attempts to the clubhouse hit a busy line, so
@@ -972,9 +1058,32 @@ ${callerLine}
 
     const duration = Math.round((Date.now() - callState.startTime) / 1000);
     const transcript = callState.transcriptParts.map(p => `${p.role}: ${p.text}`).join('\n');
-    const summary = callState.actions.length > 0
+    let summary = callState.actions.length > 0
       ? `Actions: ${callState.actions.map(a => a.tool).join(', ')}`
       : 'Information inquiry';
+
+    // Say/do safety net. The system prompt forbids claiming an action
+    // without calling its tool, but three real incidents got through
+    // (2026-06-30 booking change, 2026-07-16 cancellation, 2026-07-31
+    // team message) and each vanished silently until a customer
+    // complained. We cannot safely replay the action from a transcript,
+    // but we CAN refuse to let it disappear quietly: flag the call so it
+    // stands out in Call Logs and in the ops review scripts.
+    try {
+      const claimed = detectUnconfirmedClaims(
+        callState.transcriptParts,
+        callState.actions.map(a => a.tool)
+      );
+      if (claimed.length > 0) {
+        summary = `⚠️ UNCONFIRMED ${claimed.join(' + ')} — needs human follow-up | ${summary}`;
+        console.error(
+          `[tenant:${businessId}][${callLogId}] ⚠️ SAY-DO MISMATCH — AI told the caller ` +
+          `"${claimed.join(', ')}" but no matching tool ran. This call needs human follow-up.`
+        );
+      }
+    } catch (err) {
+      console.warn(`[tenant:${businessId}][${callLogId}] say/do check failed:`, err.message);
+    }
 
     try {
       await query(

@@ -93,6 +93,42 @@ async function runDeepHealthCheck() {
     issues.push('Tee-On check error: ' + err.message);
   }
 
+  // 5. Voice / call health (last 3h ≈ since the previous check). Catches
+  //    callers who got hung up on — the gap that let the 2026-06-23 xAI-429
+  //    outage run ~20h unnoticed. A "dead" call is <=5s with an empty
+  //    transcript (stored as status='completed', so nothing else flags it).
+  //    The real-time alarm (services/voice-health.js) catches live spikes
+  //    within minutes; this every-check pass is the backstop + the regular
+  //    all-clear digest, and catches a slow bleed under the spike threshold.
+  try {
+    const cr = await pool.query(`
+      SELECT
+        COUNT(*) AS total,
+        COUNT(*) FILTER (WHERE COALESCE(duration_seconds,0) <= 5 AND (transcript IS NULL OR transcript = '')) AS dead,
+        COUNT(*) FILTER (WHERE transferred_to IS NOT NULL) AS transferred
+      FROM call_logs
+      WHERE business_id = 1 AND started_at > NOW() - INTERVAL '3 hours'`);
+    const c = cr.rows[0];
+    out.callHealth = { windowHours: 3, total: +c.total, dead: +c.dead, transferred: +c.transferred, repeatCallers: [] };
+
+    const rr = await pool.query(`
+      SELECT caller_phone, COUNT(*) AS n FROM call_logs
+       WHERE business_id = 1 AND started_at > NOW() - INTERVAL '3 hours'
+         AND caller_phone IS NOT NULL
+       GROUP BY caller_phone HAVING COUNT(*) >= 3 ORDER BY n DESC LIMIT 5`);
+    out.callHealth.repeatCallers = rr.rows.map(r => `${r.caller_phone}x${r.n}`);
+
+    if (+c.dead > 0) {
+      out.status = 'alert';
+      issues.push(`${c.dead} dead call(s) in 3h — callers hung up on (likely low xAI credits — check console.x.ai)`);
+    } else if (out.callHealth.repeatCallers.length > 0) {
+      if (out.status !== 'alert') out.status = 'warn';
+      issues.push(`Repeat callers (possible no-answer): ${out.callHealth.repeatCallers.join(', ')}`);
+    }
+  } catch (err) {
+    issues.push('Call-health check failed: ' + err.message);
+  }
+
   if (out.status !== 'alert' && issues.length > 0) out.status = 'warn';
   return out;
 }
@@ -106,7 +142,8 @@ function formatHealthSms(out) {
   let body;
   if (out.status === 'ok') {
     const b = out.bookings24h || {};
-    body = `${icon} ${head} — ${b.synced ?? 0}/${b.confirmed ?? 0} bookings on Tee-On (24h), Tee-On reachable. All clear.`;
+    const ch = out.callHealth || {};
+    body = `${icon} ${head} — ${b.synced ?? 0}/${b.confirmed ?? 0} bookings on Tee-On (24h); calls 3h: ${ch.total ?? 0}, ${ch.dead ?? 0} dead, ${ch.transferred ?? 0} transferred. All clear.`;
   } else {
     body = `${icon} ${head}:\n- ${out.issues.join('\n- ')}`;
   }

@@ -54,6 +54,7 @@ const {
   DEFAULT_TIER: DEFAULT_VOICE_TIER,
   PLAN_TIER_ACCESS,
   listKnownVoices,
+  listKnownModels,
   resolveVoiceConfigFromSettings
 } = require('../services/voice-tiers');
 const { logEventFromReq, listAuditEvents } = require('../services/audit-log');
@@ -1495,6 +1496,7 @@ router.get('/voice-tiers', (req, res) => {
     res.json({
       default_tier: DEFAULT_VOICE_TIER,
       tiers: listVoiceTiers({ includeHidden }),
+      models: listKnownModels(),
       plan_access: PLAN_TIER_ACCESS
     });
   } catch (err) {
@@ -1524,7 +1526,8 @@ router.get('/businesses/:id/voice', async (req, res) => {
     res.json({
       raw,
       resolved,
-      known_voices: listKnownVoices()
+      known_voices: listKnownVoices(),
+      known_models: listKnownModels()
     });
   } catch (err) {
     console.error(`[super] get voice for business ${businessId}:`, err.message);
@@ -1534,12 +1537,18 @@ router.get('/businesses/:id/voice', async (req, res) => {
 
 // -------------- PATCH /api/super/businesses/:id/voice --------------
 //
-// Super-admin-only override for the xAI voice name. Merges into any existing
-// voice_config (so a tier selected at onboarding is preserved — only the
-// `voice` field is pinned). Pass `voice: null` to clear the override and
-// fall back to the tier's default voice or the legacy value.
+// Super-admin-only override for the xAI voice name and/or the realtime model.
+// Merges into any existing voice_config (so a tier selected at onboarding is
+// preserved — only the fields you pass are touched). Pass null for either
+// field to clear that override and fall back to the tier default.
 //
-// Body: { voice: string | null }
+// Body: { voice?: string | null, model?: string | null }  — at least one.
+//
+// `model` is the realtime model id sent as ?model= on the xAI WebSocket,
+// e.g. 'grok-voice-think-fast-2.0'. It is validated against the grok-voice-*
+// namespace here because an unknown model id does NOT fail the connection —
+// it connects and then never speaks, which reads as a dead call. grok-voice.js
+// applies the same guard as a second line of defence.
 //
 // We deliberately accept a free-form string rather than validating against
 // KNOWN_VOICES so that a new voice xAI ships tomorrow can be used today
@@ -1551,11 +1560,33 @@ router.patch('/businesses/:id/voice', async (req, res) => {
     return res.status(400).json({ error: 'Invalid business id' });
   }
 
-  const hasVoice = Object.prototype.hasOwnProperty.call(req.body || {}, 'voice');
-  if (!hasVoice) {
-    return res.status(400).json({ error: 'Missing `voice` field (pass a string or null)' });
+  const body = req.body || {};
+  const hasVoice = Object.prototype.hasOwnProperty.call(body, 'voice');
+  const hasModel = Object.prototype.hasOwnProperty.call(body, 'model');
+  if (!hasVoice && !hasModel) {
+    return res.status(400).json({ error: 'Pass a `voice` and/or `model` field (string or null)' });
   }
-  const incoming = req.body.voice;
+
+  // Validate the model up front so a typo is rejected loudly here rather than
+  // showing up as silence on a customer call.
+  let nextModel = null;
+  if (hasModel) {
+    const rawModel = body.model;
+    if (rawModel !== null && rawModel !== undefined && rawModel !== '') {
+      if (typeof rawModel !== 'string') {
+        return res.status(400).json({ error: '`model` must be a string or null' });
+      }
+      const trimmedModel = rawModel.trim();
+      if (!/^grok-voice-[a-zA-Z0-9.\-]+$/.test(trimmedModel) || trimmedModel.length > 64) {
+        return res.status(400).json({
+          error: '`model` must be a grok-voice-* id (e.g. grok-voice-think-fast-2.0), or null for automatic'
+        });
+      }
+      nextModel = trimmedModel;
+    }
+  }
+
+  const incoming = hasVoice ? body.voice : undefined;
   let nextVoice = null;
   if (incoming !== null && incoming !== undefined && incoming !== '') {
     if (typeof incoming !== 'string') {
@@ -1581,10 +1612,13 @@ router.patch('/businesses/:id/voice', async (req, res) => {
     );
     const prev = existing.rows[0]?.value || {};
     const nextConfig = { ...(typeof prev === 'object' && prev ? prev : {}) };
-    if (nextVoice === null) {
-      delete nextConfig.voice;
-    } else {
-      nextConfig.voice = nextVoice;
+    if (hasVoice) {
+      if (nextVoice === null) delete nextConfig.voice;
+      else nextConfig.voice = nextVoice;
+    }
+    if (hasModel) {
+      if (nextModel === null) delete nextConfig.model;
+      else nextConfig.model = nextModel;
     }
 
     await query(
@@ -1600,8 +1634,9 @@ router.patch('/businesses/:id/voice', async (req, res) => {
 
     logEventFromReq(req, 'voice.updated', {
       business_id: businessId,
-      voice: nextVoice,
-      cleared: nextVoice === null
+      voice: hasVoice ? nextVoice : undefined,
+      model: hasModel ? nextModel : undefined,
+      cleared: (hasVoice && nextVoice === null) || (hasModel && nextModel === null)
     });
 
     res.json({ raw: nextConfig, resolved });

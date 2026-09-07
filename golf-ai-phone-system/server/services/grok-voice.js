@@ -560,7 +560,7 @@ ${callerLine}
     console.warn(`[tenant:${businessId}][${callSid}] voice_config lookup failed, using legacy fallback:`, err.message);
     voiceCfg = resolveVoiceConfigFromSettings(null);
   }
-  console.log(`[tenant:${businessId}][${callSid}] Voice tier: ${voiceCfg.tier || 'legacy'} | model=${voiceCfg.model} voice=${voiceCfg.voice} speed=${voiceCfg.speed}`);
+  console.log(`[tenant:${businessId}][${callSid}] Voice tier: ${voiceCfg.tier || 'legacy'} | model=${voiceCfg.model || 'auto (xAI default)'} voice=${voiceCfg.voice} speed=${voiceCfg.speed}`);
 
   // IMPORTANT: do NOT put `?model=...` on the WebSocket URL.
   //
@@ -576,7 +576,30 @@ ${callerLine}
   // below. Once we've verified the correct way to activate
   // `grok-think-fast-1.0` we can re-add a per-tier model override — but it
   // must go into the session payload, not the URL.
-  const grokUrl = GROK_REALTIME_URL;
+  // Pin the realtime model when this tenant has one selected.
+  //
+  // WHY THE GUARD: until now no model was ever pinned — this URL had no
+  // ?model= at all, so xAI served its own default on every call. The tier
+  // catalog nominally held 'grok-think-fast-1.0', which is not a valid xAI
+  // id (voice models are namespaced 'grok-voice-*'); it went unnoticed for
+  // months precisely because it was never sent anywhere. Now that it IS
+  // sent, a bad id becomes a live risk, so only ids in that namespace are
+  // appended. Anything else connects bare — identical to the behaviour
+  // this system has run on all along — and logs a warning.
+  const wantedModel = typeof voiceCfg.model === 'string' ? voiceCfg.model.trim() : '';
+  const modelIsSafe = /^grok-voice-[a-z0-9.\-]+$/i.test(wantedModel);
+  if (wantedModel && !modelIsSafe) {
+    console.warn(
+      `[tenant:${businessId}][${callSid}] Unrecognised voice model "${wantedModel}" — ` +
+      'ignoring it and letting xAI choose (guards against the dead-air bug).'
+    );
+  }
+  const grokUrl = modelIsSafe
+    ? `${GROK_REALTIME_URL}?model=${encodeURIComponent(wantedModel)}`
+    : GROK_REALTIME_URL;
+  if (modelIsSafe) {
+    console.log(`[tenant:${businessId}][${callSid}] Pinned realtime model: ${wantedModel}`);
+  }
 
   // Connect to Grok Real-time Voice API
   const grokWs = new WebSocket(grokUrl, {

@@ -3969,6 +3969,8 @@ function EditTenantModal({ business, onClose, onSaved }) {
   // source the wizard uses). Falls back to a minimal hardcoded list if
   // the catalog endpoint is offline so the dropdown still works.
   const [voiceTiers, setVoiceTiers] = useState([]);
+  // Selectable realtime model catalog (same endpoint as the tiers).
+  const [voiceModels, setVoiceModels] = useState([]);
 
   useEffect(() => {
     if (!business) return;
@@ -4002,6 +4004,7 @@ function EditTenantModal({ business, onClose, onSaved }) {
         setOriginalTemplateKey(b.template_key || null);
         setTemplates(Array.isArray(tpl?.templates) ? tpl.templates : []);
         setVoiceTiers(Array.isArray(vt?.tiers) ? vt.tiers : []);
+        setVoiceModels(Array.isArray(vt?.models) ? vt.models : []);
         // Only surface owner_profile if the tenant has a settings row for
         // it. The PA wizard seeds assistant_name into this object; we
         // expose just that field (plus any raw JSON for power users).
@@ -4059,6 +4062,9 @@ function EditTenantModal({ business, onClose, onSaved }) {
         // same as null, but cleaner not to persist it.
         const next = { tier: voiceConfig.tier };
         if (voiceConfig.voice && voiceConfig.voice.trim()) next.voice = voiceConfig.voice.trim();
+        // Empty model = "Automatic": omit the key so the resolver falls back
+        // to no ?model= param (xAI's default) rather than persisting "".
+        if (voiceConfig.model && voiceConfig.model.trim()) next.model = voiceConfig.model.trim();
         settingsPatch.voice_config = next;
       }
       if (Object.keys(settingsPatch).length > 0) {
@@ -4183,16 +4189,16 @@ function EditTenantModal({ business, onClose, onSaved }) {
                   )
             ),
 
-            // ---------- Voice tier ----------
+            // ---------- Voice ----------
             // Per-tenant voice_config override. Writes settings.voice_config
             // via the existing PATCH /api/super/businesses/:id settings
-            // pathway. Premium tier resolves to the grok-think-fast-1.0
-            // model + Rock voice in voice-tiers.js — that's the "best
-            // voice" tenants typically ask for. Default voice for each
-            // tier is fine for 99% of tenants; the optional override is
-            // there for the rare case where a tenant wants a specific
-            // named voice (e.g. a forthcoming xAI release that ships
-            // before we update the catalog).
+            // pathway. Three independent controls:
+            //   tier  — cost/quality band (see voice-tiers.js)
+            //   model — which xAI realtime model to pin (?model= on the
+            //           WebSocket). "Automatic" sends no model param, which
+            //           is how every call has run to date.
+            //   voice — a named voice, for a release we haven't catalogued.
+            // Changes apply on the NEXT inbound call; nothing restarts.
             React.createElement('section', null,
               React.createElement('h3', { className: 'text-xs font-bold uppercase tracking-wide text-gray-500 mb-2' }, 'Voice'),
               React.createElement('div', { className: 'grid grid-cols-2 gap-3' },
@@ -4208,7 +4214,7 @@ function EditTenantModal({ business, onClose, onSaved }) {
                       : [
                           { key: 'economy',  label: 'Economy',  tagline: 'Lowest cost' },
                           { key: 'standard', label: 'Standard', tagline: 'Balanced' },
-                          { key: 'premium',  label: 'Premium',  tagline: 'Grok Think Fast 1.0 + Rock voice' }
+                          { key: 'premium',  label: 'Premium',  tagline: 'Richest, most expressive voice' }
                         ]
                     ).map(t =>
                       React.createElement('option', { key: t.key, value: t.key },
@@ -4218,25 +4224,50 @@ function EditTenantModal({ business, onClose, onSaved }) {
                   )
                 ),
                 React.createElement('div', null,
+                  React.createElement('label', { className: 'text-xs text-gray-600 block mb-1' }, 'Realtime model'),
+                  React.createElement('select', {
+                    value: voiceConfig.model || '',
+                    onChange: e => setVoiceConfig(vc => ({ ...vc, model: e.target.value })),
+                    className: 'w-full text-sm border rounded-lg px-3 py-2 bg-white'
+                  },
+                    (voiceModels.length > 0
+                      ? voiceModels
+                      : [
+                          { id: '',                          label: 'Automatic — let xAI choose (default)' },
+                          { id: 'grok-voice-think-fast-2.0', label: 'Grok Voice Think Fast 2.0 — flagship' },
+                          { id: 'grok-voice-think-fast-1.0', label: 'Grok Voice Think Fast 1.0 — previous generation' },
+                          { id: 'grok-voice-latest',         label: 'Latest — always newest (auto-upgrades)' }
+                        ]
+                    ).map(m =>
+                      React.createElement('option', { key: m.id || 'auto', value: m.id }, m.label)
+                    )
+                  )
+                )
+              ),
+              React.createElement('div', { className: 'grid grid-cols-2 gap-3 mt-3' },
+                React.createElement('div', null,
                   React.createElement('label', { className: 'text-xs text-gray-600 block mb-1' }, 'Voice override (optional)'),
                   React.createElement('input', {
                     type: 'text',
                     value: voiceConfig.voice || '',
                     onChange: e => setVoiceConfig(vc => ({ ...vc, voice: e.target.value })),
-                    placeholder: 'e.g. rock',
+                    placeholder: 'e.g. ara',
                     className: 'w-full text-sm border rounded-lg px-3 py-2 bg-white'
                   })
                 )
               ),
               React.createElement('p', { className: 'text-[11px] text-gray-500 mt-2' },
-                voiceConfig.tier === 'premium'
-                  ? 'Premium uses the Grok Think Fast 1.0 model with the Rock voice — xAI’s newest, most expressive voice.'
-                  : 'Voice override pins a specific named voice (e.g. "rock"). Leave blank to use the tier’s default voice.'
+                'Realtime model pins which Grok Voice release answers calls. "Automatic" is what every call has used so far — xAI picks. Choosing 2.0 pins the flagship; "Latest" tracks xAI’s newest release and can change without notice. Voice override pins a named voice (e.g. "ara"); leave blank for the tier default.'
               ),
               voiceConfig.tier !== originalVoiceConfig.tier && React.createElement('p', {
                 className: 'mt-2 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2'
               },
                 `Voice tier change from "${originalVoiceConfig.tier}" to "${voiceConfig.tier}" takes effect on the next inbound call — no restart needed.`
+              ),
+              (voiceConfig.model || '') !== (originalVoiceConfig.model || '') && React.createElement('p', {
+                className: 'mt-2 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2'
+              },
+                `Model change from "${originalVoiceConfig.model || 'automatic'}" to "${voiceConfig.model || 'automatic'}" takes effect on the next inbound call. Place a test call right after saving — a model change is worth hearing before customers do.`
               )
             ),
 

@@ -40,7 +40,7 @@ const VOICE_TIERS = {
     // this writing. Until we have a verified Economy model/voice ID, this
     // tier is hidden from the wizard (`placeholder: true`). Ops can still
     // opt into it manually by writing settings.voice_config directly.
-    model: 'grok-4.20-latest',
+    model: null,   // auto — xAI picks its default
     voice: 'eve',
     speed: 1.15,
     cost_tier: 1,
@@ -51,7 +51,7 @@ const VOICE_TIERS = {
     label: 'Standard',
     tagline: 'Balanced quality and cost. The default for most businesses.',
     description: 'Natural-sounding voice, fast responses, predictable cost. Today\u2019s default voice for every tenant.',
-    model: 'grok-4.20-latest',
+    model: null,   // auto — xAI picks its default
     voice: 'eve',
     speed: 1.15,
     cost_tier: 2,
@@ -60,14 +60,16 @@ const VOICE_TIERS = {
   premium: {
     key: 'premium',
     label: 'Premium',
-    tagline: 'xAI\u2019s newest voice \u2014 richer, more expressive.',
-    description: 'Grok Think Fast 1.0 with the new Rock voice. Higher cost per call; best for brands that want the most polished experience.',
-    // TODO(voice): these strings come from the user and need a live-call
-    // verification. If xAI's actual identifiers differ (e.g. grok-think-fast-1
-    // without the .0, or a different voice ID), update here — grok-voice.js
-    // reads from this file so one edit flows everywhere.
-    model: 'grok-think-fast-1.0',
-    voice: 'rock',
+    tagline: 'Richest, most expressive voice.',
+    description: 'Warm, expressive Ara voice. Pair with a pinned model below for the newest Grok Voice release.',
+    // Verified against xAI 2026-08-01. The previous values here were
+    // wrong on both counts: 'grok-think-fast-1.0' is not a real model id
+    // (voice models are namespaced grok-voice-*) and it was never sent
+    // anyway, and 'rock' is not a real voice — xAI silently substituted
+    // its default, so callers have been hearing 'ara' all along. 'ara' is
+    // now stated honestly; model defaults to auto and is chosen per tenant.
+    model: null,   // auto — override per tenant in Super Admin
+    voice: 'ara',
     speed: 1.15,
     cost_tier: 3,
     placeholder: false
@@ -80,7 +82,7 @@ const DEFAULT_TIER = 'standard';
 // resolveVoiceConfigFromSettings returns these when a tenant has no
 // voice_config row at all, so Valleymede is a no-op during rollout.
 const LEGACY_FALLBACK = Object.freeze({
-  model: 'grok-4.20-latest',
+  model: null,   // auto — xAI picks its default
   voice: 'eve',
   speed: 1.15
 });
@@ -175,6 +177,27 @@ function resolveVoiceConfigFromSettings(voiceConfigValue) {
 // doesn't override `voice` — it matches LEGACY_FALLBACK.voice exactly so
 // Valleymede stays on its historical voice until an operator explicitly
 // changes it.
+// ─── Selectable realtime models ──────────────────────────────────────────────
+//
+// Verified against xAI docs 2026-08-01. The model is passed as a QUERY
+// PARAMETER on the realtime WebSocket URL (?model=...), never in
+// session.update. An empty id means "send no model param" — xAI then serves
+// its own default, which is the behaviour this system shipped with.
+//
+// Pin a versioned id for stability; 'grok-voice-latest' always tracks xAI's
+// newest release (currently Think Fast 2.0) and can therefore change under
+// you without warning.
+const KNOWN_MODELS = Object.freeze([
+  Object.freeze({ id: '',                          label: 'Automatic — let xAI choose (default)' }),
+  Object.freeze({ id: 'grok-voice-think-fast-2.0', label: 'Grok Voice Think Fast 2.0 — flagship' }),
+  Object.freeze({ id: 'grok-voice-think-fast-1.0', label: 'Grok Voice Think Fast 1.0 — previous generation' }),
+  Object.freeze({ id: 'grok-voice-latest',         label: 'Latest — always newest (auto-upgrades)' })
+]);
+
+function listKnownModels() {
+  return KNOWN_MODELS.map(m => ({ id: m.id, label: m.label }));
+}
+
 const KNOWN_VOICES = Object.freeze([
   Object.freeze({ name: 'eve',  label: 'Eve (default xAI voice)' }),
   Object.freeze({ name: 'rock', label: 'Rock (newer, more expressive)' })
@@ -190,10 +213,12 @@ module.exports = {
   LEGACY_FALLBACK,
   PLAN_TIER_ACCESS,
   KNOWN_VOICES,
+  KNOWN_MODELS,
   allowedTiersForPlan,
   isTierAllowedOnPlan,
   getTier,
   listTiers,
   listKnownVoices,
+  listKnownModels,
   resolveVoiceConfigFromSettings
 };
